@@ -500,11 +500,19 @@ class Indexer:
                 else:
                     remaining.append(anchor)
 
-            # ── Step 2: Recreate vector table on dim change ──────────────
+            # ── Step 2: Vector-table dimension reconciliation ────────────
+            #
+            # init_schema is idempotent + dim-aware: it only drops+recreates
+            # chunks_vec when the on-disk dimensionality differs from the
+            # supplied value (db.py §7.2.1).  Calling it here ensures the
+            # vec table matches new_dims regardless of how the db was
+            # constructed (Indexer.__init__ may receive a pre-initialized
+            # db whose vec table is still at old_dims).  Calling
+            # recreate_vector_table unconditionally instead would NULL
+            # out batch progress committed on a prior crashed reembed
+            # retry — review-w2l HIGH bug #1.
             new_dims = embedder.dimensions
-            old_dims = prior_meta.embedding_dimensions if prior_meta else new_dims
-            if new_dims != old_dims:
-                db.recreate_vector_table(new_dims)
+            db.init_schema(embedding_dimensions=new_dims)
 
             # ── Step 3 + 4: Re-embed in batches; metadata in final batch ─
             conn = db._conn
@@ -591,25 +599,6 @@ class Indexer:
 
 
 # ─── Module-level helpers (not part of the public API) ───────────────────────
-
-
-def _to_sqlite_int64(value: int) -> int:
-    """Reinterpret an unsigned 64-bit integer as a signed 64-bit integer.
-
-    SimHash returns values in the range [0, 2^64).  SQLite stores integers as
-    signed 64-bit (range [-2^63, 2^63)).  Values ≥ 2^63 wrap to negative via
-    the standard two's-complement reinterpretation — the bit pattern is
-    preserved, so reads must apply the inverse to recover the original value.
-
-    Args:
-        value: Unsigned 64-bit integer from :func:`~scry.anchor_id.fingerprint_simhash`.
-
-    Returns:
-        The same bit pattern as a signed 64-bit integer.
-    """
-    if value >= 2**63:
-        return value - 2**64
-    return value
 
 
 def _file_content_hash(path: Path) -> str:
@@ -735,15 +724,13 @@ def _process_anchor(
     now = _now_iso()
     conn = db._conn
 
-    # SQLite stores integers as signed int64; SimHash produces unsigned int64.
-    # Convert to avoid OverflowError on values >= 2^63.
-    anchor_for_db = anchor.model_copy(
-        update={"fingerprint_simhash": _to_sqlite_int64(anchor.fingerprint_simhash)}
-    )
-
     with conn:
-        # 1. Upsert anchor (sets overview_embedding=NULL on new/changed hashes).
-        _upsert_anchor_in_txn(conn, anchor_for_db, now)
+        # 1. Upsert anchor.  db.py now applies the unsigned→signed simhash
+        # conversion internally (review-w2l HIGH fix #2 — was previously
+        # only applied here, leaving db.upsert_anchor unsafe for any
+        # other caller and corrupting fingerprint round-trips since
+        # _row_to_anchor had no inverse).  No anchor copy needed.
+        _upsert_anchor_in_txn(conn, anchor, now)
 
         # 2. Store the overview embedding computed above.
         conn.execute(

@@ -912,6 +912,37 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _to_signed_int64(value: int) -> int:
+    """Convert an unsigned 64-bit integer to a signed 64-bit two's-complement.
+
+    SQLite ``INTEGER`` is signed 64-bit (``-2^63`` to ``2^63 - 1``), but
+    ``simhash.Simhash.value`` returns an unsigned 64-bit fingerprint (``0``
+    to ``2^64 - 1``).  Passing a value with the high bit set directly
+    raises ``sqlite3.OverflowError`` ≈ 50 % of the time on real-world
+    fingerprints.  This helper reinterprets the bit pattern as
+    two's-complement so any value in [0, 2^64) round-trips through SQLite
+    without OverflowError.
+
+    Inverse: :func:`_from_signed_int64`.
+    """
+    if value < 0 or value >= (1 << 64):
+        raise ValueError(f"_to_signed_int64 requires an unsigned 64-bit input, got {value}")
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def _from_signed_int64(value: int) -> int:
+    """Inverse of :func:`_to_signed_int64`.
+
+    Reinterprets a signed 64-bit two's-complement integer as the unsigned
+    64-bit value the extractor originally produced.  Required so that
+    ``Anchor.fingerprint_simhash`` round-trips losslessly through the
+    SQLite store and downstream code (W4 fuzzy-match Jaccard, §3.3 inline
+    rebase) compares fresh extractor output against stored fingerprints
+    using the same sign convention.
+    """
+    return value if value >= 0 else value + (1 << 64)
+
+
 def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) -> None:
     """Execute a single anchor upsert inside the caller's transaction.
 
@@ -927,6 +958,11 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
     heading_path_json: str | None = (
         json.dumps(anchor.heading_path) if anchor.heading_path is not None else None
     )
+    # Convert the unsigned 64-bit simhash to signed two's-complement so
+    # SQLite (signed INTEGER) accepts the high-bit-set values.  The read
+    # side (_row_to_anchor) applies the inverse so callers always see
+    # the original unsigned value.
+    simhash_signed = _to_signed_int64(anchor.fingerprint_simhash)
     conn.execute(
         """
         INSERT INTO anchors
@@ -957,7 +993,7 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             anchor.symbol_name,
             anchor.content_text,
             anchor.content_hash,
-            anchor.fingerprint_simhash,
+            simhash_signed,
             str(anchor.transitive_hash_status)
             if anchor.transitive_hash_status is not None
             else None,
@@ -1054,6 +1090,10 @@ def _row_to_anchor(row: Any) -> Anchor:
         symbol_name=symbol_name,
         content_text=content_text,
         content_hash=content_hash,
-        fingerprint_simhash=fingerprint_simhash,
+        # Reverse the signed→unsigned conversion applied at write time so
+        # the round-trip preserves the extractor's original unsigned value
+        # (downstream W4 fuzzy-match Jaccard + §3.3 inline rebase compare
+        # against this verbatim).
+        fingerprint_simhash=_from_signed_int64(int(fingerprint_simhash)),
         transitive_hash_status=transitive_hash_status,
     )
