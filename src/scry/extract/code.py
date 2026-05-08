@@ -1,0 +1,669 @@
+"""Tree-sitter code symbol extraction for scry.
+
+Implements workstream W1b.  DESIGN.md references: §3.1, §3.2, §5.4, §6, §15.3.
+
+Public API
+----------
+    extract_code_symbols(path, repo_root, *, language, config) -> list[Anchor]
+
+Supported languages (Wave 1 scope)
+------------------------------------
+* **python**         - ``function_definition``, ``class_definition``,
+                       ``decorated_definition`` (inner name unwrapped, §15.3)
+* **typescript/tsx** - ``function_declaration``, ``class_declaration``,
+                       ``interface_declaration``, ``type_alias_declaration``;
+                       ``function_signature`` used internally for overload
+                       detection (§15.3); not exposed in default config list
+* **zig**            - ``FnProto``, ``ContainerDecl``
+
+Anchor ID format (§3.2 Layer 1)
+---------------------------------
+* Top-level symbols  : ``<repo-relative-path>:<symbol_name>``
+* Nested methods     : ``<path>:<OuterClass>.<method_name>``
+* TS overloads       : ``<path>:<fn_name>@<sig-hash[:6]>``     (§15.3, via
+                       :func:`scry.anchor_id.derive_code_id`)
+* Same-name collision: first bare, subsequent ``<name>@2``, ``<name>@3`` (§15.3,
+                       via :func:`scry.anchor_id.disambiguate_siblings` semantics)
+
+``granularity: "file"`` (DESIGN.md §13, open question #13)
+-----------------------------------------------------------
+Wave 1 does **not** implement file-level anchors.  If the config sets
+``granularity: "file"``, a warning is logged and the extractor falls back to
+``"symbol"`` mode.  Wave N will implement ``<path>``-only IDs and whole-file
+content hashes when this option is finalised.
+
+``transitive_hash_status``
+--------------------------
+All Wave 1 code anchors carry ``TransitiveHashStatus.LSP_UNAVAILABLE``.
+Wave 3 (W3a-c) will refine this via ``callHierarchy/outgoingCalls``.
+
+Cross-module canonicalization invariant
+----------------------------------------
+This module **delegates** content canonicalization, hashing, and SimHash
+fingerprinting to :mod:`scry.anchor_id` so that hashes computed here agree
+byte-for-byte with hashes computed by the markdown extractor (W1a) and any
+other consumer that reuses the W1c primitives.  Do **not** reintroduce a
+local copy of :func:`canonicalize_content` — see review-w1b BLOCKING finding.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any
+
+from scry.anchor_id import (
+    canonicalize_content,
+    content_hash,
+    fingerprint_simhash,
+)
+from scry.models import Anchor, AnchorType, CodeAnchorsConfig, TransitiveHashStatus
+
+# Re-export the W1c canonicalizer under the historical name for callers that
+# imported `scry.extract.code.canonicalize`.  This is the SAME function, not
+# a duplicate.
+canonicalize = canonicalize_content
+
+__all__ = ["canonicalize", "extract_code_symbols"]
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Language configuration
+# ---------------------------------------------------------------------------
+
+# Default symbol_kinds per language (DESIGN.md §6 code_anchors.symbol_kinds).
+# The TypeScript entry intentionally omits ``function_signature`` because that
+# node kind is handled implicitly for overload detection (§15.3) - it is not a
+# user-configurable kind.
+_DEFAULT_SYMBOL_KINDS: dict[str, list[str]] = {
+    "python": ["function_definition", "class_definition", "decorated_definition"],
+    "typescript": [
+        "function_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+    ],
+    "tsx": [
+        "function_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+    ],
+    "javascript": ["function_declaration", "class_declaration"],
+    "jsx": ["function_declaration", "class_declaration"],
+    "zig": ["FnProto", "ContainerDecl"],
+}
+
+# Normalise user-supplied language names → tree-sitter-language-pack grammar names.
+_GRAMMAR_NAME: dict[str, str] = {
+    "python": "python",
+    "py": "python",
+    "typescript": "typescript",
+    "ts": "typescript",
+    "tsx": "tsx",
+    "javascript": "javascript",
+    "js": "javascript",
+    "jsx": "jsx",
+    "zig": "zig",
+}
+
+_DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB (matches IndexConfig default)
+
+
+# ---------------------------------------------------------------------------
+# §5.4 Canonicalization (delegated to scry.anchor_id — see module docstring)
+# ---------------------------------------------------------------------------
+
+
+def _sig_hash6(text: str) -> str:
+    """6-char hex prefix of SHA-256 — used for overload disambiguation.
+
+    Length matches :func:`scry.anchor_id.derive_code_id`'s
+    ``signature_hash[:6]`` truncation so that an ID minted here is byte-
+    identical to one minted by ``derive_code_id(..., signature_hash=full_hash)``.
+    """
+    return hashlib.sha256(canonicalize_content(text).encode("utf-8")).hexdigest()[:6]
+
+
+# ---------------------------------------------------------------------------
+# AST helpers (tree-sitter nodes typed as ``Any``; module has no stubs)
+# ---------------------------------------------------------------------------
+
+
+def _node_text(node: Any, src: bytes) -> str:
+    return src[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def _child_of_type(node: Any, *types: str) -> Any | None:
+    """Return the first direct child whose ``.type`` is in *types*, or None."""
+    for child in node.children:
+        if child.type in types:
+            return child
+    return None
+
+
+def _find_descendant_of_type(node: Any, *types: str) -> Any | None:
+    """Depth-first search for the first descendant of one of *types*."""
+    for child in node.children:
+        if child.type in types:
+            return child
+        found = _find_descendant_of_type(child, *types)
+        if found is not None:
+            return found
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Collision resolution helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_collisions(raw: list[str]) -> list[str]:
+    """Given a list of raw symbol names (in order), return collision-resolved names.
+
+    First occurrence keeps the bare name; subsequent occurrences receive
+    ``@2``, ``@3``, … suffixes per §15.3.
+    """
+    counts: dict[str, int] = {}
+    out: list[str] = []
+    for name in raw:
+        counts[name] = counts.get(name, 0) + 1
+        if counts[name] == 1:
+            out.append(name)
+        else:
+            out.append(f"{name}@{counts[name]}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Python extraction
+# ---------------------------------------------------------------------------
+
+
+def _py_symbol_name(node: Any, src: bytes) -> str | None:
+    """Return the user-visible symbol name for a Python AST node.
+
+    For ``decorated_definition``, unwraps to the inner ``function_definition``
+    or ``class_definition`` and returns *that* node's identifier (§15.3).
+    Returns ``None`` for anonymous or unrecognised shapes.
+    """
+    if node.type == "decorated_definition":
+        inner = _child_of_type(
+            node, "function_definition", "async_function_definition", "class_definition"
+        )
+        if inner is None:
+            return None
+        node = inner
+    return _py_identifier(node, src)
+
+
+def _py_identifier(node: Any, src: bytes) -> str | None:
+    """Return the text of the first ``identifier`` child of *node*."""
+    child = _child_of_type(node, "identifier")
+    if child is None:
+        return None
+    return src[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+
+
+def _py_inner_node(node: Any) -> Any:
+    """Unwrap a ``decorated_definition`` to its inner def/class node."""
+    if node.type != "decorated_definition":
+        return node
+    inner = _child_of_type(
+        node, "function_definition", "async_function_definition", "class_definition"
+    )
+    return inner if inner is not None else node
+
+
+def _py_is_class(node: Any) -> bool:
+    """Return True when *node* is (or wraps) a class definition."""
+    n = _py_inner_node(node)
+    return bool(n.type == "class_definition")
+
+
+def _py_class_body(node: Any) -> Any | None:
+    """Return the ``block`` child of a class (possibly decorated) node."""
+    n = _py_inner_node(node)
+    if n.type != "class_definition":
+        return None
+    return _child_of_type(n, "block")
+
+
+# Raw record used during Python tree walk.
+_PyRec = tuple[str, str]  # (qualified_symbol_path, raw_content_text)
+
+
+def _walk_python(
+    nodes: list[Any],
+    src: bytes,
+    kinds: set[str],
+    scope_prefix: str,
+) -> list[_PyRec]:
+    """Recursively walk *nodes* and return (symbol_path, raw_content) pairs.
+
+    *scope_prefix* is the dot-separated class context, e.g. ``"OuterClass"``
+    for methods, or ``""`` for top-level symbols.  Collision resolution is
+    applied *per scope level* before recursing into class bodies.
+    """
+    # Collect matching nodes at this scope level.
+    raw_names: list[str] = []
+    matching: list[Any] = []
+    for node in nodes:
+        if node.type not in kinds:
+            continue
+        name = _py_symbol_name(node, src)
+        if name is None:
+            continue
+        raw_names.append(name)
+        matching.append(node)
+
+    resolved_names = _apply_collisions(raw_names)
+
+    results: list[_PyRec] = []
+    for node, resolved in zip(matching, resolved_names, strict=True):
+        symbol_path = f"{scope_prefix}.{resolved}" if scope_prefix else resolved
+        content_raw = _node_text(node, src)
+        results.append((symbol_path, content_raw))
+
+        # Recurse into class bodies to extract methods.
+        if _py_is_class(node):
+            body = _py_class_body(node)
+            if body is not None:
+                child_scope = symbol_path
+                results.extend(_walk_python(list(body.children), src, kinds, child_scope))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# TypeScript / TSX extraction
+# ---------------------------------------------------------------------------
+
+
+def _ts_symbol_name(node: Any, src: bytes) -> str | None:
+    """Return the identifier for a TypeScript top-level declaration."""
+    # Most TS declarations use ``identifier`` or ``type_identifier`` as the
+    # second child (after keyword).
+    for child in node.children:
+        if child.type in ("identifier", "type_identifier", "property_identifier"):
+            return src[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _ts_method_name(node: Any, src: bytes) -> str | None:
+    """Return the name of a ``method_definition`` node."""
+    child = _child_of_type(node, "property_identifier", "identifier")
+    if child is None:
+        return None
+    return src[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+
+
+def _ts_class_methods(
+    class_node: Any,
+    src: bytes,
+    class_name: str,
+) -> list[_PyRec]:
+    """Extract ``method_definition`` anchors from a TypeScript class body."""
+    body = _child_of_type(class_node, "class_body")
+    if body is None:
+        return []
+
+    raw_names: list[str] = []
+    method_nodes: list[Any] = []
+    for child in body.children:
+        if child.type != "method_definition":
+            continue
+        name = _ts_method_name(child, src)
+        if name is None:
+            continue
+        raw_names.append(name)
+        method_nodes.append(child)
+
+    resolved = _apply_collisions(raw_names)
+    results: list[_PyRec] = []
+    for node, resolved_name in zip(method_nodes, resolved, strict=True):
+        symbol_path = f"{class_name}.{resolved_name}"
+        results.append((symbol_path, _node_text(node, src)))
+    return results
+
+
+# Groups nodes collected during the TypeScript top-level walk.
+_TsGroup = dict[str, list[Any]]  # name -> [node, …]
+
+
+def _walk_typescript(
+    nodes: list[Any],
+    src: bytes,
+    kinds: set[str],
+) -> list[_PyRec]:
+    """Return (symbol_path, raw_content) pairs from TypeScript source nodes.
+
+    Overload handling (§15.3):
+    * ``function_signature`` nodes at the top level are TypeScript overload
+      declarations.  Each is given a ``@<sig-hash[:6]>`` suffix appended to
+      the symbol path via :func:`scry.anchor_id.derive_code_id`.
+    * ``function_declaration`` nodes with the same name that follow overload
+      signatures are treated as the implementation body and extracted with
+      the bare name (or ``@N`` collision suffix).
+
+    Note: ``function_signature`` nodes inside interface bodies are NOT
+    extracted here - only top-level ones (direct children of *nodes*).
+    """
+    results: list[_PyRec] = []
+
+    # Single pass: separate overload signatures from regular declarations.
+    decl_names: list[str] = []
+    decl_nodes: list[tuple[str, Any]] = []  # (raw_name, node)
+    sig_entries: list[tuple[str, Any]] = []  # (raw_name, node) for function_signature
+
+    for node in nodes:
+        if node.type == "function_signature":
+            name = _ts_symbol_name(node, src)
+            if name is not None:
+                sig_entries.append((name, node))
+        elif node.type in kinds:
+            name = _ts_symbol_name(node, src)
+            if name is not None:
+                decl_names.append(name)
+                decl_nodes.append((name, node))
+
+    # Emit overload signatures with @<sig-hash[:6]> suffix.  Match
+    # derive_code_id semantics so an ID minted here is byte-identical to
+    # one that downstream code might recreate via that helper.
+    for sig_name, sig_node in sig_entries:
+        sig_text = _node_text(sig_node, src)
+        suffix = _sig_hash6(sig_text)
+        symbol_path = f"{sig_name}@{suffix}"
+        results.append((symbol_path, sig_text))
+
+    # Emit regular declarations with collision resolution.
+    resolved = _apply_collisions(decl_names)
+    for (_raw_name, node), resolved_name in zip(decl_nodes, resolved, strict=True):
+        results.append((resolved_name, _node_text(node, src)))
+
+        # Recurse into class body for methods.
+        if node.type == "class_declaration":
+            results.extend(_ts_class_methods(node, src, resolved_name))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Zig extraction
+# ---------------------------------------------------------------------------
+
+
+def _zig_fn_name(fn_proto_node: Any, src: bytes) -> str | None:
+    """Return the function name from a Zig ``FnProto`` node."""
+    child = _child_of_type(fn_proto_node, "IDENTIFIER")
+    if child is None:
+        return None
+    return src[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+
+
+def _zig_var_name(var_decl_node: Any, src: bytes) -> str | None:
+    """Return the variable name from a Zig ``VarDecl`` node."""
+    child = _child_of_type(var_decl_node, "IDENTIFIER")
+    if child is None:
+        return None
+    return src[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+
+
+def _zig_has_container_decl(var_decl_node: Any) -> bool:
+    """Return True if *var_decl_node* contains a ``ContainerDecl`` descendant."""
+    return _find_descendant_of_type(var_decl_node, "ContainerDecl") is not None
+
+
+def _walk_zig(
+    root: Any,
+    src: bytes,
+    kinds: set[str],
+) -> list[_PyRec]:
+    """Return (symbol_path, raw_content) pairs from a Zig source file root.
+
+    The Zig grammar places top-level declarations as ``Decl`` children of
+    ``source_file``, with optional ``pub`` siblings immediately preceding them::
+
+        source_file
+          [pub]          ← visibility keyword (sibling, not inside Decl)
+          [Decl]
+            [FnProto]    ← function prototype
+            [Block]      ← function body
+          [Decl]
+            [VarDecl]    ← const declaration (may contain ContainerDecl)
+
+    Content text for a symbol includes the ``pub`` prefix when present.
+    """
+    children: list[Any] = list(root.children)
+    raw_names: list[str] = []
+    raw_entries: list[tuple[str, str]] = []  # (name, content_text)
+
+    for i, child in enumerate(children):
+        if child.type != "Decl":
+            continue
+
+        # Determine whether a `pub` keyword immediately precedes this Decl.
+        has_pub = i > 0 and children[i - 1].type == "pub"
+        content_start = children[i - 1].start_byte if has_pub else child.start_byte
+        content_bytes = src[content_start : child.end_byte]
+        content_text = content_bytes.decode("utf-8", errors="replace")
+
+        # Check for FnProto (function).
+        fn_proto = _child_of_type(child, "FnProto")
+        if fn_proto is not None and "FnProto" in kinds:
+            name = _zig_fn_name(fn_proto, src)
+            if name is not None:
+                raw_names.append(name)
+                raw_entries.append((name, content_text))
+            continue  # A Decl is either a fn or a var, not both.
+
+        # Check for VarDecl containing a ContainerDecl (struct/enum/union).
+        var_decl = _child_of_type(child, "VarDecl")
+        if var_decl is not None and "ContainerDecl" in kinds and _zig_has_container_decl(var_decl):
+            name = _zig_var_name(var_decl, src)
+            if name is not None:
+                raw_names.append(name)
+                raw_entries.append((name, content_text))
+
+    resolved = _apply_collisions(raw_names)
+    results: list[_PyRec] = []
+    for (_, content), resolved_name in zip(raw_entries, resolved, strict=True):
+        results.append((resolved_name, content))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Anchor construction helper
+# ---------------------------------------------------------------------------
+
+
+def _make_anchor(
+    path_str: str,
+    symbol_path: str,
+    raw_content: str,
+) -> Anchor:
+    """Build an ``Anchor`` for a code symbol.
+
+    *symbol_path* is the full qualified path portion of the ID
+    (e.g. ``"MyClass.method"`` or ``"fn_name@abc123"``).
+    The ``id`` is ``<path_str>:<symbol_path>``.
+
+    Content is canonicalised per §5.4 before hashing.
+    ``transitive_hash_status`` is set to ``LSP_UNAVAILABLE`` (Wave 1; Wave 3
+    will refine via ``callHierarchy``).
+    """
+    import re as _re
+
+    canon = canonicalize_content(raw_content)
+    chash = content_hash(raw_content)  # content_hash canonicalizes internally
+    shash = fingerprint_simhash(raw_content)
+
+    # symbol_name is the leaf name (last component), with both the `@N`
+    # collision suffix AND the `@<sig-hash>` overload suffix stripped, to
+    # keep it human-readable.  The suffix-stripping regex matches `@`
+    # followed by digits (collision) OR by hex chars (sig hash).
+    leaf = symbol_path.split(".")[-1]
+    symbol_name = _re.sub(r"@(?:\d+|[0-9a-f]+)$", "", leaf)
+
+    return Anchor(
+        id=f"{path_str}:{symbol_path}",
+        type=AnchorType.CODE,
+        path=path_str,
+        symbol_name=symbol_name,
+        content_text=canon,
+        content_hash=chash,
+        fingerprint_simhash=shash,
+        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def extract_code_symbols(
+    path: Path,
+    repo_root: Path,
+    *,
+    language: str,
+    config: CodeAnchorsConfig | None = None,
+    max_file_size_bytes: int = _DEFAULT_MAX_FILE_SIZE,
+) -> list[Anchor]:
+    """Extract ``AnchorType.CODE`` anchors from *path* using tree-sitter.
+
+    Parameters
+    ----------
+    path:
+        Absolute or repo-relative path to the source file.
+    repo_root:
+        Repository root used to compute the repo-relative path stored in each
+        anchor's ``path`` field.
+    language:
+        Grammar name or alias (``"python"``, ``"typescript"``, ``"ts"``,
+        ``"zig"``, …).  Must resolve via the internal alias table.
+    config:
+        Optional ``CodeAnchorsConfig`` from ``.scry/config.yaml``.  Controls
+        ``languages.<lang>`` skip behaviour, ``symbol_kinds``, and
+        ``granularity``.  Defaults to ``CodeAnchorsConfig()`` when omitted.
+    max_file_size_bytes:
+        Per-file byte cap (DESIGN.md §15.4).  Pass
+        ``IndexConfig.max_file_size_bytes`` from the loaded config to honor
+        the user's override; defaults to ``_DEFAULT_MAX_FILE_SIZE`` (5 MB)
+        for callers that don't have an ``IndexConfig`` handy.
+
+    Returns
+    -------
+    list[Anchor]
+        Zero or more ``Anchor`` objects of type ``AnchorType.CODE``.
+        Returns an empty list (never raises) for:
+        * Unknown / unsupported language
+        * ``languages.<lang>: skip`` in config
+        * File size exceeds ``max_file_size_bytes`` (default 5 MB)
+        * Empty file
+        * ``granularity: "file"`` (falls back to symbol mode after warning)
+    """
+    if config is None:
+        config = CodeAnchorsConfig()
+
+    # Warn and fall back when granularity="file" (DESIGN.md §13 #13).
+    if config.granularity == "file":
+        logger.warning(
+            "code_anchors.granularity='file' is not yet implemented (DESIGN.md §13 "
+            "open question #13); falling back to 'symbol' mode for %s",
+            path,
+        )
+
+    # Normalise language name → grammar name.
+    lang_key = language.lower()
+    grammar_name = _GRAMMAR_NAME.get(lang_key)
+    if grammar_name is None:
+        logger.warning("extract_code_symbols: unsupported language %r for %s", language, path)
+        return []
+
+    # Check per-language skip directive.
+    lang_directive = config.languages.get(lang_key) or config.languages.get(grammar_name)
+    if lang_directive == "skip":
+        logger.debug("Skipping %s (language=%r is configured as 'skip')", path, language)
+        return []
+
+    # Resolve repo-relative path (forward-slash form per Anchor.path validator).
+    try:
+        path_resolved = path.resolve()
+        repo_resolved = repo_root.resolve()
+        rel = path_resolved.relative_to(repo_resolved)
+    except ValueError:
+        # path is not under repo_root; use as-is (best-effort)
+        rel = path
+    path_str = rel.as_posix()
+
+    # File size guard (DESIGN.md §15.4).
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        logger.warning("extract_code_symbols: cannot stat %s: %s", path, exc)
+        return []
+    if file_size > max_file_size_bytes:
+        logger.warning(
+            "extract_code_symbols: %s exceeds max_file_size (%d bytes); skipping",
+            path,
+            max_file_size_bytes,
+        )
+        return []
+
+    # Read source bytes.
+    try:
+        src_bytes = path.read_bytes()
+    except OSError as exc:
+        logger.warning("extract_code_symbols: cannot read %s: %s", path, exc)
+        return []
+
+    if not src_bytes:
+        return []
+
+    # Resolve symbol kinds (config override or language default).
+    config_kinds = config.symbol_kinds.get(lang_key) or config.symbol_kinds.get(grammar_name)
+    if config_kinds is not None:
+        kinds: set[str] = set(config_kinds)
+    else:
+        kinds = set(_DEFAULT_SYMBOL_KINDS.get(grammar_name, []))
+
+    if not kinds:
+        return []
+
+    # Parse with tree-sitter.
+    try:
+        from tree_sitter_language_pack import get_parser
+
+        parser = get_parser(grammar_name)  # type: ignore[arg-type]
+        tree = parser.parse(src_bytes)
+    except Exception as exc:
+        logger.warning("extract_code_symbols: parse error for %s: %s", path, exc)
+        return []
+
+    root = tree.root_node
+
+    # Dispatch to language-specific walker.
+    if grammar_name == "python":
+        records = _walk_python(list(root.children), src_bytes, kinds, "")
+    elif grammar_name in ("typescript", "tsx", "javascript", "jsx"):
+        records = _walk_typescript(list(root.children), src_bytes, kinds)
+    elif grammar_name == "zig":
+        records = _walk_zig(root, src_bytes, kinds)
+    else:
+        logger.warning(
+            "extract_code_symbols: no walker for grammar %r (language=%r)",
+            grammar_name,
+            language,
+        )
+        return []
+
+    # Build Anchor objects.
+    anchors: list[Anchor] = []
+    for symbol_path, raw_content in records:
+        anchor = _make_anchor(path_str, symbol_path, raw_content)
+        anchors.append(anchor)
+
+    return anchors
