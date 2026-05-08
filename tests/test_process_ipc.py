@@ -306,6 +306,46 @@ async def test_ipc_client_multiple_calls_same_connection(tmp_repo: Path, unix_on
         await srv.stop()
 
 
+@pytest.mark.unix_only
+async def test_ipc_client_concurrent_calls_routed_correctly(
+    tmp_repo: Path, unix_only: None
+) -> None:
+    """Regression (review-w2h HIGH): concurrent IPCClient.call MUST NOT swap responses.
+
+    Without the per-instance asyncio.Lock + response-id check, two
+    concurrent calls would race on the shared stream. Caller A writes,
+    caller B writes, then whichever wakes first reads — silently
+    receiving the OTHER caller's response.
+
+    Each call passes a unique sentinel in args; the handler echoes it
+    back. Mixed-up responses produce mismatched (echo, expected) pairs.
+    """
+    handler_call_count = 0
+
+    async def _handler(req: IPCRequest) -> IPCResponse:
+        nonlocal handler_call_count
+        handler_call_count += 1
+        # Tiny sleep encourages interleaving in the absence of the lock.
+        await asyncio.sleep(0.01)
+        return IPCResponse(request_id=req.request_id, ok=True, result=req.args.get("sentinel"))
+
+    srv = IPCServer(tmp_repo, handler=_handler)
+    await srv.start()
+    try:
+        spec = parse_endpoint_uri(srv.endpoint_uri, tmp_repo)
+        client = IPCClient(spec)
+        sentinels = [f"unique-{i}" for i in range(20)]
+        results = await asyncio.gather(*(client.call("status", {"sentinel": s}) for s in sentinels))
+        await client.close()
+        # Each call must receive its own sentinel back, not someone else's.
+        assert results == sentinels, (
+            f"response-routing bug: results={results} sentinels={sentinels}"
+        )
+        assert handler_call_count == 20
+    finally:
+        await srv.stop()
+
+
 # ─── Per-overlay lock (concurrent serialization) ──────────────────────
 
 
@@ -622,17 +662,21 @@ async def test_oversized_message_rejected(tmp_repo: Path, unix_only: None) -> No
         writer.write(huge_msg)
         await writer.drain()
 
-        # Server should send an error response OR close the connection (EOF).
+        # Server MUST send a structured oversized error response per spec
+        # §10.3 v3.1 ("Connection rejected if message > 1 MB (DoS guard)").
+        # Allowing silent EOF would let a regression that drops the error
+        # response slip through (review-w2h LOW finding).
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=3.0)
         except TimeoutError:
-            line = b""
+            pytest.fail("server did not respond to oversized message within 3s")
 
-        if line:
-            resp = json.loads(line)
-            assert resp["ok"] is False
-            assert resp.get("error_type") in ("oversized",)
-        # EOF is also acceptable — server closed connection after the huge message.
+        assert line, "server closed connection without sending the oversized error"
+        resp = json.loads(line)
+        assert resp["ok"] is False
+        assert resp.get("error_type") == "oversized", (
+            f"expected error_type=oversized, got {resp.get('error_type')!r}"
+        )
 
         writer.close()
         with contextlib.suppress(Exception):

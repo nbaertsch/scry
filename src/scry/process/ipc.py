@@ -302,6 +302,13 @@ class _ConnectionHandler:
         Uses ``SO_PEERCRED`` on Linux (DESIGN.md §10.3 security requirement).
         On macOS and other Unix systems, the mode-0600 socket file is the
         primary access guard; this method returns ``True`` unconditionally.
+
+        On Linux: fails CLOSED if SO_PEERCRED itself errors. The previous
+        fail-open behaviour (review-w2h LOW finding) defeated the
+        "leader rejects any connection whose SO_PEERCRED UID does not
+        match its own UID" guarantee whenever the syscall failed for
+        any reason — kernel quirks, getsockopt failure, etc. Failing
+        closed is the correct interpretation of the §10.3 contract.
         """
         if platform.system() != "Linux":
             return True
@@ -310,7 +317,9 @@ class _ConnectionHandler:
 
             sock: _socket.socket | None = self._writer.get_extra_info("socket")
             if sock is None:
-                return True
+                # No underlying socket — cannot verify; reject conservatively.
+                log.warning("IPC: cannot verify peer UID (no socket); rejecting")
+                return False
             # SO_PEERCRED: struct { pid_t pid; uid_t uid; gid_t gid; }
             raw = sock.getsockopt(
                 _socket.SOL_SOCKET,
@@ -327,8 +336,9 @@ class _ConnectionHandler:
                 )
                 return False
         except Exception:
-            # Can't read creds — allow; mode-0600 file provides primary guard.
-            log.debug("IPC: SO_PEERCRED check skipped", exc_info=True)
+            # SO_PEERCRED failure on Linux: fail closed.
+            log.warning("IPC: SO_PEERCRED check failed; rejecting connection", exc_info=True)
+            return False
         return True
 
     async def run(self) -> None:
@@ -563,13 +573,23 @@ class IPCServer:
                 if task is not None:
                     connection_tasks.discard(task)
 
-        self._server = await asyncio.start_unix_server(  # type: ignore[attr-defined]
-            _client_cb,
-            path=sock_path,
-            limit=MAX_MESSAGE_BYTES + 1,
-        )
-        # Restrict to owner-only access (DESIGN.md §10.3 security).
-        os.chmod(sock_path, 0o600)
+        # Restrictive umask wraps start_unix_server so the socket is
+        # created with mode 0600 from the first instant — closes the
+        # TOCTOU window on macOS where SO_PEERCRED is unavailable and
+        # socket mode is the only access guard (review-w2h MEDIUM fix).
+        prior_umask = os.umask(0o077)
+        try:
+            self._server = await asyncio.start_unix_server(  # type: ignore[attr-defined]
+                _client_cb,
+                path=sock_path,
+                limit=MAX_MESSAGE_BYTES + 1,
+            )
+            # Belt-and-braces: explicit chmod even though umask should
+            # have handled it, since asyncio's bind path may differ
+            # from a vanilla socket() + bind().
+            os.chmod(sock_path, 0o600)
+        finally:
+            os.umask(prior_umask)
         log.info("IPC: listening at %s", sock_path)
 
     async def stop(self) -> None:
@@ -605,6 +625,14 @@ class IPCClient:
     (:data:`WRITE_OPS`) the caller **must** supply an *idempotency_token*
     so the leader can deduplicate retries across transient failures.
 
+    Concurrency model:
+        :meth:`call` is safe to invoke from multiple coroutines on the SAME
+        instance — an internal :class:`asyncio.Lock` serialises the
+        send-then-receive critical section so concurrent callers cannot
+        race on the shared stream and silently swap each other's responses.
+        The lock also guards the response-id check that defends against
+        any unexpected wire-protocol drift.
+
     Timeouts:
 
     * Short ops (``propose_link``, ``accept_link``, ``status``): default to
@@ -629,6 +657,10 @@ class IPCClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._request_id: int = 0
+        # Serializes the send-then-receive critical section so concurrent
+        # call() invocations on the same instance cannot interleave writes
+        # OR receive each other's responses (review-w2h HIGH fix).
+        self._call_lock = asyncio.Lock()
 
     async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Open the transport connection if not already open."""
@@ -673,59 +705,73 @@ class IPCClient:
         Raises:
             asyncio.TimeoutError: If the per-op timeout elapses waiting for the
                 response. The connection is closed on timeout.
-            RuntimeError: If the leader returns ``ok: false`` — the exception
-                message contains the leader's ``error`` field.
+            RuntimeError: If the leader returns ``ok: false`` (the exception
+                message contains the leader's ``error`` field) OR if the
+                response's ``id`` does not match the request's (wire-protocol
+                drift defense).
             NotImplementedError: On Windows (deferred to Wave 6).
         """
-        self._request_id += 1
-        req_id = self._request_id
+        async with self._call_lock:
+            self._request_id += 1
+            req_id = self._request_id
 
-        payload: dict[str, Any] = {
-            "id": req_id,
-            "op": op,
-            "args": args,
-            "protocol_version": 1,
-        }
-        if idempotency_token is not None:
-            payload["idempotency_token"] = idempotency_token
+            payload: dict[str, Any] = {
+                "id": req_id,
+                "op": op,
+                "args": args,
+                "protocol_version": 1,
+            }
+            if idempotency_token is not None:
+                payload["idempotency_token"] = idempotency_token
 
-        raw = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+            raw = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
 
-        is_long_op = op in {"commit_links", "reindex"}
-        effective_timeout: float | None = (
-            timeout_seconds
-            if timeout_seconds is not None
-            else (None if is_long_op else self._config.timeouts.short)
-        )
+            is_long_op = op in {"commit_links", "reindex"}
+            effective_timeout: float | None = (
+                timeout_seconds
+                if timeout_seconds is not None
+                else (None if is_long_op else self._config.timeouts.short)
+            )
 
-        reader, writer = await self._connect()
-        writer.write(raw)
-        await writer.drain()
+            reader, writer = await self._connect()
+            writer.write(raw)
+            await writer.drain()
 
-        try:
-            if effective_timeout is not None:
-                line = await asyncio.wait_for(reader.readline(), timeout=effective_timeout)
-            else:
-                line = await reader.readline()
-        except TimeoutError:
-            # Close connection: stream state is unknown after a timeout.
-            await self.close()
-            raise
+            try:
+                if effective_timeout is not None:
+                    line = await asyncio.wait_for(reader.readline(), timeout=effective_timeout)
+                else:
+                    line = await reader.readline()
+            except TimeoutError:
+                # Close connection: stream state is unknown after a timeout.
+                await self.close()
+                raise
 
-        if not line:
-            await self.close()
-            raise RuntimeError("IPC: server closed connection unexpectedly")
+            if not line:
+                await self.close()
+                raise RuntimeError("IPC: server closed connection unexpectedly")
 
-        try:
-            resp_d: dict[str, Any] = json.loads(line)
-        except json.JSONDecodeError as exc:
-            await self.close()
-            raise RuntimeError(f"IPC: invalid JSON in leader response: {exc}") from exc
+            try:
+                resp_d: dict[str, Any] = json.loads(line)
+            except json.JSONDecodeError as exc:
+                await self.close()
+                raise RuntimeError(f"IPC: invalid JSON in leader response: {exc}") from exc
 
-        if not resp_d.get("ok"):
-            raise RuntimeError(str(resp_d.get("error") or "IPC error"))
+            # Wire-protocol invariant: the leader echoes our request id.
+            # If it doesn't, our stream state is corrupt — close and raise
+            # rather than silently returning someone else's response.
+            resp_id = resp_d.get("id")
+            if resp_id != req_id:
+                await self.close()
+                raise RuntimeError(
+                    f"IPC: response id mismatch (expected {req_id}, got {resp_id!r}); "
+                    "stream state is corrupt"
+                )
 
-        return resp_d.get("result")
+            if not resp_d.get("ok"):
+                raise RuntimeError(str(resp_d.get("error") or "IPC error"))
+
+            return resp_d.get("result")
 
     async def close(self) -> None:
         """Close the underlying transport connection gracefully."""
