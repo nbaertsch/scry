@@ -1,0 +1,11 @@
+include:
+  - "docs/**.md"
+  - "python/**.py"
+
+exclude:
+  - ".scry/**"
+
+# docs/ files are specs; python/ files are not classified here —
+# they participate as code anchors rather than section anchors.
+classify:
+  - { glob: "docs/**.md", type: spec }

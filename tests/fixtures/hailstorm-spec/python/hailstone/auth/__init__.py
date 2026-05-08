@@ -1,0 +1,1 @@
+"""hailstorm-spec fixture package."""
