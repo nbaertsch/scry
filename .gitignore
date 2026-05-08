@@ -1,7 +1,13 @@
 # Generated artifacts (per-repo, never committed)
 .scry/vectors.db
+.scry/vectors.db-shm
+.scry/vectors.db-wal
+.scry/vectors.db.lock
+.scry/leader.lock
+.scry/overlays/
 .scry/cache/
 .scry/stats.json
+.scry/commit-links.*.marker
 
 # Standard Python ignores (anticipating implementation)
 __pycache__/
@@ -47,3 +53,5 @@ Thumbs.db
 .coverage.*
 htmlcov/
 .tox/
+.mypy_cache/
+.ruff_cache/

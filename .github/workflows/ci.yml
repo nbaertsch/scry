@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install dev deps
+        run: uv pip install --system -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check src tests
+      - name: Ruff format check
+        run: ruff format --check src tests
+      - name: mypy
+        run: mypy src
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Install package + dev deps
+        shell: bash
+        run: |
+          uv pip install --system -e ".[dev]"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            uv pip install --system "pywin32>=306"
+          fi
+      - name: pytest
+        run: pytest --cov=scry --cov-report=term-missing -m "not integration"
