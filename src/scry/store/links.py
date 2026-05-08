@@ -36,7 +36,6 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
 
 from scry.models import EventId, Link, LinkId, LinkOp, LinkRecord
 
@@ -308,18 +307,23 @@ class LinkStore:
         txn_id = str(uuid.uuid4())
         marker_path = self._scry_dir / f"commit-links.{txn_id}.marker"
 
-        # ── Step 1: append to baseline + write marker, fsync both ─────────────
-        with self.baseline_path.open("a", encoding="utf-8") as fh:
-            for record in to_promote:
-                fh.write(record.model_dump_json(by_alias=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-
         try:
             overlay_relative: Path = overlay_path.relative_to(self._scry_dir)
         except ValueError:
             overlay_relative = Path(overlay_path.name)
 
+        # ── Step 1a: write marker FIRST, before touching baseline ─────────────
+        #
+        # Reversed order from the naive design (review-w2b MEDIUM/BLOCKING
+        # fix combined with the merge-conflict dedupe): if the process
+        # crashes between marker-write and baseline-append, the marker
+        # exists with no baseline change — recover_pending_promotions
+        # detects this and re-applies. If we instead appended to baseline
+        # first, a crash before marker-write would leave duplicate records
+        # (overlay still has them + baseline has them) with no marker for
+        # recovery to find — exactly the false-positive merge-conflict
+        # state that bit review-w2b. Marker-first means baseline is only
+        # mutated when there's already a record of the intent.
         marker_data = {
             "txn_id": txn_id,
             "overlay_path": overlay_relative.as_posix(),
@@ -328,6 +332,13 @@ class LinkStore:
         }
         marker_path.write_text(json.dumps(marker_data), encoding="utf-8")
         _fsync_file(marker_path)
+        _fsync_dir(self._scry_dir)
+
+        # ── Step 1b: append the records to baseline (each via _do_append
+        # so the cross-process append lock is held — review-w2b MEDIUM
+        # fix; previously this path bypassed the lock).
+        for record in to_promote:
+            self._do_append(self.baseline_path, record)
 
         # ── Step 2: atomic overlay rewrite, fsync dir ──────────────────────────
         remaining = [r for r in overlay_records if r.event_id not in promoted_set]
@@ -342,10 +353,25 @@ class LinkStore:
     def recover_pending_promotions(self) -> list[EventId]:
         """Finish any promotions interrupted by a crash (§3.5.4 recovery).
 
-        Scans for ``.scry/commit-links.*.marker`` files and completes
-        step 2 (overlay rewrite) + step 3 (marker delete) for each.
+        With the marker-first protocol, a crashed promotion can leave
+        any of these states:
 
-        Idempotent: returns ``[]`` if no markers are present.
+        1. Marker exists; baseline missing the records; overlay still
+           has them — replay step 1b (re-append to baseline), then
+           step 2 (rewrite overlay), then step 3 (unlink marker).
+        2. Marker exists; baseline already has the records (from a
+           prior partial completion); overlay still has them — skip
+           step 1b (don't double-append), do steps 2 and 3.
+        3. Marker exists; baseline has records; overlay already
+           rewritten — only step 3 left.
+        4. Marker missing — nothing to recover.
+
+        We detect "baseline already has the records" by checking
+        whether the marker's promoted_event_ids are present in the
+        baseline records, deduping by event_id.
+
+        Returns the list of promoted event_ids that were finalized
+        (across all recovered markers).  Idempotent.
         """
         markers = sorted(self._scry_dir.glob("commit-links.*.marker"))
         completed: list[EventId] = []
@@ -368,6 +394,20 @@ class LinkStore:
             if not isinstance(overlay_rel, str):
                 continue
             overlay_path = self._scry_dir / overlay_rel
+
+            # ── Step 1b recovery: re-append any promoted records to baseline
+            # that aren't already there.  Look up by event_id in the
+            # current baseline + overlay.
+            baseline_records = self.read_records(self.baseline_path)
+            baseline_event_ids = {r.event_id for r in baseline_records}
+            missing_event_ids = [evt for evt in promoted_event_ids if evt not in baseline_event_ids]
+            if missing_event_ids and overlay_path.exists():
+                overlay_records = self.read_records(overlay_path)
+                overlay_by_evt = {r.event_id: r for r in overlay_records}
+                for evt in missing_event_ids:
+                    rec = overlay_by_evt.get(evt)
+                    if rec is not None:
+                        self._do_append(self.baseline_path, rec)
 
             # Step 2: remove promoted records from overlay (if still present).
             if overlay_path.exists():
@@ -469,18 +509,33 @@ class LinkStore:
         """Detect broken supersedes chains per §3.5.2 rule 6.
 
         Returns a sorted list of link_ids with broken chains:
-        - **Condition 1**: two upserts share the same supersedes event_id
-          (forked chain — typically the result of a git union merge).
-        - **Condition 2**: any record whose supersedes references an event_id
-          not present in baseline ⊕ overlay.
+        - **Condition 1**: two upserts with DISTINCT event_ids share the
+          same supersedes target (forked chain — typically the result
+          of a git union merge).
+        - **Condition 2**: any record whose supersedes references an
+          event_id not present in baseline ⊕ overlay.
+
+        Records are deduplicated by ``event_id`` before condition 1
+        is evaluated (review-w2b HIGH fix). Without this dedupe, the
+        same logical record appearing in both baseline and overlay
+        (the post-state of a §3.5.4 step-1-partial-failure crash, or
+        a concurrent-promotion edge case) would be counted twice and
+        spuriously flagged as a fork.
         """
         known_evt: set[EventId] = {r.event_id for r in all_records}
         conflict_ids: set[LinkId] = set()
 
-        # Condition 1: count how many upserts share the same supersedes.
+        # Condition 1: count how many DISTINCT upserts share the same
+        # supersedes target.  Dedupe by event_id (a record present in
+        # both baseline and overlay is the SAME logical record, not a
+        # fork).
+        seen_evt: set[EventId] = set()
         supersedes_to_links: dict[EventId, list[LinkId]] = defaultdict(list)
         for r in all_records:
             if r.op == LinkOp.UPSERT and r.supersedes is not None:
+                if r.event_id in seen_evt:
+                    continue
+                seen_evt.add(r.event_id)
                 supersedes_to_links[r.supersedes].append(r.link_id)
 
         for link_ids_for_evt in supersedes_to_links.values():
@@ -504,15 +559,20 @@ class LinkStore:
         concurrent appends) can never interleave bytes within a single
         record OR overwrite each other's writes.
 
-        Why not rely on POSIX O_APPEND atomicity: Linux/macOS guarantee
-        atomic single-write append under O_APPEND, but Windows does NOT
-        give the same guarantee — two ``open(..., 'a')`` handles can
-        both seek to the same EOF and overwrite each other.  Cross-process
-        file locking (``fcntl.flock`` on Unix, ``msvcrt.locking`` on
-        Windows) closes that gap.
+        Locking strategy (sidecar lock file — review-w2b HIGH fix):
+            We acquire a lock on a SEPARATE companion file ``<path>.lock``
+            at byte 0.  The data file's EOF is irrelevant to the lock.
+            * Linux/macOS: ``fcntl.flock`` is whole-file advisory; the
+              sidecar approach also works directly on the data file but
+              the sidecar gives us a uniform cross-platform contract.
+            * Windows: ``msvcrt.locking`` is mandatory byte-range; using
+              a sidecar fixed at byte 0 means the lock byte never moves
+              with EOF, the locked range never overlaps user writes, and
+              no PermissionError is raised on flush under contention.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh, _exclusive_file_lock(fh):
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with _exclusive_file_lock(lock_path), path.open("a", encoding="utf-8") as fh:
             fh.write(record.model_dump_json(by_alias=True) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -522,49 +582,67 @@ class LinkStore:
 
 
 @contextlib.contextmanager
-def _exclusive_file_lock(fh: IO[str], *, retry_seconds: float = 5.0) -> Iterator[None]:
-    """Acquire an OS-level exclusive lock on *fh* for the duration of the block.
+def _exclusive_file_lock(lock_path: Path, *, retry_seconds: float = 5.0) -> Iterator[None]:
+    """Acquire an exclusive OS-level lock on ``<lock_path>`` for the block.
 
-    Linux/macOS: ``fcntl.flock(LOCK_EX)``.
-    Windows: ``msvcrt.locking`` with retry-with-backoff.
+    Sidecar-file pattern: the lock is placed on a SEPARATE companion
+    file, not the data file being written. This decouples the lock
+    region from the data file's EOF — important on Windows where
+    ``msvcrt.locking`` is mandatory and locking-at-EOF causes
+    PermissionError on subsequent flushes if another process's
+    write extends past the locked byte.
 
-    The lock is advisory (Unix) but mandatory (Windows for the locked range);
-    either way two processes calling ``_do_append`` concurrently will
-    serialize through this lock, so each one's
-    ``write + flush + fsync`` window is exclusive.
-
-    A 5-second retry budget on Windows tolerates short bursts of contention
-    without raising; in practice, append windows are sub-millisecond, so
-    contention beyond this would indicate a deadlock or stuck holder.
+    * Linux/macOS: ``fcntl.flock(LOCK_EX)`` (whole-file advisory).
+      Released automatically on file close + on process death.
+    * Windows: ``msvcrt.locking(LK_NBLCK, 1)`` at byte 0 of the lock
+      file with retry-with-backoff (default 5s budget). Released by
+      explicit ``LK_UNLCK`` at the same byte 0; lock file is closed
+      after release. No write ever extends the lock file beyond byte
+      0, so the mandatory lock never collides with user data writes.
     """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
         import msvcrt
 
-        deadline = time.monotonic() + retry_seconds
-        while True:
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.01)
+        # Open the lock file in binary read+write+create; we never
+        # write to it after creating it, but we need a valid byte at
+        # offset 0 for msvcrt.locking to lock.
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            yield
+            # Ensure at least one byte exists so we can lock byte 0.
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+
+            deadline = time.monotonic() + retry_seconds
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         finally:
             with contextlib.suppress(OSError):
-                # Seek-back-and-unlock pattern: msvcrt.locking unlocks at
-                # the file pointer's current offset, which after a write
-                # may have advanced past the locked byte.  Reset to
-                # offset 0 to match where we acquired the lock.
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                os.close(fd)
     else:
         import fcntl
 
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            yield
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             with contextlib.suppress(OSError):
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                os.close(fd)
