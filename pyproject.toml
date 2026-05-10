@@ -37,6 +37,10 @@ dependencies = [
   "click >=8.1,<9",
   # Hashing helpers
   "simhash >=2.1,<3",
+  # File-system watcher (W6c scry watch)
+  "watchdog >=4.0,<5",
+  # Windows IPC (named-pipe support — no-op on Linux/macOS)
+  "pywin32 >=308; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
@@ -107,6 +111,10 @@ packages = ["scry"]
 module = ["sqlite_vec.*", "fastembed.*", "tree_sitter_language_pack.*", "simhash.*", "litellm.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["win32api", "win32event", "win32file", "win32pipe", "win32security", "pywintypes", "winerror"]
+ignore_missing_imports = true
+
 # ─── pytest ──────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 minversion = "8.0"
@@ -133,4 +141,10 @@ exclude_lines = [
   "raise NotImplementedError",
   "if TYPE_CHECKING:",
   "if __name__ == .__main__.:",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=0.26.0",
 ]

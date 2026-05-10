@@ -49,7 +49,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, TypeAlias
 
+from scry.lsp.adapters.gopls import GoplsAdapter
 from scry.lsp.adapters.pyright import PyrightAdapter
+from scry.lsp.adapters.rust_analyzer import RustAnalyzerAdapter
 from scry.lsp.adapters.typescript_ls import TypeScriptLSAdapter
 from scry.lsp.adapters.uri import is_local_file_uri
 from scry.lsp.adapters.zls import ZlsAdapter
@@ -57,7 +59,9 @@ from scry.lsp.adapters.zls import ZlsAdapter
 __all__ = [
     "ADAPTERS",
     "AdapterProtocol",
+    "GoplsAdapter",
     "PyrightAdapter",
+    "RustAnalyzerAdapter",
     "TypeScriptLSAdapter",
     "ZlsAdapter",
     "get_adapter",
@@ -101,16 +105,20 @@ class AdapterProtocol(Protocol):
 # Union of all concrete adapter *classes* (not instances).  Using an explicit
 # Union rather than ``type[AdapterProtocol]`` avoids mypy --strict ambiguity
 # around Protocol metaclass checking while preserving full static typing.
-_AnyAdapter: TypeAlias = type[PyrightAdapter] | type[TypeScriptLSAdapter] | type[ZlsAdapter]
+_AnyAdapter: TypeAlias = (
+    type[PyrightAdapter]
+    | type[TypeScriptLSAdapter]
+    | type[ZlsAdapter]
+    | type[GoplsAdapter]
+    | type[RustAnalyzerAdapter]
+)
 
 
 # ─── Registry ─────────────────────────────────────────────────────────
 
 #: Maps **scry-side language IDs** → adapter class.
-#: Keys mirror the :data:`~scry.lsp.manager.LSP_ALLOWLIST` entries for
-#: languages that have a dedicated W3c adapter.  Languages in the allowlist
-#: without an adapter (``go``, ``rust``) fall back to minimal inline params
-#: in :class:`~scry.lsp.manager.LSPSession`.
+#: Keys mirror the :data:`~scry.lsp.manager.LSP_ALLOWLIST` entries.
+#: All languages in the allowlist now have a dedicated W3c adapter.
 ADAPTERS: dict[str, _AnyAdapter] = {
     "python": PyrightAdapter,
     "typescript": TypeScriptLSAdapter,
@@ -118,6 +126,8 @@ ADAPTERS: dict[str, _AnyAdapter] = {
     "javascript": TypeScriptLSAdapter,
     "jsx": TypeScriptLSAdapter,
     "zig": ZlsAdapter,
+    "go": GoplsAdapter,
+    "rust": RustAnalyzerAdapter,
 }
 
 
@@ -136,7 +146,7 @@ def get_adapter(language: str) -> _AnyAdapter | None:
 
     Returns
     -------
-    type[PyrightAdapter] | type[TypeScriptLSAdapter] | type[ZlsAdapter] | None
+    type[PyrightAdapter] | type[TypeScriptLSAdapter] | type[ZlsAdapter] | type[GoplsAdapter] | type[RustAnalyzerAdapter] | None
         The adapter class, or ``None`` when no adapter is registered.
     """
     return ADAPTERS.get(language)

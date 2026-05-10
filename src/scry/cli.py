@@ -24,7 +24,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import click
 
@@ -332,15 +332,50 @@ def index(ctx: click.Context, force: bool, reembed: bool) -> None:
 
 
 @main.command("watch")
+@click.option(
+    "--debounce-ms",
+    default=500,
+    type=int,
+    show_default=True,
+    help="Milliseconds of quiet after the last file event before triggering reindex.",
+)
+@click.option(
+    "--once",
+    is_flag=True,
+    help="Run a single reindex pass then exit (useful for scripting/testing).",
+)
+@click.option(
+    "--reconnect-timeout",
+    default=60,
+    type=int,
+    show_default=True,
+    help="Seconds to keep retrying IPC before giving up when the leader disappears mid-watch.",
+)
 @click.pass_context
-def watch(ctx: click.Context) -> None:
-    """File watcher — deferred to Wave 6.
+def watch(ctx: click.Context, debounce_ms: int, once: bool, reconnect_timeout: int) -> None:
+    """Watch for file changes and reindex incrementally.
 
-    .. note::
-        ``scry watch`` is deferred to Wave 6. It will reindex on file change
-        and coordinate with the leader process via IPC.
+    Requires a running leader process (``scry mcp``).  ``scry watch`` acts as
+    a follower: file events are forwarded to the leader via IPC so the leader
+    owns the single write path.  Exits with code 2 if no leader is detected.
+
+    Press Ctrl+C to stop.
     """
-    click.echo("scry watch is deferred to Wave 6")
+    from scry.cmd_watch import WatchError, run_watch
+
+    repo = _resolve_repo_root(ctx)
+    try:
+        exit_code = asyncio.run(
+            run_watch(repo, debounce_ms=debounce_ms, once=once, reconnect_timeout=reconnect_timeout)
+        )
+    except WatchError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        pass  # clean Ctrl+C exit
+    else:
+        if exit_code != 0:
+            raise SystemExit(exit_code)
 
 
 # ─── scry check ───────────────────────────────────────────────────────────────
@@ -1134,6 +1169,148 @@ def reconcile(
         yes=yes,
         json_output=json_output,
     )
+
+
+# ─── scry callers / scry subclasses (W6e — DESIGN.md lines 1444-1445) ────────
+
+
+@main.command("callers")
+@click.argument("anchor_id", type=str)
+@click.option(
+    "--max-depth",
+    default=1,
+    type=int,
+    show_default=True,
+    help="BFS depth for incomingCalls walk (1 = direct callers only).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+@click.pass_context
+def callers(ctx: click.Context, anchor_id: str, max_depth: int, as_json: bool) -> None:
+    """Show symbols that CALL the given code anchor (W6e reverse query)."""
+    import asyncio as _asyncio
+
+    from scry.mcp.handlers import MCPContext, MCPServerError
+    from scry.mcp.handlers import get_callers as _get_callers
+
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(2) from None
+
+    try:
+        config = load_config(repo)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    async def _run() -> dict[str, Any]:
+        from scry.embed import StubEmbedder
+        from scry.process.ipc import IPCClient as _IPC
+
+        with ScryDB(repo, read_only=True) as db:
+            git_ctx_prov = GitContextProvider(repo)
+            overlay_mgr = OverlayManager(repo, git_context=git_ctx_prov)
+            mcp_ctx = MCPContext(
+                repo_root=repo,
+                config=config,
+                db=db,
+                embedder=StubEmbedder(),
+                git_context=git_ctx_prov,
+                overlay_mgr=overlay_mgr,
+                indexer=None,
+                role="leader",
+                ipc_client=cast(_IPC | None, None),
+            )
+            return await _get_callers(mcp_ctx, anchor_id=anchor_id, max_depth=max_depth)
+
+    try:
+        result = _asyncio.run(_run())
+    except MCPServerError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    callers_list: list[dict[str, Any]] = result.get("callers", [])
+    if not callers_list:
+        click.echo("No callers found.")
+        return
+    click.echo(f"Found {len(callers_list)} caller(s) of {anchor_id}:")
+    for c in callers_list:
+        anchor = c.get("anchor_id") or "(unindexed)"
+        click.echo(f"  {anchor}  {c.get('path')}  symbol={c.get('symbol_name')!r}")
+
+
+@main.command("subclasses")
+@click.argument("anchor_id", type=str)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+@click.pass_context
+def subclasses(ctx: click.Context, anchor_id: str, as_json: bool) -> None:
+    """Show classes that EXTEND the given class anchor (W6e reverse query)."""
+    import asyncio as _asyncio
+
+    from scry.mcp.handlers import MCPContext, MCPServerError
+    from scry.mcp.handlers import get_subclasses as _get_subclasses
+
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(2) from None
+
+    try:
+        config = load_config(repo)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    async def _run() -> dict[str, Any]:
+        from scry.embed import StubEmbedder
+        from scry.process.ipc import IPCClient as _IPC
+
+        with ScryDB(repo, read_only=True) as db:
+            git_ctx_prov = GitContextProvider(repo)
+            overlay_mgr = OverlayManager(repo, git_context=git_ctx_prov)
+            mcp_ctx = MCPContext(
+                repo_root=repo,
+                config=config,
+                db=db,
+                embedder=StubEmbedder(),
+                git_context=git_ctx_prov,
+                overlay_mgr=overlay_mgr,
+                indexer=None,
+                role="leader",
+                ipc_client=cast(_IPC | None, None),
+            )
+            return await _get_subclasses(mcp_ctx, anchor_id=anchor_id)
+
+    try:
+        result = _asyncio.run(_run())
+    except MCPServerError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    subs: list[dict[str, Any]] = result.get("subclasses", [])
+    if not subs:
+        click.echo("No subclasses found.")
+        return
+    click.echo(f"Found {len(subs)} subclass(es) of {anchor_id}:")
+    for s in subs:
+        anchor = s.get("anchor_id") or "(unindexed)"
+        click.echo(f"  {anchor}  {s.get('path')}  symbol={s.get('symbol_name')!r}")
 
 
 # ─── scry doctor ──────────────────────────────────────────────────────────────

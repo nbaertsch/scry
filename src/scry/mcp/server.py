@@ -251,6 +251,28 @@ class MCPServer:
                 ),
             )
 
+        @mcp.tool()
+        async def get_callers(anchor_id: str, max_depth: int = 1) -> dict[str, Any]:
+            """Return symbols that CALL the given code anchor (W6e — DESIGN.md line 1444)."""
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "get_callers",
+                    {"anchor_id": anchor_id, "max_depth": max_depth},
+                ),
+            )
+
+        @mcp.tool()
+        async def get_subclasses(anchor_id: str) -> dict[str, Any]:
+            """Return classes that EXTEND the given class anchor (W6e — DESIGN.md line 1445)."""
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "get_subclasses",
+                    {"anchor_id": anchor_id},
+                ),
+            )
+
     # ─── Dispatch ────────────────────────────────────────────────────────────
 
     async def _dispatch(self, op: str, args: dict[str, Any]) -> Any:

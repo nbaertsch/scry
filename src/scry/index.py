@@ -66,6 +66,7 @@ from scry.extract.code import extract_code_symbols
 from scry.extract.markdown import extract_markdown
 from scry.git_context import GitContextError, GitContextProvider
 from scry.lsp.closure import CalleeRef, compute_closure
+from scry.lsp.full_resolution import compute_closure_full, supports_full_mode
 from scry.models import Anchor, AnchorType, Config, Frontmatter, IndexMetadata, TransitiveHashStatus
 from scry.store.db import ScryDB, _now_iso, _upsert_anchor_in_txn
 
@@ -93,6 +94,10 @@ _EXT_TO_LANG: dict[str, str] = {
     ".js": "javascript",
     ".jsx": "jsx",
     ".zig": "zig",
+    # W6d HIGH #1: Go and Rust — LSP enrichment reaches these files even though
+    # tree-sitter extraction returns [] (no Go/Rust grammar bundled yet).
+    ".go": "go",
+    ".rs": "rust",
 }
 
 # Number of anchors processed per reembed batch transaction.
@@ -475,6 +480,7 @@ class Indexer:
                     lsp_mgr,
                     self._repo_root,
                     max_depth=max_depth,
+                    transitive_resolution=config.code_anchors.transitive_resolution,
                 )
                 try:
                     asyncio.get_running_loop()
@@ -655,6 +661,7 @@ class Indexer:
                     lsp_mgr,
                     self._repo_root,
                     max_depth=max_depth,
+                    transitive_resolution=config.code_anchors.transitive_resolution,
                 )
 
             # ── Phase 3: Embed and store ─────────────────────────────────
@@ -1101,6 +1108,9 @@ _LANG_ID: dict[str, str] = {
     "javascript": "javascript",
     "jsx": "javascriptreact",
     "zig": "zig",
+    # W6d HIGH #1: standard LSP language IDs for Go and Rust.
+    "go": "go",
+    "rust": "rust",
 }
 
 
@@ -1121,6 +1131,7 @@ async def _enrich_all_with_lsp(
     repo_root: Path,
     *,
     max_depth: int,
+    transitive_resolution: Literal["call_only", "full"] = "call_only",
     timeout_per_call: float = 10.0,
 ) -> list[Anchor]:
     """Run the LSP closure walk for every CODE anchor and return updated list.
@@ -1212,6 +1223,15 @@ async def _enrich_all_with_lsp(
             # Track opened URIs for this session (one didOpen per file).
             opened_uris: set[str] = set()
 
+            # Compute per-language full-mode gate once (avoids per-anchor logging).
+            use_full_mode = transitive_resolution == "full" and supports_full_mode(lang)
+            if transitive_resolution == "full" and not use_full_mode:
+                logger.warning(
+                    "transitive_resolution=full is not supported for language"
+                    " '%s'; falling back to call_only",
+                    lang,
+                )
+
             try:
                 for anchor in lang_anchors:
                     abs_path = repo_root / anchor.path
@@ -1238,14 +1258,24 @@ async def _enrich_all_with_lsp(
                     def_line = anchor.def_line if anchor.def_line is not None else 0
                     def_char = anchor.def_char if anchor.def_char is not None else 0
 
-                    result = await compute_closure(
-                        session,
-                        file_uri,
-                        def_line,
-                        def_char,
-                        max_depth=max_depth,
-                        timeout_per_call=timeout_per_call,
-                    )
+                    if use_full_mode:
+                        result = await compute_closure_full(
+                            session,
+                            file_uri,
+                            def_line,
+                            def_char,
+                            max_depth=max_depth,
+                            timeout_per_call=timeout_per_call,
+                        )
+                    else:
+                        result = await compute_closure(
+                            session,
+                            file_uri,
+                            def_line,
+                            def_char,
+                            max_depth=max_depth,
+                            timeout_per_call=timeout_per_call,
+                        )
 
                     enriched[anchor.id] = anchor.model_copy(
                         update={

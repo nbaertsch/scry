@@ -63,7 +63,9 @@ __all__ = [
     "commit_links",
     "find_drift",
     "get_anchor",
+    "get_callers",
     "get_links",
+    "get_subclasses",
     "propose_link",
     "reindex",
     "repo_summary",
@@ -72,6 +74,18 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# Mapping from lowercase file extension → LSP language name (mirrors index.py).
+_EXT_TO_LANG: dict[str, str] = {
+    ".py": "python",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".js": "javascript",
+    ".jsx": "jsx",
+    ".zig": "zig",
+    ".go": "go",
+    ".rs": "rust",
+}
 
 
 # ─── Exceptions ───────────────────────────────────────────────────────────────
@@ -780,6 +794,282 @@ async def _run_index(indexer: Indexer, *, force: bool) -> Any:
     return await indexer.index_async(force=force)
 
 
+# ─── LSP reverse-link handlers (W6e) ─────────────────────────────────────────
+
+
+async def get_callers(
+    ctx: MCPContext,
+    anchor_id: str,
+    *,
+    max_depth: int = 1,
+) -> dict[str, Any]:
+    """Return symbols that CALL the given code anchor.
+
+    Leverages ``callHierarchy/incomingCalls`` — the inverse of the transitive
+    outgoing-call closure built in W3b.
+
+    Args:
+        ctx:        Injected :class:`MCPContext`.
+        anchor_id:  Primary ID of the target anchor (must be ``CODE`` type).
+        max_depth:  Number of incomingCalls hops to walk.  Default ``1``
+                    returns direct callers only; values ``> 1`` return
+                    transitive callers via BFS.
+
+    Returns:
+        Dict with keys:
+
+        * ``callers`` — list of caller dicts, each with:
+          - ``anchor_id``: scry anchor ID if found in the index, else ``None``
+          - ``path``: repo-relative path inferred from the URI
+          - ``symbol_name``: caller's symbol name from LSP
+          - ``uri``: raw LSP file URI
+          - ``range_start_line``, ``range_start_char``, ``range_end_line``,
+            ``range_end_char``: position in the caller's file
+        * ``index_state``: current index state string
+
+    Raises:
+        :class:`MCPServerError`: If *anchor_id* is not found, is not CODE
+            type, or has no persisted LSP position (def_line / def_char).
+    """
+    from pathlib import Path as _Path
+
+    from scry.lsp.manager import LSPManager as _LSPManager
+    from scry.lsp.reverse import get_callers as _get_callers
+
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
+    anchor = ctx.db.get_anchor(anchor_id)
+    if anchor is None:
+        raise MCPServerError(f"Anchor not found: {anchor_id!r}")
+    if anchor.type != AnchorType.CODE:
+        raise MCPServerError(
+            f"Anchor {anchor_id!r} is not CODE type (got {anchor.type!r}); "
+            "get_callers requires a CODE anchor"
+        )
+    if anchor.def_line is None or anchor.def_char is None:
+        raise MCPServerError(
+            f"Anchor {anchor_id!r} has no persisted LSP position "
+            "(def_line / def_char are None — run `scry index` to populate them)"
+        )
+
+    suffix = _Path(anchor.path).suffix.lower()
+    lang = _EXT_TO_LANG.get(suffix)
+    if lang is None:
+        raise MCPServerError(
+            f"Cannot infer LSP language from path {anchor.path!r} "
+            f"(unsupported extension {suffix!r})"
+        )
+
+    file_uri = (ctx.repo_root / anchor.path).as_uri()
+    def_line: int = anchor.def_line
+    def_char: int = anchor.def_char
+
+    # Build a position-to-anchor-id lookup from indexed CODE anchors.
+    pos_to_id: dict[tuple[str, int, int], str] = {}
+    for a in ctx.db.list_anchors(anchor_type=AnchorType.CODE):
+        if a.def_line is not None and a.def_char is not None:
+            a_uri = (ctx.repo_root / a.path).as_uri()
+            pos_to_id[(a_uri, a.def_line, a.def_char)] = a.id
+
+    async with _LSPManager(ctx.repo_root, ctx.config.code_anchors) as mgr:
+        session = await mgr.session_for(lang)
+        if session is None:
+            return {"callers": [], "index_state": index_state}
+
+        caller_refs = await _get_callers(
+            session,
+            file_uri,
+            def_line,
+            def_char,
+            max_depth=max_depth,
+        )
+
+    def _uri_to_path(uri: str) -> str:
+        """Convert file:// URI to a repo-relative path best-effort."""
+        try:
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(uri)
+            if parsed.scheme.lower() != "file":
+                return uri
+            raw = unquote(parsed.path)
+            if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                raw = raw[1:]
+            from pathlib import Path as _P
+
+            full = _P(raw)
+            try:
+                return str(full.relative_to(ctx.repo_root)).replace("\\", "/")
+            except ValueError:
+                return str(full)
+        except Exception:
+            return uri
+
+    callers_out: list[dict[str, Any]] = []
+    for ref in caller_refs:
+        matched_id = pos_to_id.get((ref.uri, ref.range_start_line, ref.range_start_char))
+        callers_out.append(
+            {
+                "anchor_id": matched_id,
+                "path": _uri_to_path(ref.uri),
+                "symbol_name": ref.name,
+                "uri": ref.uri,
+                "range_start_line": ref.range_start_line,
+                "range_start_char": ref.range_start_char,
+                "range_end_line": ref.range_end_line,
+                "range_end_char": ref.range_end_char,
+            }
+        )
+
+    return {"callers": callers_out, "index_state": index_state}
+
+
+async def get_subclasses(
+    ctx: MCPContext,
+    anchor_id: str,
+) -> dict[str, Any]:
+    """Return classes that extend / implement the given code anchor.
+
+    Uses ``textDocument/implementation`` (the LSP standard for subclass
+    discovery).  The queried anchor should represent a class or interface.
+
+    Args:
+        ctx:        Injected :class:`MCPContext`.
+        anchor_id:  Primary ID of the class anchor (must be ``CODE`` type).
+
+    Returns:
+        Dict with keys:
+
+        * ``subclasses`` — list of subclass dicts, each with:
+          - ``anchor_id``: scry anchor ID if found in the index, else ``None``
+          - ``path``: repo-relative path inferred from the URI
+          - ``symbol_name``: best-available name (anchor name or URI stem)
+          - ``uri``: raw LSP file URI
+          - ``range_start_line``, ``range_start_char``, ``range_end_line``,
+            ``range_end_char``: position in the subclass's file
+        * ``index_state``: current index state string
+
+    Raises:
+        :class:`MCPServerError`: If *anchor_id* is not found, is not CODE
+            type, or has no persisted LSP position.
+    """
+    from pathlib import Path as _Path
+
+    from scry.lsp.manager import LSPManager as _LSPManager
+    from scry.lsp.reverse import get_subclasses as _get_subclasses
+
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
+    anchor = ctx.db.get_anchor(anchor_id)
+    if anchor is None:
+        raise MCPServerError(f"Anchor not found: {anchor_id!r}")
+    if anchor.type != AnchorType.CODE:
+        raise MCPServerError(
+            f"Anchor {anchor_id!r} is not CODE type (got {anchor.type!r}); "
+            "get_subclasses requires a CODE anchor"
+        )
+    if anchor.def_line is None or anchor.def_char is None:
+        raise MCPServerError(
+            f"Anchor {anchor_id!r} has no persisted LSP position "
+            "(def_line / def_char are None — run `scry index` to populate them)"
+        )
+
+    suffix = _Path(anchor.path).suffix.lower()
+    lang = _EXT_TO_LANG.get(suffix)
+    if lang is None:
+        raise MCPServerError(
+            f"Cannot infer LSP language from path {anchor.path!r} "
+            f"(unsupported extension {suffix!r})"
+        )
+
+    file_uri = (ctx.repo_root / anchor.path).as_uri()
+    def_line_s: int = anchor.def_line
+    def_char_s: int = anchor.def_char
+
+    # Build position → anchor_id lookup from indexed CODE anchors.
+    pos_to_id: dict[tuple[str, int, int], str] = {}
+    for a in ctx.db.list_anchors(anchor_type=AnchorType.CODE):
+        if a.def_line is not None and a.def_char is not None:
+            a_uri = (ctx.repo_root / a.path).as_uri()
+            pos_to_id[(a_uri, a.def_line, a.def_char)] = a.id
+
+    async with _LSPManager(ctx.repo_root, ctx.config.code_anchors) as mgr:
+        session = await mgr.session_for(lang)
+        if session is None:
+            return {"subclasses": [], "index_state": index_state}
+
+        subclass_refs = await _get_subclasses(
+            session,
+            file_uri,
+            def_line_s,
+            def_char_s,
+        )
+
+    def _uri_to_path(uri: str) -> str:
+        try:
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(uri)
+            if parsed.scheme.lower() != "file":
+                return uri
+            raw = unquote(parsed.path)
+            if raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
+                raw = raw[1:]
+            from pathlib import Path as _P
+
+            full = _P(raw)
+            try:
+                return str(full.relative_to(ctx.repo_root)).replace("\\", "/")
+            except ValueError:
+                return str(full)
+        except Exception:
+            return uri
+
+    subclasses_out: list[dict[str, Any]] = []
+    for ref in subclass_refs:
+        matched_id = pos_to_id.get((ref.uri, ref.range_start_line, ref.range_start_char))
+        # Prefer indexed anchor's symbol_name over URI stem when available.
+        if matched_id is not None:
+            matched_anchor = ctx.db.get_anchor(matched_id)
+            name = (
+                matched_anchor.symbol_name
+                if matched_anchor is not None and matched_anchor.symbol_name
+                else ref.name
+            )
+        else:
+            name = ref.name
+        subclasses_out.append(
+            {
+                "anchor_id": matched_id,
+                "path": _uri_to_path(ref.uri),
+                "symbol_name": name,
+                "uri": ref.uri,
+                "range_start_line": ref.range_start_line,
+                "range_start_char": ref.range_start_char,
+                "range_end_line": ref.range_end_line,
+                "range_end_char": ref.range_end_char,
+            }
+        )
+
+    return {"subclasses": subclasses_out, "index_state": index_state}
+
+
 # ─── Dispatch table ───────────────────────────────────────────────────────────
 
 #: Maps MCP tool names to their handler functions.
@@ -795,4 +1085,6 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     "status": status,
     "repo_summary": repo_summary,
     "reindex": reindex,
+    "get_callers": get_callers,
+    "get_subclasses": get_subclasses,
 }

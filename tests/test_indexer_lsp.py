@@ -226,6 +226,59 @@ class TestHelperFunctions:
         # Unknown languages pass through unchanged.
         assert _lang_to_language_id("ruby") == "ruby"
 
+    # W6d HIGH #1: Go and Rust extension/language mappings
+    def test_ext_to_lang_go(self) -> None:
+        assert _ext_to_lang("src/main.go") == "go"
+
+    def test_ext_to_lang_rust(self) -> None:
+        assert _ext_to_lang("src/lib.rs") == "rust"
+
+    def test_lang_to_language_id_go(self) -> None:
+        assert _lang_to_language_id("go") == "go"
+
+    def test_lang_to_language_id_rust(self) -> None:
+        assert _lang_to_language_id("rust") == "rust"
+
+    def test_go_file_classified_as_code(self, tmp_path: Path) -> None:
+        """classify_for_extraction returns code + go for a .go file (W6d HIGH #1)."""
+        from scry.config import load_config
+        from scry.index import Indexer
+
+        scry_dir = tmp_path / ".scry"
+        scry_dir.mkdir()
+        (scry_dir / "overlays").mkdir()
+        (scry_dir / "config.yaml").write_text(
+            "include:\n  - '**/*.go'\ncode_anchors:\n  languages:\n    go: lsp\n",
+            encoding="utf-8",
+        )
+        go_file = tmp_path / "main.go"
+        go_file.write_text("package main\nfunc main() {}\n", encoding="utf-8")
+        config = load_config(tmp_path)
+        indexer = Indexer(tmp_path, config=config)
+        target = indexer.classify_for_extraction(go_file)
+        assert target.kind == "code"
+        assert target.language == "go"
+
+    def test_rust_file_classified_as_code(self, tmp_path: Path) -> None:
+        """classify_for_extraction returns code + rust for a .rs file (W6d HIGH #1)."""
+        from scry.config import load_config
+        from scry.index import Indexer
+
+        scry_dir = tmp_path / ".scry"
+        scry_dir.mkdir()
+        (scry_dir / "overlays").mkdir()
+        (scry_dir / "config.yaml").write_text(
+            "include:\n  - '**/*.rs'\ncode_anchors:\n  languages:\n    rust: lsp\n",
+            encoding="utf-8",
+        )
+        rs_file = tmp_path / "lib.rs"
+        rs_file.write_text("fn main() {}\n", encoding="utf-8")
+        config = load_config(tmp_path)
+        indexer = Indexer(tmp_path, config=config)
+        target = indexer.classify_for_extraction(rs_file)
+        assert target.kind == "code"
+        assert target.language == "rust"
+
 
 # ─── LSPManager.status_for() ──────────────────────────────────────────────────
 

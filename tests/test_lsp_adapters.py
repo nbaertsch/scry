@@ -262,10 +262,19 @@ def test_get_adapter_nonexistent_returns_none() -> None:
     assert get_adapter("") is None
 
 
-def test_get_adapter_allowlisted_without_adapter_returns_none() -> None:
-    """go and rust are in LSP_ALLOWLIST but have no W3c adapter yet."""
-    assert get_adapter("go") is None
-    assert get_adapter("rust") is None
+def test_all_allowlisted_languages_have_adapters() -> None:
+    """W6a: every language in LSP_ALLOWLIST now has a dedicated adapter.
+
+    Previously 'go' and 'rust' lacked W3c adapters and fell back to minimal
+    inline params.  W6a adds GoplsAdapter and RustAnalyzerAdapter, completing
+    full adapter coverage of the allowlist.
+    """
+    from scry.lsp.manager import LSP_ALLOWLIST
+
+    for lang in LSP_ALLOWLIST:
+        assert get_adapter(lang) is not None, (
+            f"LSP_ALLOWLIST language '{lang}' has no adapter — add one or update LSP_ALLOWLIST."
+        )
 
 
 def test_adapters_dict_covers_allowlist_intersection() -> None:
@@ -387,11 +396,12 @@ async def test_zls_adapter_params_reach_fake_lsp(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-async def test_no_adapter_fallback_still_works(tmp_path: Path) -> None:
-    """Integration: a language without an adapter falls back to minimal params.
+async def test_go_adapter_session_works_with_fake_lsp(tmp_path: Path) -> None:
+    """Integration: GoplsAdapter params flow through LSPSession.start() correctly.
 
-    'go' and 'rust' are in LSP_ALLOWLIST but have no W3c adapter; the
-    manager falls back to the pre-W3c inline initialize params.
+    'go' is now covered by GoplsAdapter (W6a); the manager uses its
+    prepare_initialize_params() instead of the minimal fallback.  The fake LSP
+    accepts any init params and returns canned capabilities.
     """
     from scry.lsp.manager import LSPLaunchSpec, LSPSession
 

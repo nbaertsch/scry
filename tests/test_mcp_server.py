@@ -560,7 +560,7 @@ async def test_reindex_follower_raises(git_repo: Path) -> None:
 
 
 def test_handlers_dict_covers_all_tools() -> None:
-    """HANDLERS covers all 10 MCP tool names."""
+    """HANDLERS covers all 12 MCP tool names."""
     expected = {
         "search",
         "get_anchor",
@@ -572,6 +572,8 @@ def test_handlers_dict_covers_all_tools() -> None:
         "status",
         "repo_summary",
         "reindex",
+        "get_callers",
+        "get_subclasses",
     }
     assert set(HANDLERS.keys()) == expected
 

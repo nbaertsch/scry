@@ -15,7 +15,7 @@ Covers:
   - Unix socket mode 0600 after start (unix_only)
   - SO_PEERCRED code path verification (unix_only)
   - _IdempotencyCache LRU eviction (unit test, no server needed)
-  - Windows stubs raise NotImplementedError (windows_only)
+  - Windows pipe: server starts, client call succeeds (windows_only)
 """
 
 from __future__ import annotations
@@ -742,25 +742,33 @@ async def test_so_peercred_same_user_allowed(tmp_repo: Path, unix_only: None) ->
 # ─── Windows stubs ────────────────────────────────────────────────────
 
 
+# ─── Windows pipe smoke tests ─────────────────────────────────────────
+
+
 @pytest.mark.windows_only
-async def test_windows_ipc_server_raises_not_implemented(
-    tmp_repo: Path, windows_only: None
-) -> None:
-    """On Windows, IPCServer.start() raises NotImplementedError (Wave 6 gap)."""
+async def test_windows_ipc_server_starts(tmp_repo: Path, windows_only: None) -> None:
+    """On Windows, IPCServer.start() should succeed and bind a named pipe."""
     srv = IPCServer(tmp_repo, handler=_async_echo)
-    with pytest.raises(NotImplementedError, match="pywin32"):
-        await srv.start()
+    await srv.start()
+    try:
+        assert srv.endpoint_uri.startswith("pipe:")
+    finally:
+        await srv.stop()
 
 
 @pytest.mark.windows_only
-async def test_windows_ipc_client_raises_not_implemented(
-    tmp_repo: Path, windows_only: None
-) -> None:
-    """On Windows, IPCClient.call() raises NotImplementedError (Wave 6 gap)."""
-    spec = parse_endpoint_uri("pipe:scry-abc123", tmp_repo)
+async def test_windows_ipc_client_call_returns_result(tmp_repo: Path, windows_only: None) -> None:
+    """On Windows, IPCClient.call() connects to the server and returns a result."""
+    srv = IPCServer(tmp_repo, handler=_async_echo)
+    await srv.start()
+    spec = parse_endpoint_uri(srv.endpoint_uri, tmp_repo)
     client = IPCClient(spec)
-    with pytest.raises(NotImplementedError, match="pywin32"):
-        await client.call("status", {})
+    try:
+        result = await client.call("status", {})
+        assert result == {"op": "status"}
+    finally:
+        await client.close()
+        await srv.stop()
 
 
 # ─── WRITE_OPS constant ───────────────────────────────────────────────

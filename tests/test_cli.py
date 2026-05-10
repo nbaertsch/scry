@@ -11,8 +11,9 @@ The ``SCRY_EMBEDDER=stub`` environment variable is set on every CliRunner
 invocation so that fastembed weights are never downloaded during tests.
 
 Stub notes:
-- ``scry watch`` and ``scry suggest-links`` are verified to print their
-  deferral messages and exit 0.
+- ``scry watch`` requires a running leader (W6c) and exits 2 when none is
+  running. Tests mock ``detect_leader_state`` appropriately.
+- ``scry suggest-links`` deferral message test remains.
 - ``scry reconcile`` is now a live command (W5c); see test_reconcile_cmd.py.
 - ``scry mcp`` is tested by passing an instantly-closing stdin (via
   CliRunner's input="") — the server is expected to exit cleanly without
@@ -367,14 +368,32 @@ class TestIndex:
 
 
 class TestWatch:
-    """Tests for ``scry watch`` (Wave 6 stub)."""
+    """Tests for ``scry watch`` (W6c — requires a running leader)."""
 
-    def test_watch_prints_deferred_message(self, runner: CliRunner, tmp_path: Path) -> None:
-        """scry watch prints deferral message and exits 0."""
+    def test_watch_no_leader_exits_2(self, runner: CliRunner, tmp_path: Path) -> None:
+        """scry watch exits 2 and prints an error when no leader is running (W6c BLOCKING #1)."""
+        from unittest.mock import patch
+
+        from scry.process.leader import LeaderState
+
         with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(main, ["watch"], env=_STUB_ENV, catch_exceptions=False)
-        assert result.exit_code == 0
-        assert "Wave 6" in result.output
+            repo = Path.cwd()
+            # Create a minimal .scry dir so _resolve_repo_root is satisfied.
+            scry_dir = repo / ".scry"
+            scry_dir.mkdir()
+            (scry_dir / "overlays").mkdir()
+            with patch(
+                "scry.cmd_watch.detect_leader_state",
+                return_value=(LeaderState.LEADER, None),
+            ):
+                result = runner.invoke(
+                    main,
+                    ["watch", "--once"],
+                    env=_STUB_ENV,
+                    catch_exceptions=False,
+                )
+        assert result.exit_code == 2
+        assert "requires a running leader" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -886,13 +905,40 @@ class TestGlobalFlags:
     """Tests for global flags on the main group."""
 
     def test_allow_untrusted_flag_accepted(self, runner: CliRunner, indexed_repo: Path) -> None:
-        """--allow-untrusted-lsp-config is accepted as a global flag."""
-        result = _run(
-            runner,
-            ["--allow-untrusted-lsp-config", "watch"],
-            repo=indexed_repo,
+        """--allow-untrusted-lsp-config is accepted as a global flag.
+
+        watch now requires a leader, so we mock detect_leader_state to confirm
+        the global flag is parsed (not rejected) and reaches the command.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from scry.process.ipc import IPCClient
+        from scry.process.leader import LeaderMetadata, LeaderState
+
+        fake_meta = LeaderMetadata(
+            pid=12345,
+            endpoint_uri="unix:/tmp/fake.sock",
+            boot_epoch_token="tok",
+            scry_version="0.0.1",
         )
-        # watch just prints its stub message; exit 0.
+        mock_client = MagicMock(spec=IPCClient)
+        mock_client.call = AsyncMock(return_value={})
+        mock_client.close = AsyncMock()
+
+        with (
+            patch(
+                "scry.cmd_watch.detect_leader_state",
+                return_value=(LeaderState.FOLLOWER, fake_meta),
+            ),
+            patch("scry.cmd_watch.parse_endpoint_uri", return_value=MagicMock()),
+            patch("scry.cmd_watch.IPCClient", return_value=mock_client),
+        ):
+            result = _run(
+                runner,
+                ["--allow-untrusted-lsp-config", "watch", "--once"],
+                repo=indexed_repo,
+            )
+        # Exit 0: flag parsed successfully and watch completed one follower pass.
         assert result.exit_code == 0
 
     def test_version_flag(self, runner: CliRunner, tmp_path: Path) -> None:

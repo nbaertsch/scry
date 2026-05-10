@@ -1,4 +1,4 @@
-"""IPC transport — Unix socket (Linux/macOS) or Windows named pipe (stub).
+"""IPC transport — Unix socket (Linux/macOS) or Windows named pipe.
 
 Implements the leader/follower JSON-over-stream protocol described in
 DESIGN.md §10.3 v3.1 and §10.5 for scry's multi-process coordination layer.
@@ -12,7 +12,7 @@ Public API summary::
     IPCResponse           - leader -> follower wire message
     IPCHandler            - Callable[[IPCRequest], Awaitable[IPCResponse]]
     WRITE_OPS             - ops that require an idempotency_token
-    IPCServer             - leader-side listener (Unix; NotImplementedError on Windows)
+    IPCServer             - leader-side listener (Unix socket or Windows named pipe)
     IPCClient             - follower-side connector
 
 Idempotency (DESIGN.md §10.3 v3.1):
@@ -22,15 +22,15 @@ Idempotency (DESIGN.md §10.3 v3.1):
 
 Per-op timeouts (DESIGN.md §10.3 v3.1):
     Short ops (propose_link, accept_link, status): default 5 s.
-    Long ops (commit_links, reindex): no timeout; heartbeat every 10 s keeps
-    the connection alive (Wave 2 tests verify the timeout path; full heartbeat
-    loop lands in Wave 6 scry watch).
+    Long ops (commit_links, reindex): heartbeat every 10 s keeps the connection
+    alive; the client enforces a lapse timeout (30 s by default) between
+    successive heartbeats/responses to detect a hung server.
 
-Windows IPC (DESIGN.md §10.5):
-    Named-pipe support (pywin32 + restrictive DACL) is **deferred to Wave 6**
-    (scry watch).  ``IPCServer.start()`` and ``IPCClient.call()`` raise
-    ``NotImplementedError`` on Windows.  The single-leader mode (no followers)
-    remains fully functional on Windows without IPC.
+Windows IPC (DESIGN.md §10.5, §10.7):
+    Named-pipe support via pywin32 with a restrictive DACL (current-user-only)
+    is implemented in Wave 6.  The DACL grants GENERIC_READ|GENERIC_WRITE
+    exclusively to the current user's SID; cross-user connections are rejected
+    at accept time via impersonation + SID comparison.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ import platform
 import re
 import struct
 import sys
+import threading
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -372,7 +373,20 @@ class _ConnectionHandler:
                     log.warning("IPC: malformed request, closing connection")
                     break
 
-                resp = await self._dispatch(req)
+                is_long_op = req.op in {"commit_links", "reindex"}
+                if is_long_op:
+                    hb_task: asyncio.Task[None] = asyncio.create_task(
+                        self._heartbeat(self._config.timeouts.long_heartbeat_interval)
+                    )
+                    try:
+                        resp = await self._dispatch(req)
+                    finally:
+                        hb_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await hb_task
+                else:
+                    resp = await self._dispatch(req)
+
                 try:
                     self._writer.write(_encode_response(resp))
                     await self._writer.drain()
@@ -394,69 +408,367 @@ class _ConnectionHandler:
         except Exception:
             pass
 
+    async def _heartbeat(self, interval: float) -> None:
+        """Send ``{"type":"heartbeat"}`` lines every *interval* seconds."""
+        hb_line = json.dumps({"type": "heartbeat"}, separators=(",", ":")).encode() + b"\n"
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                self._writer.write(hb_line)
+                await self._writer.drain()
+            except Exception:
+                return
+
     async def _dispatch(self, req: IPCRequest) -> IPCResponse:
         """Apply idempotency / validation / timeout, then call the handler."""
-        is_write = req.op in WRITE_OPS
+        return await _run_dispatch_logic(req, self._handler, self._cache, self._config)
 
-        if is_write:
-            token = req.idempotency_token
-            if token is None:
-                return IPCResponse(
-                    request_id=req.request_id,
-                    ok=False,
-                    error=f"Write op '{req.op}' requires idempotency_token",
-                    error_type="validation",
-                )
-            if not _validate_token(token):
-                return IPCResponse(
-                    request_id=req.request_id,
-                    ok=False,
-                    error=f"Invalid idempotency_token format: {token!r}",
-                    error_type="validation",
-                )
-            cached = self._cache.get(token)
-            if cached is not None:
-                log.debug("IPC: idempotency cache hit token=%s", token)
-                # Return cached payload; update request_id to the current one.
-                return IPCResponse(
-                    request_id=req.request_id,
-                    ok=cached.ok,
-                    result=cached.result,
-                    error=cached.error,
-                    error_type=cached.error_type,
-                )
 
-        is_long_op = req.op in {"commit_links", "reindex"}
-        server_timeout: float | None = None if is_long_op else self._config.timeouts.short
+# ─── Shared dispatch logic ────────────────────────────────────────────
+
+
+async def _run_dispatch_logic(
+    req: IPCRequest,
+    handler: IPCHandler,
+    cache: _IdempotencyCache,
+    config: IPCConfig,
+) -> IPCResponse:
+    """Apply idempotency / validation / timeout, then invoke the handler.
+
+    Shared by :class:`_ConnectionHandler` (Unix) and
+    :class:`_WinConnectionHandler` (Windows) so business logic is not
+    duplicated across transports.
+    """
+    is_write = req.op in WRITE_OPS
+
+    if is_write:
+        token = req.idempotency_token
+        if token is None:
+            return IPCResponse(
+                request_id=req.request_id,
+                ok=False,
+                error=f"Write op '{req.op}' requires idempotency_token",
+                error_type="validation",
+            )
+        if not _validate_token(token):
+            return IPCResponse(
+                request_id=req.request_id,
+                ok=False,
+                error=f"Invalid idempotency_token format: {token!r}",
+                error_type="validation",
+            )
+        cached = cache.get(token)
+        if cached is not None:
+            log.debug("IPC: idempotency cache hit token=%s", token)
+            return IPCResponse(
+                request_id=req.request_id,
+                ok=cached.ok,
+                result=cached.result,
+                error=cached.error,
+                error_type=cached.error_type,
+            )
+
+    is_long_op = req.op in {"commit_links", "reindex"}
+    server_timeout: float | None = None if is_long_op else config.timeouts.short
+
+    try:
+        if server_timeout is not None:
+            resp = await asyncio.wait_for(handler(req), timeout=server_timeout)
+        else:
+            resp = await handler(req)
+    except TimeoutError:
+        return IPCResponse(
+            request_id=req.request_id,
+            ok=False,
+            error=f"Op '{req.op}' timed out on server after {server_timeout}s",
+            error_type="timeout",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("IPC: handler raised for op=%s", req.op)
+        return IPCResponse(
+            request_id=req.request_id,
+            ok=False,
+            error=str(exc),
+            error_type="internal",
+        )
+
+    if is_write and req.idempotency_token is not None:
+        cache.put(req.idempotency_token, resp)
+
+    return resp
+
+
+# ─── Windows pipe I/O helpers ─────────────────────────────────────────
+
+
+def _win_get_current_user_sid() -> Any:
+    """Return the SID for the current user's account (Windows only)."""
+    import win32api
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(),
+        win32security.TOKEN_QUERY,
+    )
+    user_info = win32security.GetTokenInformation(token, win32security.TokenUser)
+    return user_info[0]
+
+
+def _win_build_pipe_sa() -> Any:
+    """Build a SECURITY_ATTRIBUTES that grants current-user-only pipe access.
+
+    The resulting DACL allows GENERIC_READ | GENERIC_WRITE exclusively for the
+    current user's SID — no other accounts can open the pipe handle.
+    """
+    import pywintypes
+    import win32file
+    import win32security
+
+    sid = _win_get_current_user_sid()
+
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+        sid,
+    )
+
+    sd = win32security.SECURITY_DESCRIPTOR()
+    sd.SetSecurityDescriptorDacl(True, dacl, False)
+
+    sa = pywintypes.SECURITY_ATTRIBUTES()
+    sa.SECURITY_DESCRIPTOR = sd
+    return sa
+
+
+class _WinPipeIO:
+    """Async-compatible I/O wrapper around a blocking Windows named-pipe HANDLE.
+
+    All blocking calls (ReadFile, WriteFile) are dispatched to the default
+    thread-pool executor via :func:`asyncio.to_thread`.  A :class:`threading.Lock`
+    serialises concurrent writes so heartbeat and response bytes never interleave
+    in the pipe's write buffer.
+    """
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._read_buf = b""
+        self._write_lock = threading.Lock()
+
+    def _readline_sync(self) -> bytes:
+        """Read bytes from the pipe until a newline is found (blocking).
+
+        Enforces ``MAX_MESSAGE_BYTES`` while accumulating chunks
+        (review-w6b MEDIUM): a same-user client could otherwise send an
+        unterminated oversized line and grow memory + thread-pool usage
+        unbounded.  When the buffered length exceeds the cap we drop the
+        connection by returning ``b""`` (the caller already treats empty
+        bytes as EOF and closes the pipe).
+        """
+        import pywintypes
+        import win32file
+
+        while True:
+            nl = self._read_buf.find(b"\n")
+            if nl >= 0:
+                line = self._read_buf[: nl + 1]
+                self._read_buf = self._read_buf[nl + 1 :]
+                return line
+            if len(self._read_buf) > MAX_MESSAGE_BYTES:
+                # Oversized unterminated line — abort the connection.
+                log.warning(
+                    "IPC(win): unterminated message exceeded %d bytes; closing pipe",
+                    MAX_MESSAGE_BYTES,
+                )
+                self._read_buf = b""
+                return b""
+            try:
+                _, data = win32file.ReadFile(self._handle, RECV_BUFFER_SIZE)
+                self._read_buf += data
+            except pywintypes.error as exc:
+                # ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+                # ERROR_OPERATION_ABORTED
+                if exc.args[0] in (109, 232, 233, 995):
+                    return b""
+                raise OSError(exc.args[0], exc.args[2]) from exc
+
+    async def readline(self) -> bytes:
+        """Async readline: delegates to the thread pool."""
+        return await asyncio.to_thread(self._readline_sync)
+
+    def _write_sync(self, data: bytes) -> None:
+        """Write *data* to the pipe (blocking, serialised by write lock)."""
+        import pywintypes
+        import win32file
+
+        if not data:
+            return
+        with self._write_lock:
+            try:
+                win32file.WriteFile(self._handle, data)
+            except pywintypes.error as exc:
+                raise OSError(exc.args[0], exc.args[2]) from exc
+
+    async def write_all(self, data: bytes) -> None:
+        """Async write: delegates to the thread pool."""
+        await asyncio.to_thread(self._write_sync, data)
+
+    def close(self) -> None:
+        """Close the underlying pipe handle (idempotent).
+
+        Calls ``CancelIoEx`` first to abort any blocking ``ReadFile``/``WriteFile``
+        in a thread-pool thread, ensuring the thread returns promptly and the
+        asyncio executor can shut down without hanging.
+        """
+        import ctypes
+
+        import pywintypes
+        import win32file
+
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                ctypes.windll.kernel32.CancelIoEx(int(handle), None)
+            with contextlib.suppress(pywintypes.error, OSError):
+                win32file.CloseHandle(handle)
+
+
+class _WinConnectionHandler:
+    """Windows named-pipe per-connection handler (DESIGN.md §10.5, §10.7).
+
+    Verifies that the connected client's SID matches the current user's SID
+    (cross-user rejection per §10.7), then runs the same JSON-over-stream
+    request/response loop as :class:`_ConnectionHandler`, reusing
+    :func:`_run_dispatch_logic` for all business logic.
+    """
+
+    def __init__(
+        self,
+        io: _WinPipeIO,
+        handler: IPCHandler,
+        cache: _IdempotencyCache,
+        overlay_locks: dict[str, asyncio.Lock],
+        config: IPCConfig,
+        our_sid: Any,
+    ) -> None:
+        self._io = io
+        self._handler = handler
+        self._cache = cache
+        self._overlay_locks = overlay_locks
+        self._config = config
+        self._our_sid = our_sid
+
+    async def _verify_client_sid(self) -> bool:
+        """Impersonate the client and compare its SID to ours (§10.7).
+
+        Returns ``False`` (and logs) if the SIDs differ or impersonation fails.
+        Fails CLOSED on any exception — same conservative policy as SO_PEERCRED.
+        """
+        import pywintypes
+        import win32api
+        import win32security
 
         try:
-            if server_timeout is not None:
-                resp = await asyncio.wait_for(self._handler(req), timeout=server_timeout)
-            else:
-                resp = await self._handler(req)
-        except TimeoutError:
-            return IPCResponse(
-                request_id=req.request_id,
-                ok=False,
-                error=f"Op '{req.op}' timed out on server after {server_timeout}s",
-                error_type="timeout",
-            )
-        except asyncio.CancelledError:
-            raise  # propagate cancellation (stop() in progress)
-        except Exception as exc:
-            log.exception("IPC: handler raised for op=%s", req.op)
-            return IPCResponse(
-                request_id=req.request_id,
-                ok=False,
-                error=str(exc),
-                error_type="internal",
-            )
 
-        # Cache the result so repeat tokens get the same response.
-        if is_write and req.idempotency_token is not None:
-            self._cache.put(req.idempotency_token, resp)
+            def _check_sync() -> bool:
+                win32security.ImpersonateNamedPipeClient(self._io._handle)
+                try:
+                    thread_token = win32security.OpenThreadToken(
+                        win32api.GetCurrentThread(),
+                        win32security.TOKEN_QUERY,
+                        True,
+                    )
+                    client_user = win32security.GetTokenInformation(
+                        thread_token, win32security.TokenUser
+                    )
+                    client_sid = client_user[0]
+                finally:
+                    win32security.RevertToSelf()
+                return str(client_sid) == str(self._our_sid)
 
-        return resp
+            return await asyncio.to_thread(_check_sync)
+        except pywintypes.error:
+            log.warning("IPC(win): SID check failed; rejecting connection", exc_info=True)
+            return False
+        except Exception:
+            log.warning("IPC(win): SID check failed; rejecting connection", exc_info=True)
+            return False
+
+    async def _heartbeat(self, interval: float) -> None:
+        """Send ``{"type":"heartbeat"}`` lines every *interval* seconds."""
+        hb_line = json.dumps({"type": "heartbeat"}, separators=(",", ":")).encode() + b"\n"
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._io.write_all(hb_line)
+            except Exception:
+                return
+
+    async def _send_error(self, request_id: int, error: str, error_type: str) -> None:
+        resp = IPCResponse(request_id=request_id, ok=False, error=error, error_type=error_type)
+        with contextlib.suppress(Exception):
+            await self._io.write_all(_encode_response(resp))
+
+    async def run(self) -> None:
+        """Read / dispatch / write loop for the Windows pipe connection.
+
+        Windows requires that at least one pipe read has completed before
+        ``ImpersonateNamedPipeClient`` can succeed (error 1368).  The first
+        request line is therefore read unconditionally; only then is the client
+        SID verified.  If the SID check fails, the connection is closed without
+        processing the request.
+        """
+        sid_verified = False
+        try:
+            while True:
+                try:
+                    line = await self._io.readline()
+                except OSError:
+                    break
+
+                if not line:
+                    break
+
+                if len(line) > MAX_MESSAGE_BYTES:
+                    log.warning("IPC(win): oversized message (%d bytes), closing", len(line))
+                    await self._send_error(-1, "Message exceeds 1 MiB limit", "oversized")
+                    break
+
+                # Verify client SID on first request (requires at least one read).
+                if not sid_verified:
+                    if not await self._verify_client_sid():
+                        return
+                    sid_verified = True
+
+                req = _decode_request(line)
+                if req is None:
+                    log.warning("IPC(win): malformed request, closing connection")
+                    break
+
+                is_long_op = req.op in {"commit_links", "reindex"}
+                if is_long_op:
+                    hb_task: asyncio.Task[None] = asyncio.create_task(
+                        self._heartbeat(self._config.timeouts.long_heartbeat_interval)
+                    )
+                    try:
+                        resp = await _run_dispatch_logic(
+                            req, self._handler, self._cache, self._config
+                        )
+                    finally:
+                        hb_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await hb_task
+                else:
+                    resp = await _run_dispatch_logic(req, self._handler, self._cache, self._config)
+
+                try:
+                    await self._io.write_all(_encode_response(resp))
+                except OSError:
+                    break
+        finally:
+            self._io.close()
 
 
 # ─── IPCServer ────────────────────────────────────────────────────────
@@ -466,7 +778,7 @@ class IPCServer:
     """Leader-side JSON-over-stream listener (DESIGN.md §10.3 v3.1).
 
     Owns the Unix socket at ``.scry/scry.sock`` (Linux/macOS) or the Windows
-    named pipe (stubbed — deferred to Wave 6). Also owns:
+    named pipe at ``\\\\.\\pipe\\scry-<hash>`` with a restrictive DACL. Also owns:
 
     * The **idempotency LRU cache** bounded by
       :attr:`IPCConfig.idempotency_cache_size` (§10.3).
@@ -480,11 +792,6 @@ class IPCServer:
         await srv.start()   # binds; must complete BEFORE write_metadata() (§10.2)
         ...
         await srv.stop()    # stops accepting, cancels in-flight handlers, removes socket
-
-    Windows:
-        :meth:`start` raises :exc:`NotImplementedError` — named-pipe support
-        (pywin32 + restrictive DACL, §10.5) is deferred to Wave 6 (scry watch).
-        scry operates in single-leader mode on Windows without IPC.
     """
 
     def __init__(
@@ -502,6 +809,10 @@ class IPCServer:
         self._server: asyncio.AbstractServer | None = None
         self._connection_tasks: set[asyncio.Task[Any]] = set()
         self._uri: str = derive_endpoint_uri(repo_root)
+        # Windows-only state
+        self._win_accept_task: asyncio.Task[None] | None = None
+        self._win_stop_event: threading.Event = threading.Event()
+        self._win_pipe_name: str = ""
 
     @property
     def endpoint_uri(self) -> str:
@@ -530,19 +841,141 @@ class IPCServer:
         The endpoint is ready to accept before this coroutine returns, satisfying
         the ordering requirement in DESIGN.md §10.2 v3.1: the leader must bind
         its IPC endpoint *before* writing the metadata file.
-
-        Raises:
-            NotImplementedError: Always on Windows — named-pipe support is
-                deferred to Wave 6.  See module docstring for details.
         """
         if _IS_WINDOWS:
-            raise NotImplementedError(
-                "Windows IPC requires pywin32 and a restrictive DACL — "
-                "install via `pip install pywin32` and rerun. "
-                "Full Windows named-pipe support is deferred to Wave 6 "
-                "(scry watch). scry operates in single-leader mode on Windows."
+            await self._start_windows()
+        else:
+            await self._start_unix()
+
+    async def _start_windows(self) -> None:
+        """Create the Windows named pipe with a restrictive DACL and start accepting.
+
+        The pipe is created with ``FILE_FLAG_FIRST_PIPE_INSTANCE`` on the first
+        instance to prevent pipe-squatting by another process.  Subsequent pipe
+        instances (for new connections after the first client disconnects) do NOT
+        use that flag, but the DACL on all instances grants only the current user.
+
+        The accept loop runs as a background asyncio task.  Stopping it uses a
+        threading.Event to signal the blocking ``ConnectNamedPipe`` thread, plus
+        a short-circuit dummy ``CreateFile`` to unblock any pending wait.
+        """
+        import pywintypes
+        import win32file
+        import win32pipe
+
+        spec = parse_endpoint_uri(self._uri, self._repo_root)
+        self._win_pipe_name = spec.address
+        self._win_stop_event.clear()
+
+        sa = _win_build_pipe_sa()
+        our_sid = _win_get_current_user_sid()
+
+        handler = self._handler
+        cache = self._cache
+        overlay_locks = self._overlay_locks
+        config = self._config
+        connection_tasks = self._connection_tasks
+        pipe_name = self._win_pipe_name
+        stop_event = self._win_stop_event
+
+        first_instance_flag = win32pipe.FILE_FLAG_FIRST_PIPE_INSTANCE
+
+        # Bind synchronously BEFORE returning so a squatting / pre-existing
+        # pipe causes a clean failure that the caller surfaces, instead of
+        # silently advertising an endpoint we don't actually own
+        # (review-w6b BLOCKING fix).
+        try:
+            first_handle = win32pipe.CreateNamedPipe(
+                pipe_name,
+                win32pipe.PIPE_ACCESS_DUPLEX | first_instance_flag,
+                win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                RECV_BUFFER_SIZE,
+                RECV_BUFFER_SIZE,
+                0,
+                sa,
             )
-        await self._start_unix()
+        except pywintypes.error as exc:
+            # 231 (ERROR_PIPE_BUSY) / 183 (ERROR_ALREADY_EXISTS) /
+            # 5 (ERROR_ACCESS_DENIED) all indicate the pipe name is
+            # taken or otherwise unbindable.  Surface to the caller.
+            raise OSError(
+                f"IPC(win): cannot bind named pipe {pipe_name!r}: {exc} — "
+                "another process may already own this endpoint, or the "
+                "name is squatted by a hostile process.  Refusing to start."
+            ) from exc
+
+        async def _accept_loop(initial_handle: Any) -> None:
+            handle = initial_handle  # use the pre-bound first instance
+            while not stop_event.is_set():
+                if handle is None:
+                    # Subsequent instances — first-instance flag is OFF.
+                    try:
+                        handle = win32pipe.CreateNamedPipe(
+                            pipe_name,
+                            win32pipe.PIPE_ACCESS_DUPLEX,
+                            win32pipe.PIPE_TYPE_BYTE
+                            | win32pipe.PIPE_READMODE_BYTE
+                            | win32pipe.PIPE_WAIT,
+                            win32pipe.PIPE_UNLIMITED_INSTANCES,
+                            RECV_BUFFER_SIZE,
+                            RECV_BUFFER_SIZE,
+                            0,
+                            sa,
+                        )
+                    except pywintypes.error as exc:
+                        log.error("IPC(win): CreateNamedPipe failed: %s", exc)
+                        break
+
+                # ConnectNamedPipe blocks until a client connects.  We run it in
+                # a thread so the event loop stays responsive.
+                try:
+                    await asyncio.to_thread(win32pipe.ConnectNamedPipe, handle, None)
+                except asyncio.CancelledError:
+                    win32file.CloseHandle(handle)
+                    return
+                except pywintypes.error as exc:
+                    # ERROR_PIPE_CONNECTED (535) is a benign race: a client
+                    # connected between CreateNamedPipe and ConnectNamedPipe
+                    # so the pipe is ALREADY connected.  Treat as success
+                    # (review-w6b HIGH fix).
+                    if exc.args[0] == 535:
+                        pass  # fall through to dispatch
+                    else:
+                        win32file.CloseHandle(handle)
+                        # 995 = ERROR_OPERATION_ABORTED (stop in progress)
+                        if exc.args[0] == 995:
+                            return
+                        log.warning("IPC(win): ConnectNamedPipe error: %s", exc)
+                        handle = None
+                        continue
+                except Exception as exc:
+                    win32file.CloseHandle(handle)
+                    log.warning("IPC(win): ConnectNamedPipe unexpected error: %s", exc)
+                    handle = None
+                    continue
+
+                if stop_event.is_set():
+                    # Dummy client connected during shutdown — discard.
+                    win32file.CloseHandle(handle)
+                    return
+
+                io = _WinPipeIO(handle)
+                conn = _WinConnectionHandler(io, handler, cache, overlay_locks, config, our_sid)
+
+                async def _conn_task(c: _WinConnectionHandler = conn) -> None:
+                    await c.run()
+
+                ct = asyncio.create_task(_conn_task())
+                connection_tasks.add(ct)
+                ct.add_done_callback(connection_tasks.discard)
+                handle = None  # next loop iteration creates a fresh instance
+
+        # Yield once so the task starts before this coroutine returns
+        # (satisfies §10.2 ordering requirement).
+        self._win_accept_task = asyncio.create_task(_accept_loop(first_handle))
+        await asyncio.sleep(0)
+        log.info("IPC: listening at %s", self._win_pipe_name)
 
     async def _start_unix(self) -> None:
         """Bind the Unix socket and start the accept loop."""
@@ -594,6 +1027,33 @@ class IPCServer:
 
     async def stop(self) -> None:
         """Stop accepting, cancel in-flight handlers, and remove the socket file."""
+        if _IS_WINDOWS:
+            # Signal the accept loop to exit and unblock its ConnectNamedPipe wait.
+            self._win_stop_event.set()
+            if self._win_accept_task is not None:
+                import pywintypes
+                import win32file
+
+                # Open a dummy client to unblock the pending ConnectNamedPipe.
+                if self._win_pipe_name:
+                    with contextlib.suppress(pywintypes.error, OSError):
+                        h = win32file.CreateFile(
+                            self._win_pipe_name,
+                            win32file.GENERIC_WRITE,
+                            0,
+                            None,
+                            win32file.OPEN_EXISTING,
+                            0,
+                            None,
+                        )
+                        with contextlib.suppress(pywintypes.error):
+                            win32file.CloseHandle(h)
+
+                self._win_accept_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._win_accept_task
+                self._win_accept_task = None
+
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -656,6 +1116,7 @@ class IPCClient:
         self._config = config or IPCConfig()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._win_io: _WinPipeIO | None = None
         self._request_id: int = 0
         # Serializes the send-then-receive critical section so concurrent
         # call() invocations on the same instance cannot interleave writes
@@ -663,19 +1124,99 @@ class IPCClient:
         self._call_lock = asyncio.Lock()
 
     async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Open the transport connection if not already open."""
+        """Open the Unix socket connection if not already open."""
         if self._reader is not None and self._writer is not None:
             return self._reader, self._writer
-        if self._spec.scheme == "pipe":
-            raise NotImplementedError(
-                "Windows IPC requires pywin32 — deferred to Wave 6 (scry watch)."
-            )
         reader, writer = await asyncio.open_unix_connection(  # type: ignore[attr-defined]
             self._spec.address,
             limit=MAX_MESSAGE_BYTES + 1,
         )
         self._reader, self._writer = reader, writer
         return reader, writer
+
+    async def _connect_win(self) -> _WinPipeIO:
+        """Open a Windows named-pipe connection if not already open."""
+        if self._win_io is not None:
+            return self._win_io
+        import pywintypes
+        import win32file
+
+        pipe_path = self._spec.address
+        # Retry briefly on ERROR_FILE_NOT_FOUND (2) or ERROR_PIPE_BUSY (231).
+        for attempt in range(10):
+            try:
+                handle = win32file.CreateFile(
+                    pipe_path,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                self._win_io = _WinPipeIO(handle)
+                return self._win_io
+            except pywintypes.error as exc:
+                if exc.args[0] in (2, 231) and attempt < 9:
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                raise OSError(exc.args[0], exc.args[2]) from exc
+        raise OSError("IPC(win): could not connect to named pipe")
+
+    async def _recv_response(
+        self,
+        req_id: int,
+        readline: Any,
+        is_long_op: bool,
+        effective_timeout: float | None,
+    ) -> Any:
+        """Read lines from the server, skipping heartbeats, until a real response arrives.
+
+        For long ops, each individual readline is guarded by the lapse timeout
+        (``long_heartbeat_max_lapse``) so a hung server is detected within that
+        window even while heartbeats are flowing.
+        """
+        lapse_timeout = self._config.timeouts.long_heartbeat_max_lapse
+
+        while True:
+            try:
+                if is_long_op:
+                    line = await asyncio.wait_for(readline(), timeout=lapse_timeout)
+                elif effective_timeout is not None:
+                    line = await asyncio.wait_for(readline(), timeout=effective_timeout)
+                else:
+                    line = await readline()
+            except TimeoutError:
+                await self.close()
+                raise
+
+            if not line:
+                await self.close()
+                raise RuntimeError("IPC: server closed connection unexpectedly")
+
+            try:
+                resp_d: dict[str, Any] = json.loads(line)
+            except json.JSONDecodeError as exc:
+                await self.close()
+                raise RuntimeError(f"IPC: invalid JSON in leader response: {exc}") from exc
+
+            # Skip heartbeat messages transparently.
+            if resp_d.get("type") == "heartbeat":
+                continue
+
+            # Wire-protocol invariant: the leader echoes our request id.
+            resp_id = resp_d.get("id")
+            if resp_id != req_id:
+                await self.close()
+                raise RuntimeError(
+                    f"IPC: response id mismatch (expected {req_id}, got {resp_id!r}); "
+                    "stream state is corrupt"
+                )
+
+            if not resp_d.get("ok"):
+                raise RuntimeError(str(resp_d.get("error") or "IPC error"))
+
+            return resp_d.get("result")
 
     async def call(
         self,
@@ -689,7 +1230,7 @@ class IPCClient:
 
         ``timeout_seconds=None`` applies the auto-default: short ops receive
         :attr:`IPCConfig.timeouts.short`; long ops (``commit_links``,
-        ``reindex``) receive no timeout.
+        ``reindex``) receive no timeout (heartbeat lapse timeout applies instead).
 
         Args:
             op: Tool name — e.g. ``"propose_link"``, ``"status"``.
@@ -709,7 +1250,6 @@ class IPCClient:
                 message contains the leader's ``error`` field) OR if the
                 response's ``id`` does not match the request's (wire-protocol
                 drift defense).
-            NotImplementedError: On Windows (deferred to Wave 6).
         """
         async with self._call_lock:
             self._request_id += 1
@@ -733,48 +1273,26 @@ class IPCClient:
                 else (None if is_long_op else self._config.timeouts.short)
             )
 
-            reader, writer = await self._connect()
-            writer.write(raw)
-            await writer.drain()
-
-            try:
-                if effective_timeout is not None:
-                    line = await asyncio.wait_for(reader.readline(), timeout=effective_timeout)
-                else:
-                    line = await reader.readline()
-            except TimeoutError:
-                # Close connection: stream state is unknown after a timeout.
-                await self.close()
-                raise
-
-            if not line:
-                await self.close()
-                raise RuntimeError("IPC: server closed connection unexpectedly")
-
-            try:
-                resp_d: dict[str, Any] = json.loads(line)
-            except json.JSONDecodeError as exc:
-                await self.close()
-                raise RuntimeError(f"IPC: invalid JSON in leader response: {exc}") from exc
-
-            # Wire-protocol invariant: the leader echoes our request id.
-            # If it doesn't, our stream state is corrupt — close and raise
-            # rather than silently returning someone else's response.
-            resp_id = resp_d.get("id")
-            if resp_id != req_id:
-                await self.close()
-                raise RuntimeError(
-                    f"IPC: response id mismatch (expected {req_id}, got {resp_id!r}); "
-                    "stream state is corrupt"
+            if self._spec.scheme == "pipe":
+                win_io = await self._connect_win()
+                await win_io.write_all(raw)
+                return await self._recv_response(
+                    req_id, win_io.readline, is_long_op, effective_timeout
                 )
-
-            if not resp_d.get("ok"):
-                raise RuntimeError(str(resp_d.get("error") or "IPC error"))
-
-            return resp_d.get("result")
+            else:
+                reader, writer = await self._connect()
+                writer.write(raw)
+                await writer.drain()
+                return await self._recv_response(
+                    req_id, reader.readline, is_long_op, effective_timeout
+                )
 
     async def close(self) -> None:
         """Close the underlying transport connection gracefully."""
+        win_io, self._win_io = self._win_io, None
+        if win_io is not None:
+            win_io.close()
+
         writer = self._writer
         self._writer = None
         self._reader = None

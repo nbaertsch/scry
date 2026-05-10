@@ -194,6 +194,8 @@ CREATE TABLE IF NOT EXISTS anchors (
     fingerprint_simhash   INTEGER NOT NULL,
     transitive_hash_status TEXT,
     closure_hash          TEXT,
+    def_line              INTEGER,
+    def_char              INTEGER,
     overview_embedding    BLOB,
     created_at            TEXT    NOT NULL,
     updated_at            TEXT    NOT NULL
@@ -302,6 +304,47 @@ class ScryDB:
             self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
+        # Detect optional columns added by later migrations.  Read-only
+        # callers (W2j search, MCP follower) cannot run ``ALTER TABLE``
+        # so they must tolerate pre-migration databases by emitting
+        # ``NULL AS <col>`` instead of selecting a column that doesn't
+        # exist (review-w6e HIGH fix).
+        self._has_def_position_columns = self._detect_def_position_columns()
+
+    def _detect_def_position_columns(self) -> bool:
+        """Return True if the ``anchors`` table already has ``def_line``/``def_char``.
+
+        Tolerates a missing ``anchors`` table (fresh DB before
+        ``init_schema``); returns False so the conservative SELECT shape
+        is used until the schema is initialised.
+        """
+        try:
+            rows = self._conn.execute("PRAGMA table_info(anchors)").fetchall()
+        except sqlite3.OperationalError:
+            return False
+        names = {row[1] for row in rows}
+        return "def_line" in names and "def_char" in names
+
+    def _anchor_select_columns(self) -> str:
+        """Return the comma-separated SELECT clause for the ``anchors`` table.
+
+        When ``def_line`` / ``def_char`` are not present (read-only opens
+        of pre-W6e databases), substitute ``NULL`` so ``_row_to_anchor``
+        still receives 12 values and renders ``def_line=None``.
+        """
+        if self._has_def_position_columns:
+            return (
+                "id, type, path, heading_path_json, symbol_name, "
+                "content_text, content_hash, fingerprint_simhash, "
+                "transitive_hash_status, closure_hash, def_line, def_char"
+            )
+        return (
+            "id, type, path, heading_path_json, symbol_name, "
+            "content_text, content_hash, fingerprint_simhash, "
+            "transitive_hash_status, closure_hash, "
+            "NULL AS def_line, NULL AS def_char"
+        )
+
     # ------------------------------------------------------------------
     # Context manager support
     # ------------------------------------------------------------------
@@ -357,6 +400,17 @@ class ScryDB:
             # we suppress that specific error (idempotent).
             with contextlib.suppress(sqlite3.OperationalError):
                 self._conn.execute("ALTER TABLE anchors ADD COLUMN closure_hash TEXT")
+
+            # W6e migration: add def_line / def_char columns for LSP position
+            # lookup.  Idempotent — suppresses OperationalError when the columns
+            # already exist (e.g. fresh DB created from the updated _DDL_ANCHORS).
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute("ALTER TABLE anchors ADD COLUMN def_line INTEGER")
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute("ALTER TABLE anchors ADD COLUMN def_char INTEGER")
+            # Refresh the cached column-presence flag now that the migration
+            # has (idempotently) run.
+            self._has_def_position_columns = self._detect_def_position_columns()
 
             # Decide whether to create or recreate the vec virtual table.
             row = self._conn.execute(
@@ -662,10 +716,8 @@ class ScryDB:
             The matching ``Anchor``, or ``None`` if not found.
         """
         row = self._conn.execute(
-            """
-            SELECT id, type, path, heading_path_json, symbol_name,
-                   content_text, content_hash, fingerprint_simhash,
-                   transitive_hash_status, closure_hash
+            f"""
+            SELECT {self._anchor_select_columns()}
             FROM anchors WHERE id = ?
             """,
             (anchor_id,),
@@ -690,11 +742,7 @@ class ScryDB:
         Returns:
             List of matching ``Anchor`` objects (unordered).
         """
-        query = (
-            "SELECT id, type, path, heading_path_json, symbol_name, "
-            "content_text, content_hash, fingerprint_simhash, "
-            "transitive_hash_status, closure_hash FROM anchors"
-        )
+        query = f"SELECT {self._anchor_select_columns()} FROM anchors"
         conditions: list[str] = []
         params: list[Any] = []
         if anchor_type is not None:
@@ -976,8 +1024,9 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
         INSERT INTO anchors
             (id, type, path, heading_path_json, symbol_name, content_text,
              content_hash, fingerprint_simhash, transitive_hash_status,
-             closure_hash, overview_embedding, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+             closure_hash, def_line, def_char, overview_embedding,
+             created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             type                  = excluded.type,
             path                  = excluded.path,
@@ -988,6 +1037,8 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             fingerprint_simhash   = excluded.fingerprint_simhash,
             transitive_hash_status = excluded.transitive_hash_status,
             closure_hash          = excluded.closure_hash,
+            def_line              = excluded.def_line,
+            def_char              = excluded.def_char,
             overview_embedding    = CASE
                 WHEN content_hash != excluded.content_hash THEN NULL
                 ELSE overview_embedding
@@ -1007,6 +1058,8 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             if anchor.transitive_hash_status is not None
             else None,
             anchor.closure_hash,
+            anchor.def_line,
+            anchor.def_char,
             now,
             now,
         ),
@@ -1067,11 +1120,11 @@ def _replace_chunks_in_txn(
 
 
 def _row_to_anchor(row: Any) -> Anchor:
-    """Reconstruct an ``Anchor`` from a SELECT row (10 columns, no embedding).
+    """Reconstruct an ``Anchor`` from a SELECT row (12 columns, no embedding).
 
     Column order: id, type, path, heading_path_json, symbol_name,
     content_text, content_hash, fingerprint_simhash, transitive_hash_status,
-    closure_hash.
+    closure_hash, def_line, def_char.
 
     Args:
         row: A tuple (or sqlite3.Row) from an anchors SELECT query.
@@ -1090,6 +1143,8 @@ def _row_to_anchor(row: Any) -> Anchor:
         fingerprint_simhash,
         transitive_hash_status,
         closure_hash,
+        def_line,
+        def_char,
     ) = row
     heading_path: list[str] | None = (
         json.loads(heading_path_json) if heading_path_json is not None else None
@@ -1109,4 +1164,6 @@ def _row_to_anchor(row: Any) -> Anchor:
         fingerprint_simhash=_from_signed_int64(int(fingerprint_simhash)),
         transitive_hash_status=transitive_hash_status,
         closure_hash=closure_hash,
+        def_line=int(def_line) if def_line is not None else None,
+        def_char=int(def_char) if def_char is not None else None,
     )

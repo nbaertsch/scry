@@ -1,11 +1,13 @@
 """LSP subprocess infrastructure for scry.
 
-Exposes three submodules:
+Exposes five submodules:
 
-* ``proto``   — JSON-RPC 2.0 wire encoding/decoding (DESIGN.md §11)
-* ``manager`` — :class:`~scry.lsp.manager.LSPManager` lifecycle, allowlist
-                enforcement, and per-language session pool (DESIGN.md §6.2)
-* ``closure`` — transitive call-closure walker via callHierarchy (DESIGN.md §5.3)
+* ``proto``            — JSON-RPC 2.0 wire encoding/decoding (DESIGN.md §11)
+* ``manager``          — :class:`~scry.lsp.manager.LSPManager` lifecycle, allowlist
+                         enforcement, and per-language session pool (DESIGN.md §6.2)
+* ``closure``          — transitive call-closure walker via callHierarchy (DESIGN.md §5.3)
+* ``full_resolution``  — full-mode symbol resolution (W6d)
+* ``reverse``          — reverse-link queries: get_callers / get_subclasses (W6e)
 
 See Also
 --------
@@ -28,6 +30,10 @@ from scry.lsp.closure import (
     ClosureStatus,
     compute_closure,
 )
+from scry.lsp.full_resolution import (
+    compute_closure_full,
+    supports_full_mode,
+)
 from scry.lsp.manager import (
     LSP_ALLOWLIST,
     LSPAllowlistViolation,
@@ -44,12 +50,19 @@ from scry.lsp.proto import (
     LSPStreamReader,
     LSPStreamWriter,
 )
+from scry.lsp.reverse import (
+    CallerRef,
+    SubclassRef,
+    get_callers,
+    get_subclasses,
+)
 
 __all__ = [
     "LSP_ADAPTERS",
     "LSP_ALLOWLIST",
     "AdapterProtocol",
     "CalleeRef",
+    "CallerRef",
     "ClosureResult",
     "ClosureStatus",
     "LSPAllowlistViolation",
@@ -63,6 +76,11 @@ __all__ = [
     "LSPSession",
     "LSPStreamReader",
     "LSPStreamWriter",
+    "SubclassRef",
     "compute_closure",
+    "compute_closure_full",
     "get_adapter",
+    "get_callers",
+    "get_subclasses",
+    "supports_full_mode",
 ]
