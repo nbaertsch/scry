@@ -43,8 +43,8 @@ def evaluate(rule: PolicyRule, context: dict) -> str | None:
         ``'allow'``, ``'deny'``, or ``None``.
     """
     try:
-        if eval(rule.condition, {}, context):  # noqa: S307
+        if eval(rule.condition, {}, context):
             return rule.effect
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return None
