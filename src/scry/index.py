@@ -43,7 +43,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
-import fnmatch
 import json
 import logging
 import os
@@ -60,6 +59,7 @@ from scry.config import (
     classify_path,
     compute_config_hash,
     load_config,
+    matches_globs,
     parse_frontmatter,
     should_index,
 )
@@ -106,42 +106,45 @@ _EXT_TO_LANG: dict[str, str] = {
 _REEMBED_BATCH_SIZE: int = 50
 
 
-# ─── Path-filter helpers (B2 / B6 / B7) ──────────────────────────────────────
+# ─── Path-filter helpers (B2 / B6 / B7 / SR1-3) ──────────────────────────────
 
 
-def _norm_pattern(pat: str) -> str:
-    """Normalise an exclude pattern for the FNMATCH-only directory check.
-
-    Used solely by :func:`_dir_excluded` for fast directory pruning.
-    For the full include/exclude evaluation per DESIGN.md §6 we still
-    delegate to :func:`scry.config.should_index` /
-    :func:`scry.config.matches_globs` which handle ``**`` correctly.
-    """
-    return pat.replace("**", "*")
+_DIR_PRUNE_PROBE = "__scry_dir_prune_probe__"
 
 
 def _dir_excluded(p: Path, repo: Path, excludes: list[str]) -> bool:
-    """Return True if directory *p* matches any exclude pattern.
+    """Return True if directory *p* should be pruned from the walk.
 
     Used to PRUNE entire subtrees in the indexer / validator walks
     so we never descend into ``.venv`` / ``node_modules`` / etc.
-    Conservative: matches only on directory-name prefix (``.venv``
-    against ``.venv/**``); the full glob check happens later via
-    :func:`scry.config.matches_globs` for surviving files.
+    A directory is pruned when EVERY immediate child path under it
+    would match an exclude glob — i.e. there's no point descending
+    because nothing would survive ``should_index()`` anyway.
+
+    SR1-3: previous implementation collapsed ``**`` to ``*`` for an
+    fnmatch-only path that did not handle ``**/<dir>/**`` patterns
+    against root-level directories.  We now delegate to the same
+    :func:`scry.config.matches_globs` engine the per-file filter
+    uses (proper ``**`` semantics) and probe with a sentinel child
+    so e.g. ``**/.venv/**`` correctly prunes a root-level ``.venv``.
     """
     try:
         rel = p.relative_to(repo).as_posix()
     except ValueError:
         return False
-    rel_with_slash = rel + "/"
-    for raw in excludes:
-        pat = _norm_pattern(raw)
-        if fnmatch.fnmatchcase(rel, pat) or fnmatch.fnmatchcase(rel_with_slash, pat):
-            return True
-        prefix = pat.rstrip("*").rstrip("/")
-        if prefix and (rel == prefix or rel.startswith(prefix + "/")):
-            return True
-    return False
+    if not excludes:
+        return False
+    # Direct match: pattern names this directory exactly
+    # (e.g. ``node_modules`` against ``node_modules/**`` would NOT
+    # match here, but against a literal ``node_modules`` would).
+    if matches_globs(rel, excludes):
+        return True
+    # Sentinel-child probe: would EVERY file under this dir be
+    # excluded?  We test one synthetic child; a pattern like
+    # ``**/*.pyc`` correctly does NOT match ``src/__scry_probe__``
+    # so we do not over-prune ``src/`` for a pyc-exclude config.
+    probe = f"{rel}/{_DIR_PRUNE_PROBE}"
+    return matches_globs(probe, excludes)
 
 
 # ─── Public data classes ──────────────────────────────────────────────────────

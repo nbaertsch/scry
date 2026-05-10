@@ -134,6 +134,14 @@ markers = [
   "unix_only: tests that only run on Linux/macOS",
 ]
 asyncio_mode = "auto"
+# SR1-5: ensure UT1-10 suppression survives pytest's per-test
+# warning-filter reset.  Plain ``simplefilter`` in scry/__init__.py
+# is wiped by pytest at the start of every test, so we also register
+# the ignore here to make the suppression authoritative for the
+# test suite.
+filterwarnings = [
+  "ignore::authlib.deprecate.AuthlibDeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["src/scry"]

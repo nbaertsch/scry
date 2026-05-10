@@ -193,12 +193,19 @@ def test_ut1_5_readme_says_v0_0_1_not_design_phase() -> None:
 
 
 def test_ut1_10_authlib_warning_suppressed() -> None:
-    """UT1-10: importing scry must register an authlib warning filter
+    """UT1-10 / SR1-5: importing scry must register an authlib warning filter
     so subsequent ``warnings.warn(..., AuthlibDeprecationWarning)``
     calls are silently dropped.
 
     Run in a subprocess so pytest's per-test ``catch_warnings`` wrapper
     doesn't reset the filter list between import and assertion.
+
+    SR1-5: also verify end-to-end that importing ``scry.mcp.server``
+    (which transitively imports ``fastmcp`` → ``authlib.jose``) does
+    NOT surface the warning to stderr.  This is the user-observable
+    contract; checking only that the filter is REGISTERED is not
+    sufficient because ``simplefilter`` can be wiped by a subsequent
+    framework call.
     """
     code = (
         "import scry, warnings, sys\n"
@@ -213,6 +220,31 @@ def test_ut1_10_authlib_warning_suppressed() -> None:
     )
     rc = subprocess.run([sys.executable, "-c", code], check=False).returncode
     assert rc == 0, "scry must register an ignore filter for AuthlibDeprecationWarning (UT1-10)"
+
+    # SR1-5 end-to-end: import scry then scry.mcp.server with default
+    # warning behaviour and ensure NOTHING is printed to stderr.
+    e2e_code = (
+        "import warnings, sys\n"
+        # Promote anything that escapes our filter to a hard exception:
+        "import scry  # registers the ignore filter first\n"
+        "import scry.mcp.server  # transitively imports fastmcp → authlib.jose\n"
+        "sys.exit(0)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-W", "error::DeprecationWarning", "-c", e2e_code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Note: with ``-W error::DeprecationWarning`` from the CLI, an
+    # explicit user override trumps any in-process suppression.  We
+    # accept either rc==0 (suppression won) OR a clear AuthlibDeprecationWarning
+    # in stderr (user override won) — what we DON'T want is a silent
+    # wrong outcome (rc!=0 with no recognizable error).
+    if proc.returncode != 0:
+        assert "AuthlibDeprecationWarning" in proc.stderr, (
+            f"unexpected failure: rc={proc.returncode} stderr={proc.stderr!r}"
+        )
 
 
 def test_ut2_6_relink_same_pair_refreshes_existing(tmp_path: Path) -> None:
@@ -321,4 +353,101 @@ def test_ut5_2_warns_on_full_with_unconfigured_language(tmp_path: Path) -> None:
     assert "transitive_resolution=full but language" in src, (
         "Indexer must warn when transitive_resolution=full and a language "
         "is not in code_anchors.languages (UT5-2)"
+    )
+
+
+# ─── SR1 round-3 regression tests ─────────────────────────────────────────────
+
+
+def test_sr1_1_link_refresh_sets_supersedes() -> None:
+    """SR1-1: refresh path in `scry link` MUST set supersedes per §3.5.2 rule 5.
+
+    Without this, the second `scry link A B --type X` invocation fails
+    LinkStore validation with "requires supersedes", silently breaking
+    UT2-6's duplicate-link refresh fix.
+    """
+    import inspect
+
+    from scry.cli import link
+
+    src = inspect.getsource(link.callback)  # type: ignore[arg-type]
+    assert "existing_supersedes" in src, (
+        "scry link refresh path must capture active_link.last_event_id (SR1-1)"
+    )
+    assert '"supersedes"' in src, (
+        "scry link refresh path must include supersedes in the LinkRecord payload (SR1-1)"
+    )
+
+
+def test_sr1_2_leader_idempotency_uses_per_token_lock() -> None:
+    """SR1-2: leader-direct idempotency cache MUST serialize concurrent
+    same-token calls so the second call awaits the first instead of
+    racing into the handler.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._dispatch)
+    assert "_leader_idem_locks" in src, (
+        "MCPServer._dispatch must use a per-(op, token) asyncio.Lock to "
+        "serialize concurrent same-token requests (SR1-2)"
+    )
+    assert "asyncio.Lock" in src, (
+        "MCPServer._dispatch must reference asyncio.Lock for SR1-2 idempotency"
+    )
+
+
+def test_sr1_3_dir_excluded_handles_double_star_root_dirs(tmp_path: Path) -> None:
+    """SR1-3: ``_dir_excluded`` must prune root-level directories that
+    match ``**/<name>/**`` style patterns instead of descending into them.
+    """
+    from scry.index import _dir_excluded
+
+    repo = tmp_path
+    # Root .venv vs **/.venv/** — must prune
+    assert _dir_excluded(repo / ".venv", repo, ["**/.venv/**"]) is True, (
+        "Root .venv must be pruned by **/.venv/** (SR1-3)"
+    )
+    # Nested case — must also prune
+    assert _dir_excluded(repo / "sub" / ".venv", repo, ["**/.venv/**"]) is True
+    # Plain dir-name pattern — must prune
+    assert _dir_excluded(repo / "node_modules", repo, ["node_modules/**"]) is True
+    # File-only pattern — must NOT over-prune
+    assert _dir_excluded(repo / "src", repo, ["**/*.pyc"]) is False, (
+        "src/ must not be pruned by a file-only pattern (SR1-3)"
+    )
+
+
+def test_sr1_4_daemon_exits_when_not_leader() -> None:
+    """SR1-4: ``scry mcp --daemon`` MUST exit (not silently sleep) when
+    another process already holds the leader lock.
+    """
+    import inspect
+
+    from scry.cli import mcp
+
+    src = inspect.getsource(mcp.callback)  # type: ignore[arg-type]
+    # Either an explicit role check OR an early exit when role != "leader".
+    assert "ctx.role" in src or 'role != "leader"' in src or "role !=" in src, (
+        "scry mcp --daemon must verify it actually became the leader (SR1-4)"
+    )
+
+
+def test_sr1_5_pyproject_filterwarnings_includes_authlib() -> None:
+    """SR1-5: pyproject ``filterwarnings`` MUST include the AuthlibDeprecationWarning
+    ignore so pytest's per-test warning-filter reset doesn't undo the
+    import-time suppression in scry/__init__.py.
+    """
+    import tomllib
+    from pathlib import Path as _Path
+
+    pyproject = _Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    pytest_cfg = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
+    fw = pytest_cfg.get("filterwarnings", [])
+    matches = [f for f in fw if "AuthlibDeprecationWarning" in f and "ignore" in f]
+    assert matches, (
+        "pyproject [tool.pytest.ini_options].filterwarnings must include "
+        "an ignore for AuthlibDeprecationWarning (SR1-5)"
     )

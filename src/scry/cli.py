@@ -1018,6 +1018,7 @@ def link(
         replay = None
 
     existing_id: str | None = None
+    existing_supersedes: str | None = None
     if replay is not None:
         for active_link in replay.active_links.values():
             if (
@@ -1026,6 +1027,11 @@ def link(
                 and active_link.type == link_type
             ):
                 existing_id = active_link.link_id
+                # SR1-1: refresh path requires ``supersedes`` per §3.5.2 rule 5
+                # (any upsert whose link_id already exists in baseline ⊕ overlay
+                # must reference the prior event_id).  Without this the second
+                # invocation fails with "requires supersedes".
+                existing_supersedes = active_link.last_event_id
                 break
 
     if existing_id is not None:
@@ -1039,23 +1045,24 @@ def link(
     else:
         lnk_id = new_link_id()
     evt_id = new_event_id()
-    record = LinkRecord.model_validate(
-        {
-            "op": LinkOp.UPSERT,
-            "link_id": lnk_id,
-            "event_id": evt_id,
-            "from": from_id,
-            "from_type": from_type,
-            "to": to_id,
-            "to_type": to_type,
-            "type": LinkType(link_type),
-            "from_content_hash": from_hash,
-            "to_content_hash": to_hash,
-            "commit_sha": git_ctx.head_sha,
-            "worktree_dirty": bool(git_ctx.dirty_files),
-            "evidence": evidence,
-        }
-    )
+    record_payload: dict[str, object] = {
+        "op": LinkOp.UPSERT,
+        "link_id": lnk_id,
+        "event_id": evt_id,
+        "from": from_id,
+        "from_type": from_type,
+        "to": to_id,
+        "to_type": to_type,
+        "type": LinkType(link_type),
+        "from_content_hash": from_hash,
+        "to_content_hash": to_hash,
+        "commit_sha": git_ctx.head_sha,
+        "worktree_dirty": bool(git_ctx.dirty_files),
+        "evidence": evidence,
+    }
+    if existing_supersedes is not None:
+        record_payload["supersedes"] = existing_supersedes
+    record = LinkRecord.model_validate(record_payload)
     try:
         overlay_mgr.append_to_current_branch_overlay(record)
     except (LinkValidationError, GitContextError) as exc:
@@ -1821,6 +1828,21 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
     async def _serve_daemon() -> None:
         """Run the leader/IPC server forever, no stdio."""
         await server.start()
+        # SR1-4: detect follower-mode startup so we don't silently
+        # claim leader status when another --daemon is already running.
+        # ``_ctx`` is populated by ``start()``; reading it directly is
+        # the simplest way to surface role without a public property.
+        ctx = server._ctx
+        role = ctx.role if ctx is not None else "unknown"
+        if role != "leader":
+            click.echo(
+                f"scry mcp --daemon: another leader is already running "
+                f"(this process is a {role}). Daemon mode is only "
+                f"useful for the LEADER process; exiting.",
+                err=True,
+            )
+            await server.stop()
+            raise SystemExit(2)
         click.echo(
             f"scry mcp --daemon: leader running, IPC ready. Ctrl-C to stop. PID={os.getpid()}",
             err=True,

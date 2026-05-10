@@ -44,6 +44,7 @@ Wave 2 deferrals
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from pathlib import Path
@@ -122,6 +123,12 @@ class MCPServer:
         # so duplicate MCP calls via the leader's stdio path are
         # deduplicated the same way IPC follower→leader forwards are.
         self._leader_idem_cache: dict[tuple[str, str], Any] = {}
+        # SR1-2: per-(op, token) lock so concurrent leader-direct calls
+        # with the same idempotency_token serialize and the second call
+        # observes the cached result of the first instead of also
+        # executing the handler.  Locks are evicted alongside cache
+        # entries to bound memory.
+        self._leader_idem_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._mcp: FastMCP = FastMCP(name="scry", version=scry.__version__)
         self._started = False
         self._register_tools()
@@ -339,48 +346,62 @@ class MCPServer:
         # to create two overlay records.  Cache the response in-process
         # keyed by (op, token) so duplicate calls return the cached
         # result (matching IPC semantics).
-        if (
-            op in WRITE_OPS
-            and ctx.role == "leader"
-            and (token_arg := args.get("idempotency_token"))
-        ):
-            cache_key = (op, token_arg)
-            cached = self._leader_idem_cache.get(cache_key)
-            if cached is not None:
-                logger.debug(
-                    "MCP: duplicate token %s for op=%r; returning cached response",
-                    token_arg,
-                    op,
-                )
-                return cached
-
-        handler = HANDLERS.get(op)
-        if handler is None:
-            raise MCPServerError(f"Unknown op: {op!r}")
-
+        #
+        # SR1-2 fix: serialize concurrent same-token requests on a
+        # per-(op, token) asyncio.Lock so the second request awaits
+        # the first instead of racing into the handler.
+        cache_key: tuple[str, str] | None = None
+        token_arg: str | None = None
+        if op in WRITE_OPS and ctx.role == "leader":
+            token_arg = args.get("idempotency_token")
+            if token_arg:
+                cache_key = (op, token_arg)
+                lock = self._leader_idem_locks.setdefault(cache_key, asyncio.Lock())
+                await lock.acquire()
         try:
-            result = await handler(ctx, **args)
-        except MCPServerError:
-            raise
-        except Exception as exc:
-            logger.exception("Handler raised for op=%s", op)
-            raise MCPServerError(f"Internal error in '{op}': {exc}") from exc
+            if cache_key is not None:
+                cached = self._leader_idem_cache.get(cache_key)
+                if cached is not None:
+                    logger.debug(
+                        "MCP: duplicate token %s for op=%r; returning cached response",
+                        token_arg,
+                        op,
+                    )
+                    return cached
 
-        # Cache successful responses for idempotency replay (UT3-4).
-        if (
-            op in WRITE_OPS
-            and ctx.role == "leader"
-            and (token_arg := args.get("idempotency_token"))
-        ):
-            self._leader_idem_cache[(op, token_arg)] = result
-            # Bound the cache to prevent unbounded growth (10k entries
-            # mirrors the IPCConfig default).
-            if len(self._leader_idem_cache) > 10_000:
-                # Drop oldest 100 entries (cheap dict-based LRU eviction).
-                for key in list(self._leader_idem_cache)[:100]:
-                    del self._leader_idem_cache[key]
+            handler = HANDLERS.get(op)
+            if handler is None:
+                raise MCPServerError(f"Unknown op: {op!r}")
 
-        return result
+            try:
+                result = await handler(ctx, **args)
+            except MCPServerError:
+                raise
+            except Exception as exc:
+                logger.exception("Handler raised for op=%s", op)
+                raise MCPServerError(f"Internal error in '{op}': {exc}") from exc
+
+            # Cache successful responses for idempotency replay (UT3-4).
+            if cache_key is not None:
+                self._leader_idem_cache[cache_key] = result
+                # Bound the cache to prevent unbounded growth (10k entries
+                # mirrors the IPCConfig default).
+                if len(self._leader_idem_cache) > 10_000:
+                    # Drop oldest 100 entries (cheap dict-based LRU eviction).
+                    for key in list(self._leader_idem_cache)[:100]:
+                        del self._leader_idem_cache[key]
+                        # Drop the matching lock too, but only if no
+                        # one is waiting on it (defensive).
+                        existing_lock = self._leader_idem_locks.get(key)
+                        if existing_lock is not None and not existing_lock.locked():
+                            del self._leader_idem_locks[key]
+
+            return result
+        finally:
+            if cache_key is not None:
+                lock_to_release = self._leader_idem_locks.get(cache_key)
+                if lock_to_release is not None and lock_to_release.locked():
+                    lock_to_release.release()
 
     # ─── Leader IPC handler ───────────────────────────────────────────────────
 
