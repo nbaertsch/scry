@@ -12,9 +12,8 @@ context and ``scry doctor`` prints a warning when it is set.
 
 Deferred commands (stubs)
 -------------------------
-``scry watch``          — Wave 6; prints deferral message, exits 0.
-``scry suggest-links``  — Wave 5; prints deferral message, exits 0.
-``scry reconcile``      — Wave 5; prints deferral message, exits 0.
+``scry watch``     — Wave 6; prints deferral message, exits 0.
+``scry reconcile`` — Wave 5; prints deferral message, exits 0.
 """
 
 from __future__ import annotations
@@ -865,30 +864,276 @@ def link(
 
 @main.command("suggest-links")
 @click.option("--scope", default=None, help="Restrict suggestions to this path prefix.")
-@click.option("--accept-all", is_flag=True, help="Automatically accept all suggestions.")
+@click.option(
+    "--accept-all",
+    is_flag=True,
+    help="Accept all suggestions without confirmation (implies --apply --yes).",
+)
+@click.option("--limit", default=None, type=int, help="Maximum candidate pairs to evaluate.")
+@click.option(
+    "--min-confidence",
+    default=None,
+    type=click.FloatRange(0.0, 1.0),
+    help="Minimum confidence threshold (default 0.7).",
+)
+@click.option("--apply", is_flag=True, help="Write accepted suggestions to the overlay.")
+@click.option("--yes", is_flag=True, help="Skip confirmation when --apply is set.")
+@click.option("--json", "as_json", is_flag=True, help="Output suggestions as JSON.")
+@click.option(
+    "--source",
+    type=click.Choice(["code", "doc", "both"]),
+    default="both",
+    show_default=True,
+    help="Which anchor type to scan for unlinked neighbors.",
+)
 @click.pass_context
-def suggest_links(ctx: click.Context, scope: str | None, accept_all: bool) -> None:
-    """AI-augmented batch link suggestions — deferred to Wave 5.
+def suggest_links(
+    ctx: click.Context,
+    scope: str | None,
+    accept_all: bool,
+    limit: int | None,
+    min_confidence: float | None,
+    apply: bool,
+    yes: bool,
+    as_json: bool,
+    source: str,
+) -> None:
+    """AI-augmented batch link suggestions (requires LLM provider).
 
-    .. note::
-        ``scry suggest-links`` is deferred to Wave 5 (requires LLM provider).
+    Scans for code\u2194doc anchor pairs that are semantically related but have no
+    existing link, then proposes link types via the configured LLM.
+
+    Use --apply (or --accept-all) to write accepted suggestions to the current
+    branch overlay.  Re-running on unchanged state produces no new suggestions
+    (idempotent: already-linked pairs are always excluded).
     """
-    click.echo("scry suggest-links is deferred to Wave 5")
+    import asyncio as _asyncio
+    from typing import Literal
+    from typing import cast as _cast
+
+    from scry.llm import LLMError, make_provider
+    from scry.store.links import LinkStore as _LinkStore
+    from scry.suggest import (
+        DEFAULT_MIN_CONFIDENCE,
+        LinkSuggestion,
+        SuggestConfig,
+        run_suggest_links,
+    )
+
+    # --accept-all is shorthand for --apply --yes.
+    if accept_all:
+        apply = True
+        yes = True
+
+    effective_confidence = min_confidence if min_confidence is not None else DEFAULT_MIN_CONFIDENCE
+    source_typed = _cast(Literal["code", "doc", "both"], source)
+
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(1) from None
+
+    try:
+        config = load_config(repo)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    try:
+        provider = make_provider(config.llm)
+    except LLMError as exc:
+        click.echo(f"error: LLM provider unavailable: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    embedder = _get_embedder(config)
+    suggest_config = SuggestConfig(
+        min_confidence=effective_confidence,
+        limit=limit,
+        source=source_typed,
+        scope=scope,
+    )
+
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            # Build an overlay-aware LinkStore wrapper so that
+            # ``replay()`` returns the baseline ⊕ current branch overlay.
+            # Without this, suggest-links would re-propose links that
+            # ``--apply`` had already written to the overlay, breaking
+            # idempotency (review-w5b BLOCKING fix).
+            git_ctx_prov_local = GitContextProvider(repo)
+            link_store_base = _LinkStore(repo)
+            overlay_mgr_local = OverlayManager(
+                repo, git_context=git_ctx_prov_local, link_store=link_store_base
+            )
+            current_overlay = overlay_mgr_local.current_overlay_path()
+
+            class _BranchLinkStore(_LinkStore):
+                def replay(self, *, overlay_path: Path | None = None) -> Any:
+                    return super().replay(overlay_path=overlay_path or current_overlay)
+
+            link_store = _BranchLinkStore(repo)
+            suggestions: list[LinkSuggestion] = _asyncio.run(
+                run_suggest_links(
+                    db=db,
+                    link_store=link_store,
+                    embedder=embedder,
+                    provider=provider,
+                    config=suggest_config,
+                )
+            )
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+    except LLMError as exc:
+        click.echo(f"error: LLM call failed: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    if not suggestions:
+        if as_json:
+            click.echo(json.dumps({"suggestions": []}))
+        else:
+            click.echo("No link suggestions found.")
+        return
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "suggestions": [
+                        {
+                            "from_id": s.from_id,
+                            "to_id": s.to_id,
+                            "link_type": s.link_type,
+                            "confidence": s.confidence,
+                            "reason": s.reason,
+                        }
+                        for s in suggestions
+                    ]
+                }
+            )
+        )
+        return
+
+    # ── Table output ──────────────────────────────────────────────────────────
+    click.echo(f"Found {len(suggestions)} suggestion(s):\n")
+    for i, s in enumerate(suggestions, start=1):
+        click.echo(f"  [{i}] {s.from_id}")
+        click.echo(f"      --[{s.link_type}]--> {s.to_id}")
+        click.echo(f"      confidence={s.confidence:.2f}  reason: {s.reason}")
+
+    if not apply:
+        return
+
+    # ── --apply: write links to the overlay ───────────────────────────────────
+    click.echo()
+    if not yes and not click.confirm(f"Apply {len(suggestions)} suggested link(s)?"):
+        click.echo("Aborted.")
+        return
+
+    try:
+        git_ctx_prov = GitContextProvider(repo)
+        git_ctx = git_ctx_prov.get()
+    except GitContextError as exc:
+        click.echo(f"error: git context unavailable: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    overlay_mgr = OverlayManager(repo, git_context=git_ctx_prov)
+    written = 0
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            for s in suggestions:
+                from_anchor = db.get_anchor(s.from_id)
+                to_anchor = db.get_anchor(s.to_id)
+                if from_anchor is None or to_anchor is None:
+                    click.echo(
+                        f"warning: anchor not found, skipping: {s.from_id!r} or {s.to_id!r}",
+                        err=True,
+                    )
+                    continue
+                lnk_id = new_link_id()
+                evt_id = new_event_id()
+                record = LinkRecord.model_validate(
+                    {
+                        "op": LinkOp.UPSERT,
+                        "link_id": lnk_id,
+                        "event_id": evt_id,
+                        "from": s.from_id,
+                        "from_type": AnchorType(from_anchor.type),
+                        "to": s.to_id,
+                        "to_type": AnchorType(to_anchor.type),
+                        "type": LinkType(s.link_type),
+                        "from_content_hash": from_anchor.content_hash,
+                        "to_content_hash": to_anchor.content_hash,
+                        "commit_sha": git_ctx.head_sha,
+                        "worktree_dirty": bool(git_ctx.dirty_files),
+                        "evidence": s.reason,
+                    }
+                )
+                try:
+                    overlay_mgr.append_to_current_branch_overlay(record)
+                    written += 1
+                except (LinkValidationError, GitContextError) as exc:
+                    click.echo(
+                        f"warning: could not write link {s.from_id!r} -> {s.to_id!r}: {exc}",
+                        err=True,
+                    )
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    click.echo(f"Wrote {written} link(s) to overlay.")
 
 
 # ─── scry reconcile ───────────────────────────────────────────────────────────
 
 
 @main.command("reconcile")
-@click.argument("link_id")
+@click.argument("link_id", required=False, default=None)
+@click.option("--all", "all_links", is_flag=True, help="Reconcile all drifted links.")
+@click.option(
+    "--apply",
+    "apply_patch",
+    is_flag=True,
+    help="Apply the proposed patch to the working tree via git apply.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip per-link confirmation when --apply is set.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Machine-readable JSON output.",
+)
 @click.pass_context
-def reconcile(ctx: click.Context, link_id: str) -> None:
-    """AI-assisted patch proposal for drifted links — deferred to Wave 5.
+def reconcile(
+    ctx: click.Context,
+    link_id: str | None,
+    all_links: bool,
+    apply_patch: bool,
+    yes: bool,
+    json_output: bool,
+) -> None:
+    """AI-assisted patch proposal for drifted links (DESIGN.md §5.5).
 
-    .. note::
-        ``scry reconcile`` is deferred to Wave 5 (requires LLM provider).
+    Fetches the git diff of each changed endpoint, sends context to the
+    configured LLM, and outputs a unified diff for review.
+
+    Requires ``scry index`` to have been run first.
     """
-    click.echo("scry reconcile is deferred to Wave 5")
+    from scry.cmd_reconcile import run_reconcile_cmd
+
+    run_reconcile_cmd(
+        repo_root=_resolve_repo_root(ctx),
+        link_id=link_id,
+        all_links=all_links,
+        apply_patch=apply_patch,
+        yes=yes,
+        json_output=json_output,
+    )
 
 
 # ─── scry doctor ──────────────────────────────────────────────────────────────

@@ -11,8 +11,9 @@ The ``SCRY_EMBEDDER=stub`` environment variable is set on every CliRunner
 invocation so that fastembed weights are never downloaded during tests.
 
 Stub notes:
-- ``scry watch``, ``scry suggest-links``, ``scry reconcile`` are verified
-  to print their deferral messages and exit 0.
+- ``scry watch`` and ``scry suggest-links`` are verified to print their
+  deferral messages and exit 0.
+- ``scry reconcile`` is now a live command (W5c); see test_reconcile_cmd.py.
 - ``scry mcp`` is tested by passing an instantly-closing stdin (via
   CliRunner's input="") — the server is expected to exit cleanly without
   error.
@@ -692,37 +693,49 @@ class TestLink:
 
 
 # ---------------------------------------------------------------------------
-# scry suggest-links (stub)
+# scry suggest-links — basic CLI smoke tests (deep tests in test_suggest_links.py)
 # ---------------------------------------------------------------------------
 
 
 class TestSuggestLinks:
-    """Tests for ``scry suggest-links`` (Wave 5 stub)."""
+    """Basic CLI smoke tests for scry suggest-links (Wave 5b)."""
 
-    def test_suggest_links_deferred(self, runner: CliRunner, tmp_path: Path) -> None:
-        """scry suggest-links prints deferral message and exits 0."""
+    def test_suggest_links_no_db_exits_1(self, runner: CliRunner, tmp_path: Path) -> None:
+        """scry suggest-links exits 1 with guidance when vectors.db is absent."""
         with runner.isolated_filesystem(temp_dir=tmp_path):
+            repo = Path.cwd()
+            (repo / ".scry").mkdir(parents=True, exist_ok=True)
             result = runner.invoke(main, ["suggest-links"], env=_STUB_ENV, catch_exceptions=False)
-        assert result.exit_code == 0
-        assert "Wave 5" in result.output
+        assert result.exit_code == 1
+        assert "vectors.db" in result.output
 
 
 # ---------------------------------------------------------------------------
-# scry reconcile (stub)
+# scry reconcile (W5c — now a live command; deep tests in test_reconcile_cmd.py)
 # ---------------------------------------------------------------------------
 
 
 class TestReconcile:
-    """Tests for ``scry reconcile`` (Wave 5 stub)."""
+    """Smoke tests for ``scry reconcile`` basic error paths."""
 
-    def test_reconcile_deferred(self, runner: CliRunner, tmp_path: Path) -> None:
-        """scry reconcile prints deferral message and exits 0."""
+    def test_reconcile_no_args_exits_2(self, runner: CliRunner, tmp_path: Path) -> None:
+        """scry reconcile with no LINK_ID and no --all exits 2 with guidance."""
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = runner.invoke(main, ["reconcile"], env=_STUB_ENV, catch_exceptions=False)
+        assert result.exit_code == 2
+        assert "LINK_ID" in result.output or "link_id" in result.output.lower()
+
+    def test_reconcile_missing_db_exits_2(self, runner: CliRunner, tmp_path: Path) -> None:
+        """scry reconcile without vectors.db exits 2 with helpful message."""
         with runner.isolated_filesystem(temp_dir=tmp_path):
             result = runner.invoke(
-                main, ["reconcile", "lnk_abc123"], env=_STUB_ENV, catch_exceptions=False
+                main,
+                ["reconcile", "lnk_abc123"],
+                env=_STUB_ENV,
+                catch_exceptions=False,
             )
-        assert result.exit_code == 0
-        assert "Wave 5" in result.output
+        # No vectors.db → exit 2
+        assert result.exit_code == 2
 
 
 # ---------------------------------------------------------------------------
