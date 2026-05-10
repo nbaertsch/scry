@@ -454,13 +454,17 @@ async def test_accept_link_missing_raises(git_repo: Path) -> None:
 
 
 async def test_commit_links_promotes_and_returns_event_ids(git_repo: Path) -> None:
-    """commit_links() returns event_id strings for promoted records."""
+    """commit_links() returns dict with promoted event_ids + index_state (UT3-5)."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    event_ids = await commit_links(ctx)
-    assert isinstance(event_ids, list)
-    assert len(event_ids) == 1
-    assert event_ids[0].startswith("evt_")
+    result = await commit_links(ctx)
+    assert isinstance(result, dict)
+    assert "promoted" in result
+    assert "index_state" in result  # UT3-5: §7.3 requirement
+    promoted = result["promoted"]
+    assert isinstance(promoted, list)
+    assert len(promoted) == 1
+    assert promoted[0].startswith("evt_")
 
 
 async def test_commit_links_clears_pending(git_repo: Path) -> None:

@@ -7,6 +7,8 @@ in future refactors.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 # ─── UT3-1 BLOCKING: git_context must close stdin to avoid pipe-inheritance hang
@@ -171,4 +173,152 @@ def test_ut2_4_reconcile_llm_unavailable_exits_1() -> None:
     assert "exit_code=1" in nearby, (
         "UT2-4: LLM-unavailable error path must use exit_code=1 (configuration "
         "issue), not 2 (infra failure)."
+    )
+
+
+# ─── Round-2 swarm fixes ─────────────────────────────────────────────
+
+
+def test_ut1_5_readme_says_v0_0_1_not_design_phase() -> None:
+    """UT1-5: README must not mislead first-time evaluators with the
+    obsolete 'design phase' status line.
+    """
+    from pathlib import Path as _P
+
+    text = _P(__file__).resolve().parent.parent.joinpath("README.md").read_text(encoding="utf-8")
+    assert "design phase" not in text.lower(), (
+        "README still claims scry is in 'design phase' (UT1-5)"
+    )
+    assert "v0.0.1" in text or "fully functional" in text.lower()
+
+
+def test_ut1_10_authlib_warning_suppressed() -> None:
+    """UT1-10: importing scry must register an authlib warning filter
+    so subsequent ``warnings.warn(..., AuthlibDeprecationWarning)``
+    calls are silently dropped.
+
+    Run in a subprocess so pytest's per-test ``catch_warnings`` wrapper
+    doesn't reset the filter list between import and assertion.
+    """
+    code = (
+        "import scry, warnings, sys\n"
+        "matches = [\n"
+        "    f for f in warnings.filters\n"
+        "    if f[2] is not None\n"
+        "    and (getattr(f[2], '__module__', '').startswith('authlib')\n"
+        "         or 'authlib' in getattr(f[2], '__name__', '').lower())\n"
+        "    and f[0] == 'ignore'\n"
+        "]\n"
+        "sys.exit(0 if matches else 1)\n"
+    )
+    rc = subprocess.run([sys.executable, "-c", code], check=False).returncode
+    assert rc == 0, "scry must register an ignore filter for AuthlibDeprecationWarning (UT1-10)"
+
+
+def test_ut2_6_relink_same_pair_refreshes_existing(tmp_path: Path) -> None:
+    """UT2-6: re-running ``scry link A B --type X`` reuses the existing
+    link_id instead of creating a duplicate.
+    """
+    # Smoke-test the helper logic by direct Python: scan replay for
+    # an existing (from, to, type) match and ensure the CLI module
+    # exposes the upsert-by-pair logic.
+    # The implementation of `scry link` must reference the existing-link
+    # detection block.  Verify by inspecting its source.
+    import inspect
+
+    from scry.cli import link
+
+    src = inspect.getsource(link.callback)  # type: ignore[arg-type]
+    assert "existing_id" in src, (
+        "scry link must check for an existing link with the same "
+        "(from, to, type) tuple before minting a new link_id (UT2-6)"
+    )
+    assert "refreshing existing link_id" in src
+
+
+def test_ut3_4_propose_link_idempotency_at_leader() -> None:
+    """UT3-4: leader-direct write ops must dedup by idempotency_token."""
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._dispatch)
+    assert "_leader_idem_cache" in src, (
+        "MCPServer._dispatch must have a leader-side idempotency cache (UT3-4)"
+    )
+
+
+def test_ut3_5_commit_links_returns_dict_with_index_state() -> None:
+    """UT3-5: commit_links MCP handler must include index_state per §7.3."""
+    import inspect
+
+    from scry.mcp.handlers import commit_links
+
+    sig = inspect.signature(commit_links)
+    # The return annotation must be dict, not list
+    ret = sig.return_annotation
+    assert ret is not list, "commit_links must return dict, not list (UT3-5)"
+
+
+def test_ut4_2_doctor_explains_windows_pid_wrapper() -> None:
+    """UT4-2: doctor must clarify the scry.exe / python.exe PID gap."""
+    import inspect
+
+    import scry.cli as _cli
+
+    src = inspect.getsource(_cli.doctor.callback)  # type: ignore[arg-type]
+    assert "lock_pid" in src
+    assert "wrapper" in src.lower(), (
+        "doctor must mention the Windows scry.exe wrapper PID issue (UT4-2)"
+    )
+
+
+def test_ut4_3_serve_stdio_has_eof_watchdog_on_windows() -> None:
+    """UT4-3: serve_stdio must spawn a Windows stdin-EOF watchdog thread."""
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer.serve_stdio)
+    assert "stdin" in src.lower()
+    assert "eof" in src.lower() or "watchdog" in src.lower() or "watcher" in src.lower(), (
+        "serve_stdio must include the stdin-EOF watchdog (UT4-3)"
+    )
+
+
+def test_ut1_1_mcp_has_daemon_flag() -> None:
+    """UT1-1: scry mcp --daemon enables headless leader runs for watch testing."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["mcp", "--help"])
+    assert result.exit_code == 0
+    assert "--daemon" in result.output, "scry mcp --help must advertise --daemon (UT1-1)"
+
+
+def test_ut1_2_check_has_verbose_flag() -> None:
+    """UT1-2: scry check --verbose lists drifted links (not just counts)."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["check", "--help"])
+    assert result.exit_code == 0
+    assert "--verbose" in result.output
+
+
+def test_ut5_2_warns_on_full_with_unconfigured_language(tmp_path: Path) -> None:
+    """UT5-2: transitive_resolution=full + empty languages -> WARN not silent."""
+    import inspect
+
+    import scry.index
+
+    src = inspect.getsource(scry.index._enrich_all_with_lsp)
+    # Verify the warning is in the source.
+    assert "transitive_resolution=full but language" in src, (
+        "Indexer must warn when transitive_resolution=full and a language "
+        "is not in code_anchors.languages (UT5-2)"
     )

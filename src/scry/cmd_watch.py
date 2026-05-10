@@ -53,6 +53,17 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+# UT1-6: cmd_watch's logger.warning("watch: ... — ...") writes em-dashes
+# that crash on a Windows cp1252 console.  Reconfigure stdio to UTF-8 with
+# replacement so log output never raises UnicodeEncodeError when the CLI
+# is invoked from cmd.exe / older PowerShell hosts.  Mirrors cli.py's fix.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            with contextlib.suppress(OSError, ValueError):
+                _reconfigure(encoding="utf-8", errors="replace")
+
 from watchdog.events import (
     FileSystemEvent,
     FileSystemEventHandler,
@@ -308,7 +319,7 @@ async def run_watch(
 
                 sleep_for = min(backoff, remaining)
                 logger.warning(
-                    "watch: leader IPC error: %s — retrying in %.0fs (%.0fs remaining)",
+                    "watch: leader IPC error: %s - retrying in %.0fs (%.0fs remaining)",
                     exc,
                     sleep_for,
                     remaining,
@@ -347,6 +358,10 @@ async def run_watch(
         finally:
             if ipc_client is not None:
                 await ipc_client.close()
+        # UT4-5: --once was silent on success.  Print a confirmation so
+        # users (and test scripts) can distinguish "reindex completed"
+        # from "no leader detected" / "nothing changed".
+        print("watch: --once reindex completed.", file=sys.stderr)
         return 0
 
     # ── 3. Start file watcher ─────────────────────────────────────────────

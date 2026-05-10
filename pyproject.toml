@@ -115,6 +115,10 @@ ignore_missing_imports = true
 module = ["win32api", "win32event", "win32file", "win32pipe", "win32security", "pywintypes", "winerror"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["authlib.*"]
+ignore_missing_imports = true
+
 # ─── pytest ──────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 minversion = "8.0"

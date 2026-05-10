@@ -1271,6 +1271,22 @@ async def _enrich_all_with_lsp(
                 status_tag = lsp_manager.status_for(lang)
                 if status_tag in ("skip", "unknown"):
                     ts = TransitiveHashStatus.UNSUPPORTED
+                    # UT5-2: silently dropping LSP for an "unknown" language
+                    # (i.e. user set transitive_resolution=full but did not
+                    # add the language to code_anchors.languages) is a
+                    # usability trap — full mode appears to do nothing.
+                    # Emit a clear, one-time WARN so users understand they
+                    # need to opt the language in explicitly.
+                    if status_tag == "unknown" and transitive_resolution == "full":
+                        logger.warning(
+                            "transitive_resolution=full but language %r is not "
+                            "configured in code_anchors.languages; %d anchor(s) "
+                            "will use 'unsupported'.  Add `code_anchors.languages: "
+                            "{%s: lsp}` to .scry/config.yaml to enable LSP.",
+                            lang,
+                            len(lang_anchors),
+                            lang,
+                        )
                 else:
                     ts = TransitiveHashStatus.LSP_UNAVAILABLE
                     logger.warning(

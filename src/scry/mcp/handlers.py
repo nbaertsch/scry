@@ -610,7 +610,7 @@ async def commit_links(
     *,
     scope: str | None = None,
     idempotency_token: str | None = None,
-) -> list[str]:
+) -> dict[str, Any]:
     """Promote pending overlay records to the baseline link store.
 
     Wave 2: *scope* is accepted but not used to filter promoted records —
@@ -623,14 +623,26 @@ async def commit_links(
         idempotency_token: Carried through IPC for leader-side deduplication.
 
     Returns:
-        List of ``event_id`` strings for the promoted records.
+        Dict with keys ``promoted`` (list of event_id strings for promoted
+        records) and ``index_state`` (UT3-5 fix: §7.3 requires index_state
+        on every response).  Pre-fix returned bare ``list[str]``.
     """
     if scope is not None:
         logger.debug("commit_links: scope=%r is accepted but ignored in Wave 2", scope)
 
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
     promoted_event_ids = ctx.overlay_mgr.promote_pending()
     ctx.git_context.invalidate()
-    return list(promoted_event_ids)
+    return {"promoted": list(promoted_event_ids), "index_state": index_state}
 
 
 async def status(ctx: MCPContext) -> dict[str, Any]:

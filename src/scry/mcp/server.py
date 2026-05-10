@@ -44,8 +44,11 @@ Wave 2 deferrals
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import sys
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -117,6 +120,11 @@ class MCPServer:
         self._ctx: MCPContext | None = None
         self._leader_lock: LeaderLock | None = None
         self._ipc_server: IPCServer | None = None
+        # UT3-4: in-process LRU cache for leader-direct write ops keyed by
+        # (op, idempotency_token).  Mirrors IPCServer's _IdempotencyCache
+        # so duplicate MCP calls via the leader's stdio path are
+        # deduplicated the same way IPC follower→leader forwards are.
+        self._leader_idem_cache: dict[tuple[str, str], Any] = {}
         self._mcp: FastMCP = FastMCP(name="scry", version=scry.__version__)
         self._started = False
         self._register_tools()
@@ -227,10 +235,15 @@ class MCPServer:
         async def commit_links(
             scope: str | None = None,
             idempotency_token: str | None = None,
-        ) -> list[str]:
-            """Promote pending overlay records to the baseline link store."""
+        ) -> dict[str, Any]:
+            """Promote pending overlay records to the baseline link store.
+
+            Returns ``{"promoted": [...], "index_state": "..."}`` per
+            §7.3 (UT3-5 fix: was ``-> list[str]`` which dropped the
+            required index_state field).
+            """
             return cast(
-                list[str],
+                dict[str, Any],
                 await self._dispatch(
                     "commit_links",
                     {"scope": scope, "idempotency_token": idempotency_token},
@@ -322,17 +335,55 @@ class MCPServer:
             token: str = args.get("idempotency_token") or new_idempotency_token()
             return await ctx.ipc_client.call(op, args, idempotency_token=token)
 
+        # UT3-4 fix: idempotency for direct MCP calls on the leader.
+        # Followers route through IPC which has its own LRU cache; leader
+        # write ops invoked directly bypass that cache, so a duplicate
+        # ``propose_link`` request with the same idempotency_token used
+        # to create two overlay records.  Cache the response in-process
+        # keyed by (op, token) so duplicate calls return the cached
+        # result (matching IPC semantics).
+        if (
+            op in WRITE_OPS
+            and ctx.role == "leader"
+            and (token_arg := args.get("idempotency_token"))
+        ):
+            cache_key = (op, token_arg)
+            cached = self._leader_idem_cache.get(cache_key)
+            if cached is not None:
+                logger.debug(
+                    "MCP: duplicate token %s for op=%r; returning cached response",
+                    token_arg,
+                    op,
+                )
+                return cached
+
         handler = HANDLERS.get(op)
         if handler is None:
             raise MCPServerError(f"Unknown op: {op!r}")
 
         try:
-            return await handler(ctx, **args)
+            result = await handler(ctx, **args)
         except MCPServerError:
             raise
         except Exception as exc:
             logger.exception("Handler raised for op=%s", op)
             raise MCPServerError(f"Internal error in '{op}': {exc}") from exc
+
+        # Cache successful responses for idempotency replay (UT3-4).
+        if (
+            op in WRITE_OPS
+            and ctx.role == "leader"
+            and (token_arg := args.get("idempotency_token"))
+        ):
+            self._leader_idem_cache[(op, token_arg)] = result
+            # Bound the cache to prevent unbounded growth (10k entries
+            # mirrors the IPCConfig default).
+            if len(self._leader_idem_cache) > 10_000:
+                # Drop oldest 100 entries (cheap dict-based LRU eviction).
+                for key in list(self._leader_idem_cache)[:100]:
+                    del self._leader_idem_cache[key]
+
+        return result
 
     # ─── Leader IPC handler ───────────────────────────────────────────────────
 
@@ -573,7 +624,76 @@ class MCPServer:
 
         Blocks until stdin closes (i.e. the MCP client disconnects).
         Calls :meth:`start` first if not yet started.
+
+        UT4-3: on Windows the FastMCP stdio transport does not
+        consistently propagate stdin EOF, leaving the process hung
+        after a clean disconnect.  We launch a dedicated **stdin
+        watchdog** thread that reads ``sys.stdin`` raw; when read()
+        returns 0 bytes (EOF), the thread schedules an asyncio task
+        cancellation on the main event loop so ``run_stdio_async``
+        unblocks and returns.  This is a defensive belt-and-braces
+        addition — if FastMCP's own EOF handling works (Linux/macOS),
+        the watchdog is a no-op.
         """
         if not self._started:
             await self.start()
-        await self._mcp.run_stdio_async(show_banner=False)
+
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def _stdin_eof_watcher() -> None:
+            try:
+                # Read raw bytes from stdin; .read() blocks until data
+                # OR EOF.  Empty result == EOF.  Use a small read to
+                # avoid buffering whole MCP messages here.
+                buf = sys.stdin.buffer
+                while True:
+                    chunk = buf.read(4096)
+                    if not chunk:
+                        # EOF — signal the main loop to stop.
+                        loop.call_soon_threadsafe(stop_event.set)
+                        return
+            except Exception:
+                # Any error reading stdin (closed, redirected) → also EOF.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(stop_event.set)
+                return
+
+        # NOTE: this thread READS stdin out from under FastMCP.  That's
+        # fine for the EOF-detection use case ON WINDOWS where the
+        # alternative is a hung process.  On POSIX FastMCP normally
+        # owns stdin and we never reach the read() call because the
+        # MCP messages exit serve_stdio first.  To avoid stealing
+        # bytes from a healthy MCP session, we ONLY enable the
+        # watchdog on Windows.
+        watcher: threading.Thread | None = None
+        if sys.platform == "win32":
+            watcher = threading.Thread(
+                target=_stdin_eof_watcher,
+                name="scry-mcp-stdin-eof-watcher",
+                daemon=True,
+            )
+            watcher.start()
+
+        try:
+            mcp_task = asyncio.create_task(self._mcp.run_stdio_async(show_banner=False))
+            stop_task = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait(
+                {mcp_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # If the stop_event fired (Windows EOF watchdog), cancel
+            # the FastMCP task so the function returns.
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(BaseException):
+                    await t
+            # Surface any exception from the completed task(s).
+            for t in done:
+                if not t.cancelled():
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
+        finally:
+            # Best-effort: thread is daemon, dies when process exits.
+            del watcher
