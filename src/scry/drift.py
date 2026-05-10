@@ -6,8 +6,9 @@ coverage score with null semantics) for Wave 2.
 
 Wave 2 scope and contracts:
   - Section-level drift only. CODE-typed anchors use own ``content_hash``
-    comparison; transitive LSP closure drift (§5.3) is NOT included (W4a).
-  - ``drift-unknown`` is never produced by Wave 2.
+    comparison; transitive LSP closure drift (§5.3) is produced by W3d.
+  - ``drift-unknown`` is produced (W3d) when a CODE endpoint has
+    ``transitive_hash_status == "lsp_error"`` (DESIGN.md §5.1).
   - ``drift_coverage`` is always ``"section-only"`` for Wave 2 outputs.
   - Cross-language ``semantic_drift`` detection is deferred to Wave 6.
 """
@@ -110,6 +111,8 @@ def _resolve_changed(
     *,
     current_from_hash: ContentHash,
     current_to_hash: ContentHash,
+    current_from_closure_hash: str | None = None,
+    current_to_closure_hash: str | None = None,
 ) -> tuple[bool, bool]:
     """Return ``(from_changed, to_changed)`` honouring the prior-hash override (§3.3).
 
@@ -117,10 +120,34 @@ def _resolve_changed(
     updated to the post-rename hashes. If ``prior_from_content_hash`` is set,
     we compare ``current_from_hash`` against the pre-rename hash, so a
     rename-plus-edit is correctly seen as changed rather than fresh.
+
+    For CODE anchors, the transitive closure hash is also compared (W3d §5.3):
+    if a callee's body changed, ``closure_hash`` differs even when the caller's
+    own AST is unchanged.  Backward compat: a ``None`` baseline closure hash
+    means "no closure comparison available" and never causes a false positive.
     """
     from_ref: ContentHash = link.prior_from_content_hash or link.from_content_hash
     to_ref: ContentHash = link.prior_to_content_hash or link.to_content_hash
-    return current_from_hash != from_ref, current_to_hash != to_ref
+
+    from_content_changed = current_from_hash != from_ref
+    to_content_changed = current_to_hash != to_ref
+
+    # Closure hash comparison: fires only when BOTH the baseline and current
+    # closure hashes are available — missing baseline hash never triggers.
+    from_closure_changed = (
+        link.from_closure_hash is not None
+        and current_from_closure_hash is not None
+        and current_from_closure_hash != link.from_closure_hash
+    )
+    to_closure_changed = (
+        link.to_closure_hash is not None
+        and current_to_closure_hash is not None
+        and current_to_closure_hash != link.to_closure_hash
+    )
+
+    return (from_content_changed or from_closure_changed), (
+        to_content_changed or to_closure_changed
+    )
 
 
 def _changed_to_status(
@@ -211,11 +238,9 @@ def evaluate_link_drift(
         5. ``both-changed``    — both endpoints' hashes differ.
         6. ``spec-changed``    — spec/doc endpoint (SECTION or CODE_IN_DOC) hash changed.
         7. ``code-changed``    — code endpoint (CODE) hash changed.
-        8. (``drift-unknown``  — never produced by Wave 2; reserved for W4a.)
+        8. ``drift-unknown``   — either CODE endpoint has ``transitive_hash_status
+                                 == "lsp_error"`` (DESIGN.md §5.1 / W3d).
         9. ``fresh``           — both endpoints' hashes match.
-
-    Wave 2 does NOT compute transitive closure drift (§5.3) — all CODE
-    anchors' ``transitive_hash_status`` values are treated as irrelevant.
 
     ``semantic_drift`` is computed for ``mirrors`` links when both endpoints
     have ``overview_embedding`` stored in the DB; ``None`` otherwise.
@@ -249,15 +274,33 @@ def evaluate_link_drift(
             semantic_drift=None,
         )
 
-    # Steps 4-9 -- hash comparison with prior-hash override (§3.3).
+    # Steps 4-7 -- hash comparison with prior-hash override (§3.3).
     from_type = AnchorType(from_anchor.type)
     to_type = AnchorType(to_anchor.type)
     from_changed, to_changed = _resolve_changed(
         link,
         current_from_hash=from_anchor.content_hash,
         current_to_hash=to_anchor.content_hash,
+        current_from_closure_hash=from_anchor.closure_hash,
+        current_to_closure_hash=to_anchor.closure_hash,
     )
     status = _changed_to_status(from_changed, to_changed, from_type, to_type)
+
+    # Step 8 — drift-unknown when an LSP error prevented reliable closure
+    # computation on a CODE endpoint (DESIGN.md §5.1 / §5.3).  Only applies
+    # when neither endpoint has already triggered a change status (steps 5-7),
+    # because those signals are more actionable.
+    if status == DriftStatus.FRESH:
+        from_lsp_error = (
+            from_anchor.type == AnchorType.CODE.value
+            and from_anchor.transitive_hash_status == "lsp_error"
+        )
+        to_lsp_error = (
+            to_anchor.type == AnchorType.CODE.value
+            and to_anchor.transitive_hash_status == "lsp_error"
+        )
+        if from_lsp_error or to_lsp_error:
+            status = DriftStatus.DRIFT_UNKNOWN
 
     # Semantic drift (independent of status ladder, mirrors links only — §5.1).
     semantic_drift: bool | None = None

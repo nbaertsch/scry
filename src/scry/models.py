@@ -125,6 +125,31 @@ class Anchor(BaseModel):
     transitive_hash_status: TransitiveHashStatus | None = None
     """Set on CODE anchors only; omitted from JSON for SECTION/CODE_IN_DOC."""
 
+    closure_hash: str | None = None
+    """SHA-256 over transitive callee content hashes (CODE anchors only).
+
+    Populated during W3d LSP enrichment via ``compute_closure``.  ``None``
+    when LSP is unavailable, the language is skipped, or an error occurred
+    (see ``transitive_hash_status`` for the reason).  Not persisted to the
+    DB for the current wave; stored separately from ``content_hash`` so
+    callers can distinguish AST drift from transitive-closure drift.
+    """
+
+    def_line: int | None = None
+    """0-based line of the symbol's definition position (CODE anchors only).
+
+    Set by the code extractor from the tree-sitter node's ``start_point``.
+    Used by the W3d LSP enrichment pass to call
+    ``textDocument/prepareCallHierarchy`` at the correct position.  NOT
+    persisted to the DB (None after a DB round-trip).
+    """
+
+    def_char: int | None = None
+    """0-based character offset within ``def_line`` (CODE anchors only).
+
+    See ``def_line`` for full semantics.
+    """
+
     @field_validator("path")
     @classmethod
     def _path_is_relative(cls, v: str) -> str:
@@ -136,8 +161,11 @@ class Anchor(BaseModel):
 
     @model_validator(mode="after")
     def _status_only_on_code(self) -> Anchor:
-        if self.type != AnchorType.CODE.value and self.transitive_hash_status is not None:
-            raise ValueError("transitive_hash_status may only be set on CODE anchors")
+        if self.type != AnchorType.CODE.value:
+            if self.transitive_hash_status is not None:
+                raise ValueError("transitive_hash_status may only be set on CODE anchors")
+            if self.closure_hash is not None:
+                raise ValueError("closure_hash may only be set on CODE anchors")
         return self
 
 
@@ -242,6 +270,21 @@ class LinkRecord(BaseModel):
     type: LinkType | None = None
     from_content_hash: ContentHash | None = None
     to_content_hash: ContentHash | None = None
+    from_closure_hash: str | None = None
+    """Transitive closure hash of the source anchor at link-proposal time (W3d).
+
+    Stored alongside ``from_content_hash`` so drift detection can fire
+    ``code-changed`` when a callee body changes even if the anchor's own
+    AST is unchanged (DESIGN.md §5.3).  ``None`` for non-CODE source
+    anchors or when LSP enrichment was unavailable.  Missing from
+    pre-W3d baseline records — treated as "no closure comparison" (no
+    false positive on baseline upgrade).
+    """
+    to_closure_hash: str | None = None
+    """Transitive closure hash of the target anchor at link-proposal time (W3d).
+
+    Same semantics as ``from_closure_hash`` for the target endpoint.
+    """
     prior_from_content_hash: ContentHash | None = None
     """Set on rebased upserts (§3.3); consulted by §5.1 prior-hash override."""
     prior_to_content_hash: ContentHash | None = None
@@ -310,6 +353,16 @@ class Link(BaseModel):
     type: LinkType
     from_content_hash: ContentHash
     to_content_hash: ContentHash
+    from_closure_hash: str | None = None
+    """Transitive closure hash of the source anchor at link-proposal time.
+
+    Used by drift detection to detect callee-body changes (DESIGN.md §5.3).
+    ``None`` for non-CODE source endpoints or when LSP enrichment was
+    unavailable.  Pre-W3d baselines carry ``None`` — drift treats ``None``
+    as "no closure comparison available" (no false positive).
+    """
+    to_closure_hash: str | None = None
+    """Transitive closure hash of the target anchor at link-proposal time."""
     prior_from_content_hash: ContentHash | None = None
     prior_to_content_hash: ContentHash | None = None
     commit_sha: str | None = None
@@ -468,10 +521,27 @@ class CodeAnchorsConfig(BaseModel):
     languages: dict[str, Literal["lsp", "skip"]] = Field(default_factory=dict)
     transitive_resolution: Literal["call_only", "full"] = "call_only"
     lsp: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    transitive_max_depth: int = Field(
+        default=32,
+        ge=1,
+        le=256,
+        description=(
+            "Maximum BFS depth for the transitive call-closure walk "
+            "(DESIGN.md §6 / §11).  Default 32."
+        ),
+    )
 
 
 class CodeAnchorsExtraConfig(BaseModel):
-    """Defensive caps for the LSP closure walk (DESIGN.md §5.3, post-v3.1)."""
+    """Defensive caps for the LSP closure walk (DESIGN.md §5.3, post-v3.1).
+
+    .. deprecated::
+        ``code_anchors_extra.transitive_max_depth`` is superseded by
+        ``code_anchors.transitive_max_depth`` (DESIGN.md §6 / §11).  The
+        field remains here for backward compatibility — a deprecation warning
+        is emitted when the key is present in ``.scry/config.yaml``.  It
+        will be removed in a future release.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -579,6 +649,32 @@ class Config(BaseModel):
     drift: DriftConfig = Field(default_factory=DriftConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     ipc: IPCConfig = Field(default_factory=IPCConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_deprecated_code_anchors_extra(cls, data: object) -> object:
+        """Emit a deprecation warning when code_anchors_extra is in the input.
+
+        The warning fires only when the caller explicitly provides the key,
+        not when ``Config`` is default-constructed (which uses
+        ``default_factory=CodeAnchorsExtraConfig``).
+        """
+        import logging as _logging
+        import warnings
+
+        if isinstance(data, dict) and "code_anchors_extra" in data:
+            _logging.getLogger(__name__).warning(
+                "DEPRECATED: 'code_anchors_extra.transitive_max_depth' is superseded by "
+                "'code_anchors.transitive_max_depth' (DESIGN.md §6 / §11). "
+                "Migrate your .scry/config.yaml and remove the code_anchors_extra section."
+            )
+            warnings.warn(
+                "code_anchors_extra.transitive_max_depth is deprecated; "
+                "use code_anchors.transitive_max_depth instead.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+        return data
 
     @field_validator("classify")
     @classmethod

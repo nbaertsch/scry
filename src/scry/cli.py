@@ -301,7 +301,12 @@ def index(ctx: click.Context, force: bool, reembed: bool) -> None:
         raise SystemExit(1) from None
 
     embedder = _get_embedder(config)
-    indexer = Indexer(repo, config=config, embedder=embedder)
+    indexer = Indexer(
+        repo,
+        config=config,
+        embedder=embedder,
+        allow_untrusted=ctx.obj.get("allow_untrusted_lsp_config", False),
+    )
 
     try:
         if reembed:
@@ -951,7 +956,8 @@ def mcp(ctx: click.Context) -> None:
     be the leader or a follower process (§10).  Blocks until stdin closes.
     """
     repo = _resolve_repo_root(ctx)
-    server = MCPServer(repo)
+    allow_untrusted = ctx.obj.get("allow_untrusted_lsp_config", False)
+    server = MCPServer(repo, allow_untrusted_lsp_config=allow_untrusted)
     try:
         asyncio.run(server.serve_stdio())
     except (KeyboardInterrupt, EOFError):

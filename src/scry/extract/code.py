@@ -232,7 +232,7 @@ def _py_class_body(node: Any) -> Any | None:
 
 
 # Raw record used during Python tree walk.
-_PyRec = tuple[str, str]  # (qualified_symbol_path, raw_content_text)
+_PyRec = tuple[str, str, int, int]  # (qualified_symbol_path, raw_content_text, def_line, def_char)
 
 
 def _walk_python(
@@ -265,7 +265,7 @@ def _walk_python(
     for node, resolved in zip(matching, resolved_names, strict=True):
         symbol_path = f"{scope_prefix}.{resolved}" if scope_prefix else resolved
         content_raw = _node_text(node, src)
-        results.append((symbol_path, content_raw))
+        results.append((symbol_path, content_raw, node.start_point[0], node.start_point[1]))
 
         # Recurse into class bodies to extract methods.
         if _py_is_class(node):
@@ -325,7 +325,9 @@ def _ts_class_methods(
     results: list[_PyRec] = []
     for node, resolved_name in zip(method_nodes, resolved, strict=True):
         symbol_path = f"{class_name}.{resolved_name}"
-        results.append((symbol_path, _node_text(node, src)))
+        results.append(
+            (symbol_path, _node_text(node, src), node.start_point[0], node.start_point[1])
+        )
     return results
 
 
@@ -376,12 +378,14 @@ def _walk_typescript(
         sig_text = _node_text(sig_node, src)
         suffix = _sig_hash6(sig_text)
         symbol_path = f"{sig_name}@{suffix}"
-        results.append((symbol_path, sig_text))
+        results.append((symbol_path, sig_text, sig_node.start_point[0], sig_node.start_point[1]))
 
     # Emit regular declarations with collision resolution.
     resolved = _apply_collisions(decl_names)
     for (_raw_name, node), resolved_name in zip(decl_nodes, resolved, strict=True):
-        results.append((resolved_name, _node_text(node, src)))
+        results.append(
+            (resolved_name, _node_text(node, src), node.start_point[0], node.start_point[1])
+        )
 
         # Recurse into class body for methods.
         if node.type == "class_declaration":
@@ -438,7 +442,7 @@ def _walk_zig(
     """
     children: list[Any] = list(root.children)
     raw_names: list[str] = []
-    raw_entries: list[tuple[str, str]] = []  # (name, content_text)
+    raw_entries: list[tuple[str, str, int, int]] = []  # (name, content_text, def_line, def_char)
 
     for i, child in enumerate(children):
         if child.type != "Decl":
@@ -456,7 +460,9 @@ def _walk_zig(
             name = _zig_fn_name(fn_proto, src)
             if name is not None:
                 raw_names.append(name)
-                raw_entries.append((name, content_text))
+                raw_entries.append(
+                    (name, content_text, fn_proto.start_point[0], fn_proto.start_point[1])
+                )
             continue  # A Decl is either a fn or a var, not both.
 
         # Check for VarDecl containing a ContainerDecl (struct/enum/union).
@@ -465,12 +471,14 @@ def _walk_zig(
             name = _zig_var_name(var_decl, src)
             if name is not None:
                 raw_names.append(name)
-                raw_entries.append((name, content_text))
+                raw_entries.append(
+                    (name, content_text, var_decl.start_point[0], var_decl.start_point[1])
+                )
 
     resolved = _apply_collisions(raw_names)
     results: list[_PyRec] = []
-    for (_, content), resolved_name in zip(raw_entries, resolved, strict=True):
-        results.append((resolved_name, content))
+    for (_, content, def_line, def_char), resolved_name in zip(raw_entries, resolved, strict=True):
+        results.append((resolved_name, content, def_line, def_char))
     return results
 
 
@@ -483,6 +491,8 @@ def _make_anchor(
     path_str: str,
     symbol_path: str,
     raw_content: str,
+    def_line: int = 0,
+    def_char: int = 0,
 ) -> Anchor:
     """Build an ``Anchor`` for a code symbol.
 
@@ -493,6 +503,9 @@ def _make_anchor(
     Content is canonicalised per §5.4 before hashing.
     ``transitive_hash_status`` is set to ``LSP_UNAVAILABLE`` (Wave 1; Wave 3
     will refine via ``callHierarchy``).
+    ``def_line`` and ``def_char`` carry the tree-sitter ``start_point`` for
+    this symbol — used by the W3d LSP enrichment pass to call
+    ``textDocument/prepareCallHierarchy`` at the right position.
     """
     import re as _re
 
@@ -516,6 +529,8 @@ def _make_anchor(
         content_hash=chash,
         fingerprint_simhash=shash,
         transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+        def_line=def_line,
+        def_char=def_char,
     )
 
 
@@ -662,8 +677,8 @@ def extract_code_symbols(
 
     # Build Anchor objects.
     anchors: list[Anchor] = []
-    for symbol_path, raw_content in records:
-        anchor = _make_anchor(path_str, symbol_path, raw_content)
+    for symbol_path, raw_content, def_line, def_char in records:
+        anchor = _make_anchor(path_str, symbol_path, raw_content, def_line, def_char)
         anchors.append(anchor)
 
     return anchors

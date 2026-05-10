@@ -94,6 +94,8 @@ def _link_from_record(record: LinkRecord) -> Link:
         type=record.type,
         from_content_hash=record.from_content_hash,
         to_content_hash=record.to_content_hash,
+        from_closure_hash=record.from_closure_hash,
+        to_closure_hash=record.to_closure_hash,
         prior_from_content_hash=record.prior_from_content_hash,
         prior_to_content_hash=record.prior_to_content_hash,
         commit_sha=record.commit_sha,

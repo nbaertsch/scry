@@ -193,6 +193,7 @@ CREATE TABLE IF NOT EXISTS anchors (
     content_hash          TEXT    NOT NULL,
     fingerprint_simhash   INTEGER NOT NULL,
     transitive_hash_status TEXT,
+    closure_hash          TEXT,
     overview_embedding    BLOB,
     created_at            TEXT    NOT NULL,
     updated_at            TEXT    NOT NULL
@@ -349,6 +350,13 @@ class ScryDB:
             self._conn.execute(_DDL_CHUNKS_FTS)
             for ddl in _DDL_TRIGGERS:
                 self._conn.execute(ddl)
+
+            # W3d migration: add closure_hash column if the anchors table was
+            # created before this column was introduced.  ALTER TABLE … ADD
+            # COLUMN raises OperationalError when the column already exists, so
+            # we suppress that specific error (idempotent).
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute("ALTER TABLE anchors ADD COLUMN closure_hash TEXT")
 
             # Decide whether to create or recreate the vec virtual table.
             row = self._conn.execute(
@@ -657,7 +665,7 @@ class ScryDB:
             """
             SELECT id, type, path, heading_path_json, symbol_name,
                    content_text, content_hash, fingerprint_simhash,
-                   transitive_hash_status
+                   transitive_hash_status, closure_hash
             FROM anchors WHERE id = ?
             """,
             (anchor_id,),
@@ -685,7 +693,7 @@ class ScryDB:
         query = (
             "SELECT id, type, path, heading_path_json, symbol_name, "
             "content_text, content_hash, fingerprint_simhash, "
-            "transitive_hash_status FROM anchors"
+            "transitive_hash_status, closure_hash FROM anchors"
         )
         conditions: list[str] = []
         params: list[Any] = []
@@ -968,8 +976,8 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
         INSERT INTO anchors
             (id, type, path, heading_path_json, symbol_name, content_text,
              content_hash, fingerprint_simhash, transitive_hash_status,
-             overview_embedding, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+             closure_hash, overview_embedding, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             type                  = excluded.type,
             path                  = excluded.path,
@@ -979,6 +987,7 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             content_hash          = excluded.content_hash,
             fingerprint_simhash   = excluded.fingerprint_simhash,
             transitive_hash_status = excluded.transitive_hash_status,
+            closure_hash          = excluded.closure_hash,
             overview_embedding    = CASE
                 WHEN content_hash != excluded.content_hash THEN NULL
                 ELSE overview_embedding
@@ -997,6 +1006,7 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             str(anchor.transitive_hash_status)
             if anchor.transitive_hash_status is not None
             else None,
+            anchor.closure_hash,
             now,
             now,
         ),
@@ -1057,10 +1067,11 @@ def _replace_chunks_in_txn(
 
 
 def _row_to_anchor(row: Any) -> Anchor:
-    """Reconstruct an ``Anchor`` from a SELECT row (9 columns, no embedding).
+    """Reconstruct an ``Anchor`` from a SELECT row (10 columns, no embedding).
 
     Column order: id, type, path, heading_path_json, symbol_name,
-    content_text, content_hash, fingerprint_simhash, transitive_hash_status.
+    content_text, content_hash, fingerprint_simhash, transitive_hash_status,
+    closure_hash.
 
     Args:
         row: A tuple (or sqlite3.Row) from an anchors SELECT query.
@@ -1078,6 +1089,7 @@ def _row_to_anchor(row: Any) -> Anchor:
         content_hash,
         fingerprint_simhash,
         transitive_hash_status,
+        closure_hash,
     ) = row
     heading_path: list[str] | None = (
         json.loads(heading_path_json) if heading_path_json is not None else None
@@ -1096,4 +1108,5 @@ def _row_to_anchor(row: Any) -> Anchor:
         # against this verbatim).
         fingerprint_simhash=_from_signed_int64(int(fingerprint_simhash)),
         transitive_hash_status=transitive_hash_status,
+        closure_hash=closure_hash,
     )

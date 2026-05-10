@@ -41,7 +41,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from scry.lsp.adapters import get_adapter
 from scry.lsp.proto import LSPMessage, LSPProtocolError, LSPStreamReader, LSPStreamWriter
@@ -504,6 +504,10 @@ class LSPManager:
         self._allow_untrusted = allow_untrusted
         self._sessions: dict[str, LSPSession] = {}
         self._failed: set[str] = set()
+        # Languages rejected because they use a custom command without
+        # --allow-untrusted-lsp-config.  These are tracked separately so
+        # status_for() can map them to "unsupported" (not "lsp_unavailable").
+        self._untrusted_rejected: set[str] = set()
 
     async def session_for(self, language: str) -> LSPSession | None:
         """Return a live session for *language*, spawning one if necessary.
@@ -551,7 +555,20 @@ class LSPManager:
             return None
 
         # Resolve binary and build launch spec (may raise LSPAllowlistViolation)
-        spec = self._resolve_spec(language)
+        try:
+            spec = self._resolve_spec(language)
+        except LSPAllowlistViolation as exc:
+            # Per-language rejection: do not abort the entire indexing run.
+            # Treat this language as unsupported and continue (DESIGN.md §6.2).
+            logger.warning(
+                "LSP [%s] config rejected (no --allow-untrusted-lsp-config): %s; "
+                "code anchors for this language will use unsupported status",
+                language,
+                exc,
+            )
+            self._failed.add(language)
+            self._untrusted_rejected.add(language)
+            return None
         if spec is None:
             self._failed.add(language)
             return None
@@ -576,6 +593,47 @@ class LSPManager:
             session.supports("callHierarchyProvider"),
         )
         return session
+
+    def status_for(
+        self, language: str
+    ) -> Literal["available", "skip", "lsp_unavailable", "unknown"]:
+        """Return the current availability status for *language* without spawning.
+
+        Does NOT start a new session.  The return value reflects the most
+        recent state (i.e. post any previous ``session_for`` call).
+
+        Returns
+        -------
+        ``"available"``
+            A live session already exists for this language.
+        ``"skip"``
+            ``languages.<lang>: skip`` is configured — intentionally disabled.
+            Also returned when the language was rejected because it uses a
+            custom ``command:`` without ``--allow-untrusted-lsp-config``; the
+            indexer maps both to :attr:`TransitiveHashStatus.UNSUPPORTED`.
+        ``"lsp_unavailable"``
+            The binary is missing, the LSP failed to start, or a previously
+            active session has died.  Set when ``language in self._failed`` (and
+            the failure was NOT an untrusted-command rejection).
+        ``"unknown"``
+            The language is not listed in ``code_anchors.languages`` at all.
+        """
+        if language in self._sessions and self._sessions[language].is_alive:
+            return "available"
+        if language in self._untrusted_rejected:
+            # Custom command rejected without flag — treat as intentionally
+            # unsupported, not as a binary-missing failure.
+            return "skip"
+        if language in self._failed:
+            return "lsp_unavailable"
+        lang_directive = self._config.languages.get(language)
+        if lang_directive is None:
+            return "unknown"
+        if lang_directive == "skip":
+            return "skip"
+        # Configured as "lsp" but session never started (or died without being
+        # added to _failed).  Treat as unavailable for the caller's purposes.
+        return "lsp_unavailable"
 
     async def shutdown_all(self) -> None:
         """Gracefully shut down every active LSP session."""

@@ -34,7 +34,6 @@ import pytest
 
 from scry.lsp.manager import (
     LSP_ALLOWLIST,
-    LSPAllowlistViolation,
     LSPLaunchError,
     LSPLaunchSpec,
     LSPManager,
@@ -91,32 +90,50 @@ def test_allowlist_python_entries() -> None:
 async def test_allowlist_violation_when_command_set_no_flag(
     repo_root: Path,
 ) -> None:
-    """command: in config without allow_untrusted → LSPAllowlistViolation."""
+    """command: in config without allow_untrusted → per-language rejection, not a crash.
+
+    HIGH #3 fix (DESIGN.md §6.2): LSPAllowlistViolation is now caught inside
+    session_for() and converted to a per-language failure.  The caller (indexer)
+    continues with transitive_hash_status=unsupported for that language.
+    session_for() returns None and adds the language to _untrusted_rejected.
+    """
     cfg = CodeAnchorsConfig(
         languages={"python": "lsp"},
         lsp={"python": {"command": "my-custom-pyright", "args": []}},
     )
     mgr = LSPManager(repo_root, cfg, allow_untrusted=False)
 
-    with pytest.raises(LSPAllowlistViolation, match="my-custom-pyright"):
-        await mgr.session_for("python")
+    session = await mgr.session_for("python")
+
+    assert session is None, "untrusted command must be rejected → None, not a crash"
+    assert "python" in mgr._failed
+    assert "python" in mgr._untrusted_rejected
+    # status_for returns "skip" (→ UNSUPPORTED) not "lsp_unavailable"
+    assert mgr.status_for("python") == "skip"
 
 
 async def test_allowlist_violation_message_mentions_flag(
     repo_root: Path,
 ) -> None:
-    """LSPAllowlistViolation message references --allow-untrusted-lsp-config."""
+    """LSPAllowlistViolation is logged (with the flag name) when rejected per-language.
+
+    HIGH #3 fix: the exception is no longer re-raised; instead a WARNING is
+    emitted.  We verify that the language ends up in _untrusted_rejected and
+    status_for maps it to "skip".
+    """
     cfg = CodeAnchorsConfig(
         languages={"python": "lsp"},
         lsp={"python": {"command": "evil-lsp", "args": []}},
     )
     mgr = LSPManager(repo_root, cfg, allow_untrusted=False)
 
-    with pytest.raises(LSPAllowlistViolation) as exc_info:
-        await mgr.session_for("python")
+    session = await mgr.session_for("python")
 
-    assert "--allow-untrusted-lsp-config" in str(exc_info.value)
-    assert "evil-lsp" in str(exc_info.value)
+    assert session is None
+    # The per-language tracking set must contain the rejected language so
+    # downstream callers get "skip" (→ UNSUPPORTED) not "lsp_unavailable".
+    assert "python" in mgr._untrusted_rejected
+    assert mgr.status_for("python") == "skip"
 
 
 async def test_allow_untrusted_accepts_custom_command(

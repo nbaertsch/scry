@@ -106,9 +106,11 @@ class MCPServer:
         repo_root: Path,
         *,
         config: Config | None = None,
+        allow_untrusted_lsp_config: bool = False,
     ) -> None:
         self._repo_root = repo_root
         self._preloaded_config = config
+        self._allow_untrusted_lsp_config = allow_untrusted_lsp_config
         self._ctx: MCPContext | None = None
         self._leader_lock: LeaderLock | None = None
         self._ipc_server: IPCServer | None = None
@@ -391,8 +393,9 @@ class MCPServer:
                 db=db,
                 embedder=embedder,
                 git_context=git_context,
+                allow_untrusted=self._allow_untrusted_lsp_config,
             )
-            indexer.index(force=False)
+            await indexer.index_async(force=False)
 
             # Step 3d: Crash recovery for any prior commit-links transaction
             # interrupted before its marker was deleted.

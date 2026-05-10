@@ -40,6 +40,9 @@ Indexer            — main orchestrator class
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
 import json
 import logging
 import sqlite3
@@ -47,7 +50,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from scry.anchor_id import canonicalize_content
 from scry.anchor_id import content_hash as compute_content_hash
@@ -62,8 +65,12 @@ from scry.embed import Embedder, chunk_anchor, make_embedder
 from scry.extract.code import extract_code_symbols
 from scry.extract.markdown import extract_markdown
 from scry.git_context import GitContextError, GitContextProvider
-from scry.models import Anchor, AnchorType, Config, Frontmatter, IndexMetadata
+from scry.lsp.closure import CalleeRef, compute_closure
+from scry.models import Anchor, AnchorType, Config, Frontmatter, IndexMetadata, TransitiveHashStatus
 from scry.store.db import ScryDB, _now_iso, _upsert_anchor_in_txn
+
+if TYPE_CHECKING:
+    from scry.lsp.manager import LSPManager
 
 __all__ = [
     "ExtractionTarget",
@@ -180,12 +187,16 @@ class Indexer:
         db: ScryDB | None = None,
         embedder: Embedder | None = None,
         git_context: GitContextProvider | None = None,
+        lsp_manager: LSPManager | None = None,
+        allow_untrusted: bool = False,
     ) -> None:
         self._repo_root = repo_root.resolve()
         self._config = config
         self._db = db
         self._embedder = embedder
         self._git_context = git_context
+        self._lsp_manager = lsp_manager
+        self._allow_untrusted = allow_untrusted
 
     # ------------------------------------------------------------------
     # Lazy resource accessors
@@ -219,6 +230,22 @@ class Indexer:
         if self._git_context is None:
             self._git_context = GitContextProvider.from_config(self._repo_root, config.index)
         return self._git_context
+
+    def _ensure_lsp_manager(self, config: Config) -> LSPManager:
+        """Return the LSP manager, creating one from config if not provided.
+
+        The LSPManager is lazy: it does not spawn any processes until
+        ``session_for()`` is called.  Construction is always safe.
+        """
+        if self._lsp_manager is None:
+            from scry.lsp.manager import LSPManager as _LSPManager
+
+            self._lsp_manager = _LSPManager(
+                self._repo_root,
+                config.code_anchors,
+                allow_untrusted=self._allow_untrusted,
+            )
+        return self._lsp_manager
 
     # ------------------------------------------------------------------
     # Public interface
@@ -307,11 +334,29 @@ class Indexer:
         deleted since the last index have their anchors pruned.  If the config
         hash has changed, a full reindex is forced regardless.
 
+        Incremental code-anchor re-enrichment
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        When ANY code file changes in an incremental run, ALL code anchors (new
+        and existing-unchanged) are re-enriched via LSP so that caller
+        ``closure_hash`` and ``transitive_hash_status`` reflect updated callees.
+        The cost is O(N) LSP calls per incremental run with code changes.  For
+        incremental runs with only non-code changes, LSP enrichment is skipped
+        entirely.  This trade-off is chosen over maintaining a reverse-dependency
+        graph, which is complex and error-prone.
+
         Full rebuild (``force=True``)
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         Drops **all** existing anchors (and their chunks), then re-extracts
         and re-embeds everything from scratch.  Does NOT touch ``links.jsonl``
         or overlay files.
+
+        Async context safety
+        ~~~~~~~~~~~~~~~~~~~~
+        If called from within a running event loop (e.g. the MCP server),
+        the LSP enrichment coroutine is run in a fresh ``ThreadPoolExecutor``
+        thread with its own isolated event loop, since the enrichment never
+        touches SQLite (``check_same_thread=True`` is not violated).  Callers
+        inside an async context should prefer :meth:`index_async` instead.
 
         Returns:
             An :class:`IndexResult` summarising what was done.
@@ -349,13 +394,14 @@ class Indexer:
 
             # ── Decide which files to process ───────────────────────────
             files_to_process: list[Path]
-            if (
+            is_incremental = (
                 not force
                 and prior_meta is not None
                 and prior_meta.config_hash == current_config_hash
-            ):
+            )
+            if is_incremental:
                 # Incremental: only changed / new files.
-                prior_manifest = prior_meta.indexed_file_manifest
+                prior_manifest = prior_meta.indexed_file_manifest  # type: ignore[union-attr]
                 files_to_process = []
                 for path in all_files:
                     rel = path.relative_to(self._repo_root).as_posix()
@@ -385,7 +431,8 @@ class Indexer:
                 for path in all_files
             }
 
-            # ── Extract and embed ────────────────────────────────────────
+            # ── Phase 1: Extract anchors from all files ──────────────────
+            all_anchors: list[Anchor] = []
             for path in files_to_process:
                 target = self.classify_for_extraction(path)
                 if target.kind == "skip":
@@ -398,20 +445,235 @@ class Indexer:
                 for old_anchor in db.list_anchors(path=rel):
                     db.delete_anchor(old_anchor.id)
 
-                anchors = _extract_file_anchors(path, target, config, self._repo_root)
+                extracted = _extract_file_anchors(path, target, config, self._repo_root)
+                all_anchors.extend(extracted)
                 files_processed += 1
-                anchors_extracted += len(anchors)
+                anchors_extracted += len(extracted)
 
-                for anchor in anchors:
-                    n = _process_anchor(
-                        anchor,
-                        db,
-                        embedder,
-                        max_tokens=config.sections.max_tokens,
-                        overlap_tokens=config.sections.overlap_tokens,
-                    )
-                    anchors_embedded += 1
-                    chunks_written += n
+            # Track which anchor IDs are newly extracted (vs. loaded from DB).
+            newly_extracted_ids: set[str] = {a.id for a in all_anchors}
+
+            # ── Phase 2: LSP enrichment (transitive closure) ─────────────
+            # If ANY code file changed (incremental) or this is a full run,
+            # we enrich ALL code anchors — including existing unchanged ones —
+            # so that caller closure_hash reflects updated callees.
+            # For incremental runs with only non-code changes, skip entirely.
+            code_anchors_newly_extracted = any(a.type == AnchorType.CODE.value for a in all_anchors)
+            lsp_mgr = self._ensure_lsp_manager(config)
+            if code_anchors_newly_extracted:
+                if is_incremental:
+                    # Load unchanged code anchors from DB so their closure_hash
+                    # is recomputed alongside the newly-extracted ones.
+                    for existing_anchor in db.list_anchors(anchor_type=AnchorType.CODE):
+                        if existing_anchor.id not in newly_extracted_ids:
+                            all_anchors.append(existing_anchor)
+
+                # Run enrichment: detect running loop and use a thread if needed.
+                max_depth = config.code_anchors.transitive_max_depth
+                coro = _enrich_all_with_lsp(
+                    all_anchors,
+                    lsp_mgr,
+                    self._repo_root,
+                    max_depth=max_depth,
+                )
+                try:
+                    asyncio.get_running_loop()
+                    # Running inside an event loop (e.g. MCP server): dispatch
+                    # to a fresh thread with its own event loop.  Enrichment
+                    # never touches SQLite, so check_same_thread is not violated.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        all_anchors = pool.submit(asyncio.run, coro).result()
+                except RuntimeError:
+                    # No running loop — safe to call asyncio.run() directly.
+                    all_anchors = asyncio.run(coro)
+
+            # ── Phase 3: Embed and store ─────────────────────────────────
+            # Newly-extracted anchors: full embed + store.
+            # Existing anchors (incremental re-enrichment): update only the
+            # LSP-derived fields (closure_hash, transitive_hash_status).
+            # upsert_anchors preserves overview_embedding when content_hash
+            # is unchanged (CASE … END in db.py), so this is cheap.
+            existing_enriched = [a for a in all_anchors if a.id not in newly_extracted_ids]
+            if existing_enriched:
+                db.upsert_anchors(existing_enriched)
+
+            for anchor in all_anchors:
+                if anchor.id not in newly_extracted_ids:
+                    continue
+                n = _process_anchor(
+                    anchor,
+                    db,
+                    embedder,
+                    max_tokens=config.sections.max_tokens,
+                    overlap_tokens=config.sections.overlap_tokens,
+                )
+                anchors_embedded += 1
+                chunks_written += n
+
+            # ── Write index_metadata ─────────────────────────────────────
+            indexed_branch = git_ctx.branch or f"detached-{git_ctx.head_short}"
+            new_meta = IndexMetadata(
+                indexed_git_head=git_ctx.head_sha,
+                indexed_git_tree_hash=None,
+                indexed_branch=indexed_branch,
+                indexed_file_manifest=new_manifest,
+                config_hash=current_config_hash,
+                embedding_provider=embedder.provider,
+                embedding_model=embedder.model_name,
+                embedding_dimensions=embedder.dimensions,
+                tokenizer_version=embedder.tokenizer_version,
+            )
+            db.write_index_metadata(new_meta)
+
+        elapsed = time.monotonic() - start
+        return IndexResult(
+            files_processed=files_processed,
+            anchors_extracted=anchors_extracted,
+            anchors_embedded=anchors_embedded,
+            chunks_written=chunks_written,
+            files_pruned=files_pruned,
+            elapsed_seconds=elapsed,
+        )
+
+    async def index_async(self, *, force: bool = False) -> IndexResult:
+        """Async variant of :meth:`index` for use inside running event loops.
+
+        Identical to :meth:`index` in every respect except that the LSP
+        enrichment coroutine is awaited directly rather than being dispatched
+        via :func:`asyncio.run`.  Use this method when calling from an async
+        context (e.g. the MCP server's ``_run_index`` handler) to avoid
+        ``RuntimeError: asyncio.run() cannot be called from a running event
+        loop``.
+
+        The sync :meth:`index` method auto-detects a running event loop and
+        falls back to a :class:`~concurrent.futures.ThreadPoolExecutor` thread,
+        but explicitly calling this method is cleaner when the call site is
+        already async.
+
+        Thread safety
+        ~~~~~~~~~~~~~
+        This method MUST be called from the same thread that owns the
+        ``SQLite`` connection (``check_same_thread=True`` default).  The MCP
+        server satisfies this because its event loop runs in one thread.
+
+        Returns:
+            An :class:`IndexResult` summarising what was done.
+
+        Raises:
+            IndexerError: If the config is missing/invalid, git is unavailable,
+                or a fatal I/O error occurs.
+        """
+        start = time.monotonic()
+        try:
+            config = self._ensure_config()
+        except Exception as exc:
+            raise IndexerError(f"Failed to load config: {exc}") from exc
+
+        db = self._ensure_db(config)
+        embedder = self._ensure_embedder(config)
+        git_provider = self._ensure_git_context(config)
+
+        files_processed = 0
+        anchors_extracted = 0
+        anchors_embedded = 0
+        chunks_written = 0
+        files_pruned = 0
+
+        with db.acquire_write_lock():
+            try:
+                git_ctx = git_provider.get(force_refresh=True)
+            except GitContextError as exc:
+                raise IndexerError(f"Git context unavailable: {exc}") from exc
+
+            prior_meta = db.read_index_metadata()
+            current_config_hash = compute_config_hash(config)
+            all_files = self.discover_files()
+            all_files_rel = {p.relative_to(self._repo_root).as_posix() for p in all_files}
+
+            # ── Decide which files to process ───────────────────────────
+            files_to_process: list[Path]
+            is_incremental = (
+                not force
+                and prior_meta is not None
+                and prior_meta.config_hash == current_config_hash
+            )
+            if is_incremental:
+                prior_manifest = prior_meta.indexed_file_manifest  # type: ignore[union-attr]
+                files_to_process = []
+                for path in all_files:
+                    rel = path.relative_to(self._repo_root).as_posix()
+                    current_hash = _file_content_hash(path)
+                    if prior_manifest.get(rel) != current_hash:
+                        files_to_process.append(path)
+
+                removed_paths = set(prior_manifest.keys()) - all_files_rel
+                pruned_file_paths: set[str] = set()
+                for removed_rel in removed_paths:
+                    for anchor in db.list_anchors(path=removed_rel):
+                        db.delete_anchor(anchor.id)
+                        pruned_file_paths.add(removed_rel)
+                files_pruned = len(pruned_file_paths)
+            else:
+                if force or prior_meta is not None:
+                    for existing in db.list_anchors():
+                        db.delete_anchor(existing.id)
+                files_to_process = list(all_files)
+
+            new_manifest: dict[str, str] = {
+                path.relative_to(self._repo_root).as_posix(): _file_content_hash(path)
+                for path in all_files
+            }
+
+            # ── Phase 1: Extract ─────────────────────────────────────────
+            all_anchors: list[Anchor] = []
+            for path in files_to_process:
+                target = self.classify_for_extraction(path)
+                if target.kind == "skip":
+                    continue
+                rel = path.relative_to(self._repo_root).as_posix()
+                for old_anchor in db.list_anchors(path=rel):
+                    db.delete_anchor(old_anchor.id)
+                extracted = _extract_file_anchors(path, target, config, self._repo_root)
+                all_anchors.extend(extracted)
+                files_processed += 1
+                anchors_extracted += len(extracted)
+
+            newly_extracted_ids: set[str] = {a.id for a in all_anchors}
+
+            # ── Phase 2: LSP enrichment ──────────────────────────────────
+            code_anchors_newly_extracted = any(a.type == AnchorType.CODE.value for a in all_anchors)
+            lsp_mgr = self._ensure_lsp_manager(config)
+            if code_anchors_newly_extracted:
+                if is_incremental:
+                    for existing_anchor in db.list_anchors(anchor_type=AnchorType.CODE):
+                        if existing_anchor.id not in newly_extracted_ids:
+                            all_anchors.append(existing_anchor)
+
+                max_depth = config.code_anchors.transitive_max_depth
+                all_anchors = await _enrich_all_with_lsp(
+                    all_anchors,
+                    lsp_mgr,
+                    self._repo_root,
+                    max_depth=max_depth,
+                )
+
+            # ── Phase 3: Embed and store ─────────────────────────────────
+            existing_enriched = [a for a in all_anchors if a.id not in newly_extracted_ids]
+            if existing_enriched:
+                db.upsert_anchors(existing_enriched)
+
+            for anchor in all_anchors:
+                if anchor.id not in newly_extracted_ids:
+                    continue
+                n = _process_anchor(
+                    anchor,
+                    db,
+                    embedder,
+                    max_tokens=config.sections.max_tokens,
+                    overlap_tokens=config.sections.overlap_tokens,
+                )
+                anchors_embedded += 1
+                chunks_written += n
 
             # ── Write index_metadata ─────────────────────────────────────
             indexed_branch = git_ctx.branch or f"detached-{git_ctx.head_short}"
@@ -826,3 +1088,252 @@ def _write_meta_in_txn(
             now_str,
         ),
     )
+
+
+# ─── LSP enrichment helpers ────────────────────────────────────────────────────
+
+# Maps the LSP language ID used in ``textDocument/didOpen`` from the
+# tree-sitter grammar name used inside scry.
+_LANG_ID: dict[str, str] = {
+    "python": "python",
+    "typescript": "typescript",
+    "tsx": "typescriptreact",
+    "javascript": "javascript",
+    "jsx": "javascriptreact",
+    "zig": "zig",
+}
+
+
+def _ext_to_lang(path_str: str) -> str | None:
+    """Return the language name for a repo-relative path, or ``None``."""
+    suffix = Path(path_str).suffix.lower()
+    return _EXT_TO_LANG.get(suffix)
+
+
+def _lang_to_language_id(lang: str) -> str:
+    """Return the LSP ``languageId`` string for a grammar name."""
+    return _LANG_ID.get(lang, lang)
+
+
+async def _enrich_all_with_lsp(
+    anchors: list[Anchor],
+    lsp_manager: LSPManager,
+    repo_root: Path,
+    *,
+    max_depth: int,
+    timeout_per_call: float = 10.0,
+) -> list[Anchor]:
+    """Run the LSP closure walk for every CODE anchor and return updated list.
+
+    Design notes
+    ------------
+    * Called with ``await`` inside ``index_async()`` or via a thread-pool
+      executor inside ``index()`` (when an event loop is already running).
+    * Documents are opened once per URI per language session (``didOpen``
+      cache) and closed before ``shutdown_all``.
+    * Sessions are serialized within each language (``LSPSession`` is
+      single-conversation).  Languages are processed sequentially.
+    * Non-CODE anchors pass through unchanged.
+    * ``lsp_manager.shutdown_all()`` is always called, even if an exception
+      propagates out of an individual language block.
+
+    Inter-anchor status propagation (DESIGN.md §5.3)
+    -------------------------------------------------
+    After the per-anchor closure walk, a **fixpoint propagation pass**
+    propagates the worst ``transitive_hash_status`` from callees to callers:
+
+    .. code-block:: text
+
+        A.transitive_hash_status =
+            min(A.self_lsp_status,
+                min(callee.transitive_hash_status for callee in A.closure))
+
+    where "min" is over the precedence ordering (complete < partial <
+    unsupported < lsp_unavailable < lsp_error).  The pass loops until no
+    anchor changes status (fixpoint), capped at O(N) iterations to handle
+    cycles safely (worst-status spreads monotonically so the fixpoint is
+    always reached before the cap).
+    """
+    # Rank used for inter-anchor propagation (§5.3).
+    # lsp_unavailable sits between unsupported and lsp_error.
+    _PROPAGATION_RANK: dict[str, int] = {
+        "complete": 0,
+        "partial": 1,
+        "unsupported": 2,
+        "lsp_unavailable": 3,
+        "lsp_error": 4,
+    }
+
+    enriched: dict[str, Anchor] = {}
+    # Map anchor_id → callees discovered during its closure walk, used for
+    # inter-anchor status propagation after all walks complete.
+    anchor_callees: dict[str, tuple[CalleeRef, ...]] = {}
+
+    # Separate code anchors from non-code (non-code pass through unchanged).
+    code_anchors: list[Anchor] = [a for a in anchors if a.type == AnchorType.CODE.value]
+    non_code_ids: set[str] = {a.id for a in anchors if a.type != AnchorType.CODE.value}
+
+    if not code_anchors:
+        await lsp_manager.shutdown_all()
+        return anchors
+
+    # Group code anchors by language (derived from file extension).
+    lang_to_anchors: dict[str, list[Anchor]] = {}
+    for anchor in code_anchors:
+        lang = _ext_to_lang(anchor.path)
+        if lang is None:
+            # File extension not recognized → unsupported
+            enriched[anchor.id] = anchor.model_copy(
+                update={"transitive_hash_status": TransitiveHashStatus.UNSUPPORTED}
+            )
+            continue
+        lang_to_anchors.setdefault(lang, []).append(anchor)
+
+    try:
+        for lang, lang_anchors in lang_to_anchors.items():
+            session = await lsp_manager.session_for(lang)
+
+            if session is None:
+                status_tag = lsp_manager.status_for(lang)
+                if status_tag in ("skip", "unknown"):
+                    ts = TransitiveHashStatus.UNSUPPORTED
+                else:
+                    ts = TransitiveHashStatus.LSP_UNAVAILABLE
+                    logger.warning(
+                        "LSP [%s] unavailable; %d code anchor(s) will use %s status",
+                        lang,
+                        len(lang_anchors),
+                        ts,
+                    )
+                for anchor in lang_anchors:
+                    enriched[anchor.id] = anchor.model_copy(update={"transitive_hash_status": ts})
+                continue
+
+            # Track opened URIs for this session (one didOpen per file).
+            opened_uris: set[str] = set()
+
+            try:
+                for anchor in lang_anchors:
+                    abs_path = repo_root / anchor.path
+                    file_uri = abs_path.as_uri()
+
+                    if file_uri not in opened_uris:
+                        try:
+                            src_text = abs_path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            src_text = ""
+                        await session.notify(
+                            "textDocument/didOpen",
+                            {
+                                "textDocument": {
+                                    "uri": file_uri,
+                                    "languageId": _lang_to_language_id(lang),
+                                    "version": 1,
+                                    "text": src_text,
+                                }
+                            },
+                        )
+                        opened_uris.add(file_uri)
+
+                    def_line = anchor.def_line if anchor.def_line is not None else 0
+                    def_char = anchor.def_char if anchor.def_char is not None else 0
+
+                    result = await compute_closure(
+                        session,
+                        file_uri,
+                        def_line,
+                        def_char,
+                        max_depth=max_depth,
+                        timeout_per_call=timeout_per_call,
+                    )
+
+                    enriched[anchor.id] = anchor.model_copy(
+                        update={
+                            "transitive_hash_status": result.status,
+                            "closure_hash": result.closure_hash,
+                        }
+                    )
+                    anchor_callees[anchor.id] = result.callees
+            finally:
+                # Always close opened documents to satisfy LSP protocol.
+                for uri in opened_uris:
+                    with contextlib.suppress(Exception):
+                        await session.notify(
+                            "textDocument/didClose",
+                            {"textDocument": {"uri": uri}},
+                        )
+    finally:
+        await lsp_manager.shutdown_all()
+
+    # ── Inter-anchor status propagation (DESIGN.md §5.3) ────────────────────
+    # Build a lookup: (definition_uri, def_line, def_char) → anchor_id so we
+    # can match callee CalleeRef positions against indexed anchors.
+    #
+    # Scope note: only code anchors with def_line/def_char set are included.
+    # Anchors loaded from DB (incremental re-enrichment) have def_line=None
+    # because the column is not persisted — they won't appear as callee
+    # targets in the propagation.  Newly-extracted anchors (which carry real
+    # def_line/def_char from the extractor) fully participate.  This is a
+    # known trade-off; a future wave can persist def_line/def_char to DB.
+    pos_to_anchor_id: dict[tuple[str, int, int], str] = {}
+    for anchor in code_anchors:
+        if anchor.def_line is not None and anchor.def_char is not None:
+            file_uri = (repo_root / anchor.path).as_uri()
+            pos_to_anchor_id[(file_uri, anchor.def_line, anchor.def_char)] = anchor.id
+
+    # Fixpoint loop: propagate worst callee status to callers.
+    # Converges in O(N) iterations because status only worsens (monotone).
+    propagation_changed = True
+    iterations = 0
+    max_iterations = len(code_anchors) + 1  # O(N) cap; handles chains of length N
+    while propagation_changed and iterations < max_iterations:
+        propagation_changed = False
+        iterations += 1
+        for anchor_id, callees in anchor_callees.items():
+            caller = enriched.get(anchor_id)
+            if caller is None or caller.transitive_hash_status is None:
+                continue
+            cur_status_str = str(caller.transitive_hash_status)
+            cur_rank = _PROPAGATION_RANK.get(cur_status_str, 0)
+
+            for callee_ref in callees:
+                lookup_key = (
+                    callee_ref.uri,
+                    callee_ref.range_start_line,
+                    callee_ref.range_start_char,
+                )
+                callee_id = pos_to_anchor_id.get(lookup_key)
+                if callee_id is None:
+                    continue
+                callee_anchor = enriched.get(callee_id)
+                if callee_anchor is None or callee_anchor.transitive_hash_status is None:
+                    continue
+                callee_status_str = str(callee_anchor.transitive_hash_status)
+                callee_rank = _PROPAGATION_RANK.get(callee_status_str, 0)
+
+                if callee_rank > cur_rank:
+                    enriched[anchor_id] = caller.model_copy(
+                        update={
+                            "transitive_hash_status": TransitiveHashStatus(
+                                callee_anchor.transitive_hash_status
+                            )
+                        }
+                    )
+                    caller = enriched[anchor_id]
+                    cur_rank = callee_rank
+                    propagation_changed = True
+
+    if iterations >= max_iterations:
+        logger.debug(
+            "Inter-anchor propagation reached iteration cap (%d); cycle suspected in call graph",
+            max_iterations,
+        )
+
+    # Reconstruct the anchors list in the original order.
+    result_list: list[Anchor] = []
+    for anchor in anchors:
+        if anchor.id in non_code_ids:
+            result_list.append(anchor)
+        else:
+            result_list.append(enriched.get(anchor.id, anchor))
+    return result_list

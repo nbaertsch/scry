@@ -469,6 +469,11 @@ async def propose_link(
             "type": lt,
             "from_content_hash": from_anchor.content_hash,
             "to_content_hash": to_anchor.content_hash,
+            # W3d §5.3: persist closure hashes so drift can detect callee-body
+            # changes even when the caller's own AST is unchanged.  None for
+            # non-CODE anchors or when LSP enrichment was unavailable.
+            "from_closure_hash": from_anchor.closure_hash,
+            "to_closure_hash": to_anchor.closure_hash,
             "evidence": evidence,
             "commit_sha": git_ctx.head_sha,
             "worktree_dirty": bool(git_ctx.dirty_files),
@@ -692,14 +697,13 @@ async def reindex(
 
 
 async def _run_index(indexer: Indexer, *, force: bool) -> Any:
-    """Run :meth:`Indexer.index` synchronously.
+    """Run :meth:`Indexer.index_async` from within an async context.
 
-    Wave 2 note: indexing is synchronous and may briefly block the event loop.
-    Wave 6 (scry watch) will move this to a dedicated worker thread with a
-    connection that is created in that thread (to satisfy SQLite's
-    check_same_thread constraint).
+    Wave 3 note: uses the async variant so the LSP enrichment coroutine is
+    awaited directly instead of being dispatched via asyncio.run() (which
+    raises RuntimeError when an event loop is already running).
     """
-    return indexer.index(force=force)
+    return await indexer.index_async(force=force)
 
 
 # ─── Dispatch table ───────────────────────────────────────────────────────────
