@@ -83,6 +83,12 @@ def _run_git(
         text=True,
         check=False,
         timeout=timeout,
+        # UT3-1 BLOCKING fix: git inherits the parent's stdin handle by
+        # default on Windows (CreateProcess bInheritHandles=True).  When
+        # scry runs as an MCP stdio server, sys.stdin is the pipe to the
+        # MCP client — git inherits it and never exits, freezing the
+        # event loop and breaking ALL write tools.  Always close stdin.
+        stdin=subprocess.DEVNULL,
     )
 
 
@@ -95,6 +101,7 @@ def _run_git_bytes(
         capture_output=True,
         check=False,
         timeout=timeout,
+        stdin=subprocess.DEVNULL,  # UT3-1 — see _run_git for rationale.
     )
 
 

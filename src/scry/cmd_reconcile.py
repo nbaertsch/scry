@@ -22,7 +22,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 
@@ -579,6 +579,20 @@ def _display_results(results: list[ReconcileResult], *, json_output: bool) -> No
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
 
+def _emit_error(message: str, *, json_output: bool, exit_code: int) -> NoReturn:
+    """Print an error in JSON or plain-text form, then SystemExit.
+
+    UT2-2 fix: when ``--json`` is set, error responses must be parseable
+    JSON so machine-readable pipelines can route on them.  Plain-text
+    error messages on stderr break ``scry reconcile <id> --json | jq``.
+    """
+    if json_output:
+        click.echo(json.dumps({"error": message, "exit_code": exit_code}), err=True)
+    else:
+        click.echo(f"error: {message}", err=True)
+    raise SystemExit(exit_code) from None
+
+
 def run_reconcile_cmd(
     *,
     repo_root: Path,
@@ -590,13 +604,19 @@ def run_reconcile_cmd(
 ) -> None:
     """Synchronous entry point for ``scry reconcile``.
 
-    Called from :func:`scry.cli.reconcile`.  All error paths raise
-    ``SystemExit(2)`` per §9 CLI conventions (operational errors → exit 2,
-    drift detected → exit 0 for reconcile since we want to return the patch).
+    Called from :func:`scry.cli.reconcile`.  All error paths use
+    :func:`_emit_error` so ``--json`` callers always get parseable JSON
+    on both success and failure (UT2-2 fix).
+
+    Exit codes (UT2-4 refinement):
+
+    * **0** — success / no drift.
+    * **1** — LLM unavailable / unconfigured (configuration issue).
+    * **2** — operational failure (missing DB, malformed input, git error,
+      patch validation rejection, IO error).
     """
     if not all_links and link_id is None:
-        click.echo("error: provide a LINK_ID or --all.", err=True)
-        raise SystemExit(2) from None
+        _emit_error("provide a LINK_ID or --all.", json_output=json_output, exit_code=2)
 
     # Load config; fall back to defaults when config.yaml is absent.
     try:
@@ -605,16 +625,20 @@ def run_reconcile_cmd(
         config = Config()
 
     # Build the LLM provider from config.
+    # UT2-4: LLM unavailability is a configuration problem (exit 1), not
+    # an infrastructure failure (exit 2).
     try:
         provider = make_provider(config.llm)
     except LLMError as exc:
-        click.echo(f"error: LLM provider unavailable: {exc}", err=True)
-        raise SystemExit(2) from None
+        _emit_error(f"LLM provider unavailable: {exc}", json_output=json_output, exit_code=1)
 
     db_path = repo_root / ".scry" / "vectors.db"
     if not db_path.exists():
-        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
-        raise SystemExit(2) from None
+        _emit_error(
+            "vectors.db not found. Run `scry index` first.",
+            json_output=json_output,
+            exit_code=2,
+        )
 
     # ── BLOCKING #2: build an overlay-aware LinkStore ─────────────────────────
     # Mirror the _BranchLinkStore pattern used by ``scry check`` and
@@ -628,8 +652,7 @@ def run_reconcile_cmd(
         )
         _current_overlay = _overlay_mgr.current_overlay_path()
     except GitContextError as exc:
-        click.echo(f"error: git context unavailable: {exc}", err=True)
-        raise SystemExit(2) from None
+        _emit_error(f"git context unavailable: {exc}", json_output=json_output, exit_code=2)
 
     _ov_path = _current_overlay
 
@@ -677,8 +700,11 @@ def run_reconcile_cmd(
                 replay = link_store.replay()
                 link = replay.active_links.get(link_id)
                 if link is None:
-                    click.echo(f"error: link not found: {link_id!r}", err=True)
-                    raise SystemExit(2) from None
+                    _emit_error(
+                        f"link not found: {link_id!r}",
+                        json_output=json_output,
+                        exit_code=2,
+                    )
 
                 ev = evaluate_link_drift(
                     link,
@@ -692,22 +718,22 @@ def run_reconcile_cmd(
                     return
 
                 if ev.drift_status not in _ACTIONABLE_STATUSES:
-                    click.echo(
+                    _emit_error(
                         f"Link {link_id} has status {ev.drift_status!r} which is not "
                         "actionable by the AI reconciler "
                         "(expected code-changed, spec-changed, or both-changed).",
-                        err=True,
+                        json_output=json_output,
+                        exit_code=2,
                     )
-                    raise SystemExit(2) from None
 
                 from_anchor = db.get_anchor(link.from_id)
                 to_anchor = db.get_anchor(link.to_id)
                 if from_anchor is None or to_anchor is None:
-                    click.echo(
-                        f"error: one or both anchors missing for link {link_id!r}",
-                        err=True,
+                    _emit_error(
+                        f"one or both anchors missing for link {link_id!r}",
+                        json_output=json_output,
+                        exit_code=2,
                     )
-                    raise SystemExit(2) from None
 
                 result = asyncio.run(
                     propose_patch(
@@ -820,11 +846,8 @@ def run_reconcile_cmd(
                     raise SystemExit(1) from None
 
     except ReconcileError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(2) from None
+        _emit_error(str(exc), json_output=json_output, exit_code=2)
     except LLMError as exc:
-        click.echo(f"error: LLM error: {exc}", err=True)
-        raise SystemExit(2) from None
+        _emit_error(f"LLM error: {exc}", json_output=json_output, exit_code=1)
     except (LockTimeout, OSError) as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(2) from None
+        _emit_error(str(exc), json_output=json_output, exit_code=2)

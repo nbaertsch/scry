@@ -9,9 +9,10 @@ Cold-start sequence (``MCPServer.start()``)
 1. Load ``.scry/config.yaml``; raise :class:`~scry.index.IndexerError` if absent.
 2. Try to acquire :class:`~scry.process.leader.LeaderLock`.
 3. **Leader path:**
-   a. Bind the IPC endpoint (:class:`~scry.process.ipc.IPCServer`); on Windows
-      ``IPCServer.start()`` raises ``NotImplementedError`` — the leader
-      continues in single-process mode (no IPC server, no metadata write).
+   a. Bind the IPC endpoint (:class:`~scry.process.ipc.IPCServer`).  Both
+      Unix domain sockets and Windows named pipes are now supported (W6b);
+      the leader fails fast on bind errors instead of silently falling
+      back to single-process mode.
    b. Once IPC is ready, write lock metadata
       (:meth:`~scry.process.leader.LeaderLock.write_metadata`).
    c. Open :class:`~scry.store.db.ScryDB` read-write.
@@ -123,7 +124,7 @@ class MCPServer:
     # ─── Tool registration ────────────────────────────────────────────────────
 
     def _register_tools(self) -> None:
-        """Register all 10 MCP tools with the FastMCP instance.
+        """Register all 12 MCP tools with the FastMCP instance.
 
         Each tool is a thin async closure that resolves the current
         :class:`~scry.mcp.handlers.MCPContext` and delegates to
@@ -153,10 +154,15 @@ class MCPServer:
             anchor_id: str,
             link_types: list[str] | None = None,
             direction: str = "outgoing",
-        ) -> list[dict[str, Any]]:
-            """Return active links for an anchor from the baseline ⊕ overlay table."""
+        ) -> dict[str, Any]:
+            """Return active links for an anchor from the baseline ⊕ overlay table.
+
+            Returns a dict ``{"links": [...], "index_state": "..."}`` per
+            §7.3 (UT3-2 fix: was ``-> list`` which never matched the
+            handler's actual return shape).
+            """
             return cast(
-                list[dict[str, Any]],
+                dict[str, Any],
                 await self._dispatch(
                     "get_links",
                     {"anchor_id": anchor_id, "link_types": link_types, "direction": direction},
@@ -167,10 +173,14 @@ class MCPServer:
         async def find_drift(
             scope: str | None = None,
             status_filter: list[str] | None = None,
-        ) -> list[dict[str, Any]]:
-            """Evaluate section-level drift for active links (Wave 2: section-only)."""
+        ) -> dict[str, Any]:
+            """Evaluate section-level drift for active links (Wave 2: section-only).
+
+            Returns a dict ``{"entries": [...], "index_state": "..."}`` per
+            §7.3 (UT3-3 fix: was ``-> list``).
+            """
             return cast(
-                list[dict[str, Any]],
+                dict[str, Any],
                 await self._dispatch(
                     "find_drift", {"scope": scope, "status_filter": status_filter}
                 ),

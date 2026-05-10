@@ -19,6 +19,7 @@ Deferred commands (stubs)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -35,12 +36,10 @@ import click
 # this is a no-op (stdout is already UTF-8) — only legacy cmd.exe / older
 # PowerShell hosts need it.
 if sys.platform == "win32":
-    import contextlib as _contextlib
-
     for _stream in (sys.stdout, sys.stderr):
         _reconfigure = getattr(_stream, "reconfigure", None)
         if _reconfigure is not None:
-            with _contextlib.suppress(OSError, ValueError):  # pragma: no cover
+            with contextlib.suppress(OSError, ValueError):  # pragma: no cover
                 _reconfigure(encoding="utf-8", errors="replace")
 
 import scry
@@ -1633,6 +1632,15 @@ def mcp(ctx: click.Context) -> None:
     except (ConfigError, IndexerError, MCPServerError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(1) from None
+    finally:
+        # UT4-1 BLOCKING fix: cleanly tear down the IPC server, release
+        # the leader lock, and (best-effort) unlink the lock file so
+        # followers don't read stale PID/endpoint metadata after a
+        # clean shutdown.  Wrapped in try/except so a partial-init
+        # failure (e.g. config error before server.start()) doesn't
+        # mask the original error from the user.
+        with contextlib.suppress(Exception):
+            asyncio.run(server.stop())
 
 
 if __name__ == "__main__":  # pragma: no cover

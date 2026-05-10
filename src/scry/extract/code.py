@@ -335,12 +335,55 @@ def _ts_class_methods(
 _TsGroup = dict[str, list[Any]]  # name -> [node, …]
 
 
+def _ts_unwrap(node: Any) -> Any:
+    """Unwrap an ``export_statement`` (and any nested ``export_statement``)
+    to expose the underlying declaration.
+
+    UT5-1 BLOCKING fix: top-level TypeScript symbols are almost always
+    written as ``export class Foo {}`` / ``export function bar() {}``.
+    The tree-sitter parse for that is::
+
+        export_statement
+          decorator? class_declaration | function_declaration | …
+
+    Pre-fix the walker iterated ``root.children`` and only matched
+    direct types (``class_declaration``, ``function_declaration``), so
+    every exported symbol was silently dropped — a polyglot scry repo
+    with TS frontend + Python backend produced ZERO TS anchors.
+
+    Also handles ``export default <decl>`` and tolerates wrappers
+    appearing more than once defensively.
+    """
+    seen = 0
+    cur = node
+    while cur is not None and getattr(cur, "type", None) == "export_statement" and seen < 4:
+        seen += 1
+        # The wrapped declaration is the last named child (skipping
+        # ``export``, ``default`` keywords and decorator nodes).
+        unwrapped: Any = None
+        for child in cur.children:
+            if getattr(child, "is_named", False) and child.type not in (
+                "decorator",
+                "export",
+                "default",
+            ):
+                unwrapped = child
+        if unwrapped is None:
+            return node
+        cur = unwrapped
+    return cur
+
+
 def _walk_typescript(
     nodes: list[Any],
     src: bytes,
     kinds: set[str],
 ) -> list[_PyRec]:
     """Return (symbol_path, raw_content) pairs from TypeScript source nodes.
+
+    Top-level ``export_statement`` wrappers are unwrapped via
+    :func:`_ts_unwrap` so that ``export class Foo {}`` is extracted as
+    ``Foo`` (UT5-1 BLOCKING fix).
 
     Overload handling (§15.3):
     * ``function_signature`` nodes at the top level are TypeScript overload
@@ -360,7 +403,8 @@ def _walk_typescript(
     decl_nodes: list[tuple[str, Any]] = []  # (raw_name, node)
     sig_entries: list[tuple[str, Any]] = []  # (raw_name, node) for function_signature
 
-    for node in nodes:
+    for raw_node in nodes:
+        node = _ts_unwrap(raw_node)
         if node.type == "function_signature":
             name = _ts_symbol_name(node, src)
             if name is not None:

@@ -229,6 +229,17 @@ async def run_watch(
             the watcher loop starts (re-raised by the CLI as exit 1).
     """
     # ── 1. Determine leader / follower role ───────────────────────────────
+    # UT4-4 fix: detect_leader_state can raise FileNotFoundError when
+    # ``.scry/`` doesn't exist (user hasn't run ``scry init``).  Surface
+    # that as a friendly error with exit 2 instead of a raw traceback.
+    if not (repo / ".scry").exists():
+        print(
+            "error: scry has not been initialised in this repo. "
+            "Run 'scry init' first to create .scry/ and config.yaml.",
+            file=sys.stderr,
+        )
+        return 2
+
     state, metadata = detect_leader_state(repo)
 
     # W6c BLOCKING #1: refuse to run without a running leader.
@@ -236,10 +247,15 @@ async def run_watch(
     # leader process starts later.  "Refuse" is chosen over acquiring the lock
     # ourselves (see module docstring for rationale).
     if state == LeaderState.LEADER:
+        # UT1-3 fix: previous error claimed ``scry index`` would start a
+        # one-shot leader (false — index runs and exits without leaving a
+        # leader).  Corrected guidance: start ``scry mcp`` in another
+        # terminal, then re-run ``scry watch``.
         print(
             "error: scry watch requires a running leader. "
-            "Start one first with 'scry mcp' (in another terminal) "
-            "or 'scry index' will start a one-shot leader for you.",
+            "Start one with 'scry mcp' in another terminal "
+            "(or wire scry's MCP into your editor), then re-run "
+            "'scry watch'.",
             file=sys.stderr,
         )
         return 2
