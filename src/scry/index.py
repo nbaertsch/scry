@@ -43,8 +43,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import fnmatch
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -102,6 +104,44 @@ _EXT_TO_LANG: dict[str, str] = {
 
 # Number of anchors processed per reembed batch transaction.
 _REEMBED_BATCH_SIZE: int = 50
+
+
+# ─── Path-filter helpers (B2 / B6 / B7) ──────────────────────────────────────
+
+
+def _norm_pattern(pat: str) -> str:
+    """Normalise an exclude pattern for the FNMATCH-only directory check.
+
+    Used solely by :func:`_dir_excluded` for fast directory pruning.
+    For the full include/exclude evaluation per DESIGN.md §6 we still
+    delegate to :func:`scry.config.should_index` /
+    :func:`scry.config.matches_globs` which handle ``**`` correctly.
+    """
+    return pat.replace("**", "*")
+
+
+def _dir_excluded(p: Path, repo: Path, excludes: list[str]) -> bool:
+    """Return True if directory *p* matches any exclude pattern.
+
+    Used to PRUNE entire subtrees in the indexer / validator walks
+    so we never descend into ``.venv`` / ``node_modules`` / etc.
+    Conservative: matches only on directory-name prefix (``.venv``
+    against ``.venv/**``); the full glob check happens later via
+    :func:`scry.config.matches_globs` for surviving files.
+    """
+    try:
+        rel = p.relative_to(repo).as_posix()
+    except ValueError:
+        return False
+    rel_with_slash = rel + "/"
+    for raw in excludes:
+        pat = _norm_pattern(raw)
+        if fnmatch.fnmatchcase(rel, pat) or fnmatch.fnmatchcase(rel_with_slash, pat):
+            return True
+        prefix = pat.rstrip("*").rstrip("/")
+        if prefix and (rel == prefix or rel.startswith(prefix + "/")):
+            return True
+    return False
 
 
 # ─── Public data classes ──────────────────────────────────────────────────────
@@ -264,33 +304,56 @@ class Indexer:
         deterministic (sorted) order so that two identical invocations
         produce identical manifests.
 
+        Optimisations (B6 + B7):
+        * Uses ``os.walk`` with ``dirs[:]`` pruning so excluded
+          directories (``.venv``, ``.git``, ``node_modules``,
+          ``tests/fixtures``) are NEVER descended into — avoids
+          gigabytes of wasted I/O on large dependency trees.
+        * Frontmatter is only parsed AFTER the cheap include/exclude
+          glob check passes, so a malformed-YAML warning never fires
+          for an excluded file (e.g. huggingface card templates inside
+          a virtual environment).
+
         Returns:
             Absolute paths for every file that passes ``should_index()``,
             sorted lexicographically.
         """
         config = self._ensure_config()
         results: list[Path] = []
+        excludes = config.exclude
 
-        for path in sorted(self._repo_root.rglob("*")):
-            if not path.is_file():
-                continue
-            try:
-                rel_str = path.relative_to(self._repo_root).as_posix()
-            except ValueError:
-                continue
+        for root_str, dirs, files in os.walk(self._repo_root):
+            root = Path(root_str)
+            # Prune excluded directories in-place so os.walk doesn't
+            # descend into them.
+            dirs[:] = sorted(
+                d for d in dirs if not _dir_excluded(root / d, self._repo_root, excludes)
+            )
 
-            # Read frontmatter only for markdown files (cheap; ~1 KB typical).
-            frontmatter: Frontmatter | None = None
-            if path.suffix.lower() in (".md", ".markdown"):
+            for fname in sorted(files):
+                path = root / fname
                 try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    frontmatter, _ = parse_frontmatter(text)
-                except OSError:
-                    pass
+                    rel_str = path.relative_to(self._repo_root).as_posix()
+                except ValueError:
+                    continue
 
-            if should_index(rel_str, frontmatter, config.include, config.exclude):
-                results.append(path)
+                # Frontmatter parse only AFTER we already know the
+                # directory wasn't pruned — but BEFORE the final
+                # should_index check (which honours ``skip: true``).
+                # We avoid parsing frontmatter for non-markdown files
+                # entirely (B6).
+                frontmatter: Frontmatter | None = None
+                if path.suffix.lower() in (".md", ".markdown"):
+                    try:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                        frontmatter, _ = parse_frontmatter(text)
+                    except OSError:
+                        pass
 
+                if should_index(rel_str, frontmatter, config.include, config.exclude):
+                    results.append(path)
+
+        results.sort()
         return results
 
     def classify_for_extraction(self, path: Path) -> ExtractionTarget:

@@ -50,6 +50,7 @@ from typing import Any, cast
 
 from fastmcp import FastMCP
 
+import scry
 from scry.config import load_config
 from scry.embed import make_embedder
 from scry.git_context import GitContextProvider
@@ -115,7 +116,7 @@ class MCPServer:
         self._ctx: MCPContext | None = None
         self._leader_lock: LeaderLock | None = None
         self._ipc_server: IPCServer | None = None
-        self._mcp: FastMCP = FastMCP("scry")
+        self._mcp: FastMCP = FastMCP(name="scry", version=scry.__version__)
         self._started = False
         self._register_tools()
 

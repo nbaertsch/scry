@@ -502,6 +502,23 @@ def test_fingerprint_simhash_empty_string() -> None:
     assert isinstance(result, int)
 
 
+def test_fingerprint_simhash_does_not_overflow_on_repeated_tokens() -> None:
+    """Regression (B5 — dogfood bug): the upstream simhash library multiplies
+    a numpy uint8 bitarray by an int weight, which raises ``OverflowError``
+    on numpy 2.x for any weight > 255.  ``fingerprint_simhash`` must catch
+    that case and fall back to a deterministic SHA-256-derived fingerprint
+    so the indexer never aborts on long documents.
+    """
+    # Construct a string with a single token repeated thousands of times —
+    # this is what triggers the overflow in real-world markdown corpora.
+    text = ("scry " * 5000).strip()
+    result = fingerprint_simhash(text)
+    assert isinstance(result, int)
+    # Determinism: identical input -> identical output (true for both the
+    # SimHash fast path and the SHA-256 fallback).
+    assert fingerprint_simhash(text) == result
+
+
 # ──────────────────────────────────────────────────────────────────────
 # parse_html_comment_id (§3.2 escape hatch)
 # ──────────────────────────────────────────────────────────────────────

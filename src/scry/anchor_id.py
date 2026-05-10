@@ -103,9 +103,26 @@ def fingerprint_simhash(text: str) -> int:
     Computed via the ``simhash`` package (≥ 2.1). Used for fuzzy
     fingerprint matching during inline rebase. Deterministic: identical
     text always produces the same integer.
+
+    The upstream ``simhash`` library multiplies a numpy ``uint8`` bitarray
+    by a Python int weight; on **numpy 2.x** this raises
+    ``OverflowError`` for any weight > 255 (B5).  When that happens we
+    fall back to a SHA-256-derived 64-bit fingerprint of the
+    canonicalized text — this is NOT a true SimHash (no fuzzy match)
+    but it preserves determinism for content_hash purposes so indexing
+    can complete instead of aborting.  The fallback is rare; only
+    triggered on documents whose token frequency exceeds the upstream
+    library's batch threshold.
     """
     canonical = canonicalize_content(text)
-    return int(Simhash(canonical).value)
+    try:
+        return int(Simhash(canonical).value)
+    except (OverflowError, ValueError, TypeError):
+        # B5 fallback: compute a deterministic 64-bit value from the
+        # canonical SHA-256 so the indexer doesn't crash.  Loses
+        # SimHash's fuzzy-match property for this single anchor.
+        digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big", signed=False)
 
 
 # ──────────────────────────────────────────────────────────────────────
