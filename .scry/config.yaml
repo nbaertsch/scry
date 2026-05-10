@@ -1,0 +1,47 @@
+# Dogfooding scry on its own repo.
+
+include:
+  - "**/*.py"
+  - "**/*.md"
+
+exclude:
+  - .scry/**
+  - .git/**
+  - .venv/**
+  - venv/**
+  - node_modules/**
+  - dist/**
+  - build/**
+  - target/**
+  - __pycache__/**
+  - .pytest_cache/**
+  - .mypy_cache/**
+  - .ruff_cache/**
+  - tests/fixtures/**
+
+classify:
+  - { glob: "DESIGN.md", type: spec }
+  - { glob: "AGENTS.md", type: spec }
+  - { glob: "**/*.md", type: doc }
+
+embeddings:
+  provider: local
+  model: BAAI/bge-small-en-v1.5
+  dimensions: 384
+
+code_anchors:
+  languages:
+    python: lsp
+    typescript: skip
+    go: skip
+    rust: skip
+    zig: skip
+  transitive_resolution: call_only
+  transitive_max_depth: 32
+
+drift:
+  semantic_drift_threshold: 0.25
+
+llm:
+  provider: ollama
+  model: llama3.2

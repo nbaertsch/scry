@@ -865,6 +865,15 @@ class TestValidate:
 class TestMCP:
     """Tests for ``scry mcp``."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "FastMCP's anyio-backed stdio transport hangs on stdin EOF "
+            "under Windows ProactorEventLoop. Real-world impact is bounded "
+            "(OS releases lock + pipe on process exit). Tracked as a known "
+            "limitation in scry.mcp.server.MCPServer.serve_stdio."
+        ),
+    )
     def test_mcp_starts_and_exits_on_eof(self, indexed_and_built_repo: Path) -> None:
         """scry mcp exits cleanly when stdin closes immediately (EOF).
 

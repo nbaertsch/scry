@@ -44,11 +44,8 @@ Wave 2 deferrals
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-import sys
-import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -625,75 +622,16 @@ class MCPServer:
         Blocks until stdin closes (i.e. the MCP client disconnects).
         Calls :meth:`start` first if not yet started.
 
-        UT4-3: on Windows the FastMCP stdio transport does not
-        consistently propagate stdin EOF, leaving the process hung
-        after a clean disconnect.  We launch a dedicated **stdin
-        watchdog** thread that reads ``sys.stdin`` raw; when read()
-        returns 0 bytes (EOF), the thread schedules an asyncio task
-        cancellation on the main event loop so ``run_stdio_async``
-        unblocks and returns.  This is a defensive belt-and-braces
-        addition — if FastMCP's own EOF handling works (Linux/macOS),
-        the watchdog is a no-op.
+        Known limitation (UT4-3, Windows-only): FastMCP's anyio-backed
+        stdio transport does not reliably surface ``stdin`` EOF on
+        Windows ``ProactorEventLoop`` — the process can hang for up
+        to several seconds after the client disconnects.  POSIX
+        platforms detect EOF natively.  Workarounds attempted (a
+        secondary watchdog thread reading ``sys.stdin``) failed
+        because the watchdog races FastMCP for the underlying handle.
+        Real-world impact is bounded: the lock and IPC pipe are
+        released by the OS on process exit.
         """
         if not self._started:
             await self.start()
-
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def _stdin_eof_watcher() -> None:
-            try:
-                # Read raw bytes from stdin; .read() blocks until data
-                # OR EOF.  Empty result == EOF.  Use a small read to
-                # avoid buffering whole MCP messages here.
-                buf = sys.stdin.buffer
-                while True:
-                    chunk = buf.read(4096)
-                    if not chunk:
-                        # EOF — signal the main loop to stop.
-                        loop.call_soon_threadsafe(stop_event.set)
-                        return
-            except Exception:
-                # Any error reading stdin (closed, redirected) → also EOF.
-                with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(stop_event.set)
-                return
-
-        # NOTE: this thread READS stdin out from under FastMCP.  That's
-        # fine for the EOF-detection use case ON WINDOWS where the
-        # alternative is a hung process.  On POSIX FastMCP normally
-        # owns stdin and we never reach the read() call because the
-        # MCP messages exit serve_stdio first.  To avoid stealing
-        # bytes from a healthy MCP session, we ONLY enable the
-        # watchdog on Windows.
-        watcher: threading.Thread | None = None
-        if sys.platform == "win32":
-            watcher = threading.Thread(
-                target=_stdin_eof_watcher,
-                name="scry-mcp-stdin-eof-watcher",
-                daemon=True,
-            )
-            watcher.start()
-
-        try:
-            mcp_task = asyncio.create_task(self._mcp.run_stdio_async(show_banner=False))
-            stop_task = asyncio.create_task(stop_event.wait())
-            done, pending = await asyncio.wait(
-                {mcp_task, stop_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # If the stop_event fired (Windows EOF watchdog), cancel
-            # the FastMCP task so the function returns.
-            for t in pending:
-                t.cancel()
-                with contextlib.suppress(BaseException):
-                    await t
-            # Surface any exception from the completed task(s).
-            for t in done:
-                if not t.cancelled():
-                    exc = t.exception()
-                    if exc is not None:
-                        raise exc
-        finally:
-            # Best-effort: thread is daemon, dies when process exits.
-            del watcher
+        await self._mcp.run_stdio_async(show_banner=False)
