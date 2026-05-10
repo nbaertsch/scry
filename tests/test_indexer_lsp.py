@@ -1274,10 +1274,16 @@ class TestHIGH1ClosureHashDrift:
         return db
 
     def test_closure_hash_change_triggers_code_changed(self, tmp_path: Path) -> None:
-        """When closure_hash changes but content_hash is same, drift is code-changed."""
+        """When closure_hash changes but content_hash is same, drift is code-changed.
+
+        Anchor must use ``status="complete"`` because closure comparison is
+        only valid for closure-comparable statuses per §5.3 (review-w4a HIGH).
+        """
         from scry.drift import evaluate_link_drift
 
-        from_anchor = _make_code_anchor("src/a.py", "func_a", closure_hash="new-hash")
+        from_anchor = _make_code_anchor(
+            "src/a.py", "func_a", status="complete", closure_hash="new-hash"
+        )
         to_anchor = _make_section_anchor("docs/spec.md")
 
         db = self._make_db(tmp_path, from_anchor, to_anchor)

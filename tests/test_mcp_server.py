@@ -271,6 +271,7 @@ async def test_get_anchor_roundtrip(git_repo: Path) -> None:
     assert result["id"] == _SPEC_ID
     assert result["type"] == AnchorType.SECTION
     assert "content_text" in result
+    assert "index_state" in result
 
 
 async def test_get_anchor_missing_returns_none(git_repo: Path) -> None:
@@ -284,17 +285,19 @@ async def test_get_anchor_missing_returns_none(git_repo: Path) -> None:
 
 
 async def test_get_links_empty_when_no_links(git_repo: Path) -> None:
-    """get_links() returns [] when no links have been staged."""
+    """get_links() returns empty links list when no links have been staged."""
     ctx = _make_ctx(git_repo)
     result = await get_links(ctx, _SPEC_ID)
-    assert result == []
+    assert result["links"] == []
+    assert "index_state" in result
 
 
 async def test_get_links_outgoing_after_propose(git_repo: Path) -> None:
     """get_links() surfaces the link staged by propose_link()."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    links = await get_links(ctx, _SPEC_ID, direction="outgoing")
+    result = await get_links(ctx, _SPEC_ID, direction="outgoing")
+    links = result["links"]
     assert len(links) == 1
     lnk = links[0]
     assert lnk["from_id"] == _SPEC_ID
@@ -308,7 +311,8 @@ async def test_get_links_incoming_direction(git_repo: Path) -> None:
     """get_links() with direction='incoming' returns the link on the target side."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    links = await get_links(ctx, _CODE_ID, direction="incoming")
+    result = await get_links(ctx, _CODE_ID, direction="incoming")
+    links = result["links"]
     assert len(links) == 1
     assert links[0]["direction"] == "incoming"
 
@@ -324,28 +328,30 @@ async def test_get_links_type_filter(git_repo: Path) -> None:
     """get_links() with link_types filters correctly."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    links_all = await get_links(ctx, _SPEC_ID, direction="both")
-    assert len(links_all) == 1
+    result_all = await get_links(ctx, _SPEC_ID, direction="both")
+    assert len(result_all["links"]) == 1
     # Filter for a different type — should return nothing.
-    links_tests = await get_links(ctx, _SPEC_ID, link_types=["tests"], direction="both")
-    assert links_tests == []
+    result_tests = await get_links(ctx, _SPEC_ID, link_types=["tests"], direction="both")
+    assert result_tests["links"] == []
 
 
 # ─── Tests: find_drift ────────────────────────────────────────────────────────
 
 
 async def test_find_drift_empty_when_no_links(git_repo: Path) -> None:
-    """find_drift() returns [] when no links are staged."""
+    """find_drift() returns empty entries list when no links are staged."""
     ctx = _make_ctx(git_repo)
     result = await find_drift(ctx)
-    assert result == []
+    assert result["entries"] == []
+    assert "index_state" in result
 
 
 async def test_find_drift_has_section_level_entries(git_repo: Path) -> None:
     """find_drift() returns drift entries with drift_coverage='section-only'."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    entries = await find_drift(ctx)
+    result = await find_drift(ctx)
+    entries = result["entries"]
     assert len(entries) == 1
     entry = entries[0]
     assert entry["drift_coverage"] == "section-only"
@@ -360,26 +366,27 @@ async def test_find_drift_scope_filter(git_repo: Path) -> None:
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
     # Matching prefix.
-    entries = await find_drift(ctx, scope="docs/")
-    assert len(entries) == 1
+    result = await find_drift(ctx, scope="docs/")
+    assert len(result["entries"]) == 1
     # Non-matching prefix.
-    no_entries = await find_drift(ctx, scope="nonexistent/")
-    assert no_entries == []
+    result_none = await find_drift(ctx, scope="nonexistent/")
+    assert result_none["entries"] == []
 
 
 async def test_find_drift_status_filter(git_repo: Path) -> None:
     """find_drift() status_filter restricts by drift status."""
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
-    entries_all = await find_drift(ctx)
+    result_all = await find_drift(ctx)
+    entries_all = result_all["entries"]
     assert len(entries_all) == 1
     first_status = entries_all[0]["drift_status"]
     # Filtering for this status should return the entry.
-    entries_filtered = await find_drift(ctx, status_filter=[first_status])
-    assert len(entries_filtered) == 1
+    result_filtered = await find_drift(ctx, status_filter=[first_status])
+    assert len(result_filtered["entries"]) == 1
     # Filtering for a bogus status should return nothing.
-    entries_none = await find_drift(ctx, status_filter=["bogus-status"])
-    assert entries_none == []
+    result_none = await find_drift(ctx, status_filter=["bogus-status"])
+    assert result_none["entries"] == []
 
 
 # ─── Tests: propose_link ─────────────────────────────────────────────────────
@@ -472,7 +479,7 @@ async def test_commit_links_link_visible_in_replay(git_repo: Path) -> None:
     lid = proposed["link_id"]
     await commit_links(ctx)
     links = await get_links(ctx, _SPEC_ID)
-    link_ids = [lnk["link_id"] for lnk in links]
+    link_ids = [lnk["link_id"] for lnk in links["links"]]
     assert lid in link_ids
 
 

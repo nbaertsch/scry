@@ -39,6 +39,7 @@ from scry.mcp.handlers import MCPServerError
 from scry.mcp.server import MCPServer
 from scry.models import (
     AnchorType,
+    IndexState,
     LinkOp,
     LinkRecord,
     LinkType,
@@ -46,6 +47,7 @@ from scry.models import (
     new_link_id,
 )
 from scry.process.leader import LeaderState, detect_leader_state
+from scry.reconcile import check_staleness
 from scry.retrieve import build_anchor_packet, hybrid_search
 from scry.store.db import LockTimeout, ScryDB
 from scry.store.links import LinkStore, LinkValidationError, MergeConflictError
@@ -431,7 +433,7 @@ def check(
             _ov_path = overlay_path
             branch_store = _BranchLinkStore(repo)
 
-            evaluations = evaluate_all_drift(db=db, link_store=branch_store)
+            evaluations = evaluate_all_drift(db=db, link_store=branch_store, config=config.drift)
 
             # Count code anchors for coverage.
             code_anchors = db.list_anchors(anchor_type=AnchorType.CODE)
@@ -557,12 +559,31 @@ def status(ctx: click.Context) -> None:
             with ScryDB(repo, read_only=True) as db:
                 meta = db.read_index_metadata()
                 if meta:
+                    try:
+                        config = load_config(repo)
+                    except Exception:
+                        from scry.models import Config
+
+                        config = Config()
+                    is_stale = check_staleness(git_ctx, meta, config)
                     click.echo("\nIndex:")
                     click.echo(f"  indexed_branch: {meta.indexed_branch}")
                     click.echo(f"  indexed_head:   {meta.indexed_git_head[:12]}")
                     click.echo(
                         f"  model:          {meta.embedding_provider}/{meta.embedding_model}"
                     )
+                    # MEDIUM #2: print full enum-like state, not just stale/fresh.
+                    if not is_stale:
+                        state_label = IndexState.FRESH.value
+                    else:
+                        # Best-effort derivation without an in-memory tracker.
+                        # If no leader is running, no one can reconcile.
+                        leader_st, _ = detect_leader_state(repo)
+                        if leader_st == LeaderState.FOLLOWER:
+                            state_label = "stale"
+                        else:
+                            state_label = IndexState.STALE_NO_WRITE_LOCK.value
+                    click.echo(f"  index_state:    {state_label}")
                 else:
                     click.echo("\nIndex: not yet built")
         except Exception as exc:
@@ -855,6 +876,29 @@ def doctor(ctx: click.Context) -> None:
                         f"vectors.db:    OK — model={meta.embedding_provider}/{meta.embedding_model}"
                         f" dims={meta.embedding_dimensions}"
                     )
+                    # Show index staleness when git context is available.
+                    try:
+                        git_ctx_prov = GitContextProvider(repo)
+                        git_ctx_local = git_ctx_prov.get()
+                        try:
+                            config = load_config(repo)
+                        except Exception:
+                            from scry.models import Config as _Config
+
+                            config = _Config()
+                        is_stale = check_staleness(git_ctx_local, meta, config)
+                        # MEDIUM #2: print full enum-like state, not just stale/fresh.
+                        if not is_stale:
+                            state_label = IndexState.FRESH.value
+                        else:
+                            leader_st, _ = detect_leader_state(repo)
+                            if leader_st == LeaderState.FOLLOWER:
+                                state_label = "stale"
+                            else:
+                                state_label = IndexState.STALE_NO_WRITE_LOCK.value
+                        click.echo(f"index_state:   {state_label}")
+                    except Exception:
+                        pass
                 else:
                     click.echo("vectors.db:    exists but not yet indexed")
         except Exception as exc:
@@ -871,6 +915,58 @@ def doctor(ctx: click.Context) -> None:
             "LSP `command:` overrides in .scry/config.yaml will be honoured. "
             "This bypasses the §6.2 security allowlist — use only in trusted repos."
         )
+
+    # Cross-language semantic-drift gate (§5.1 v3.1, review-w4b MEDIUM).
+    # Surface mirrors links whose endpoints resolve to different programming
+    # languages — these get semantic_drift=null unless the user configures
+    # drift.cross_language_threshold explicitly.
+    try:
+        from scry.drift import _infer_language as _drift_infer_language
+        from scry.models import AnchorType as _AT
+        from scry.models import LinkType as _LT
+        from scry.store.links import LinkStore as _LinkStore
+
+        try:
+            _doc_config = load_config(repo)
+        except Exception:
+            from scry.models import Config as _Config
+
+            _doc_config = _Config()
+        _cross_lang_threshold = _doc_config.drift.cross_language_threshold
+        if db_path.exists():
+            with ScryDB(repo, read_only=True) as _doc_db:
+                _link_store = _LinkStore(repo)
+                _replay = _link_store.replay()
+                cross_lang_pairs: list[tuple[str, str, str, str]] = []
+                for _link in _replay.active_links.values():
+                    if _link.type != _LT.MIRRORS:
+                        continue
+                    if _link.from_type != _AT.CODE or _link.to_type != _AT.CODE:
+                        continue
+                    _from_a = _doc_db.get_anchor(_link.from_id)
+                    _to_a = _doc_db.get_anchor(_link.to_id)
+                    if _from_a is None or _to_a is None:
+                        continue
+                    _from_lang = _drift_infer_language(_from_a.path)
+                    _to_lang = _drift_infer_language(_to_a.path)
+                    if _from_lang and _to_lang and _from_lang != _to_lang:
+                        cross_lang_pairs.append((_link.from_id, _from_lang, _link.to_id, _to_lang))
+                if cross_lang_pairs:
+                    click.echo("\nCross-language mirrors links (§5.1 v3.1):")
+                    if _cross_lang_threshold is None:
+                        click.echo(
+                            "  semantic_drift will be null on these pairs because "
+                            "drift.cross_language_threshold is not configured."
+                        )
+                    else:
+                        click.echo(f"  Using cross_language_threshold={_cross_lang_threshold}.")
+                    for _src, _sl, _dst, _dl in cross_lang_pairs[:10]:
+                        click.echo(f"    [{_sl} → {_dl}]  {_src}  ↔  {_dst}")
+                    if len(cross_lang_pairs) > 10:
+                        click.echo(f"    ...and {len(cross_lang_pairs) - 10} more")
+    except Exception as exc:
+        # Doctor must never fail because of cross-language detection.
+        click.echo(f"  (cross-language detection skipped: {type(exc).__name__})", err=True)
 
 
 # ─── scry validate ────────────────────────────────────────────────────────────

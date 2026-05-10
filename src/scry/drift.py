@@ -10,7 +10,8 @@ Wave 2 scope and contracts:
   - ``drift-unknown`` is produced (W3d) when a CODE endpoint has
     ``transitive_hash_status == "lsp_error"`` (DESIGN.md §5.1).
   - ``drift_coverage`` is always ``"section-only"`` for Wave 2 outputs.
-  - Cross-language ``semantic_drift`` detection is deferred to Wave 6.
+  - Cross-language CODE↔CODE ``semantic_drift`` detection implemented in W4b:
+    emits ``None`` + warning when ``cross_language_threshold`` is not set.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from scry.models import (
@@ -30,6 +32,7 @@ from scry.models import (
     Link,
     LinkId,
     LinkType,
+    TransitiveHashStatus,
 )
 from scry.store.db import ScryDB
 from scry.store.links import LinkStore
@@ -38,6 +41,7 @@ __all__ = [
     "DriftDetectionError",
     "DriftEvaluation",
     "compute_drift_summary",
+    "cosine_similarity",
     "evaluate_all_drift",
     "evaluate_link_drift",
     "evaluate_semantic_drift",
@@ -106,6 +110,65 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
     return 1.0 - dot / (mag_a * mag_b)
 
 
+# ---------------------------------------------------------------------------
+# Cross-language detection helpers (§5.1 v3.1 W4b)
+# ---------------------------------------------------------------------------
+
+# File-extension → normalised language tag.  Only extensions for languages
+# commonly handled by tree-sitter + LSP adapters are listed; unlisted
+# extensions return None (treated as "language unknown" — no cross-language
+# gate is applied).
+_EXT_TO_LANGUAGE: dict[str, str] = {
+    ".py": "python",
+    ".pyi": "python",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".jsx": "javascript",
+    ".go": "go",
+    ".rs": "rust",
+    ".zig": "zig",
+    ".zon": "zig",
+    ".java": "java",
+    ".rb": "ruby",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".cs": "csharp",
+    ".php": "php",
+    ".swift": "swift",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+}
+
+
+def _infer_language(path: str) -> str | None:
+    """Return a normalised language tag for *path*'s file extension.
+
+    Returns ``None`` for markdown, plain-text, or any extension not in the
+    known map — these are treated as language-neutral and never trigger the
+    cross-language gate in :func:`evaluate_semantic_drift`.
+
+    Args:
+        path: Repo-relative file path (e.g. ``"src/lib.py"``).
+
+    Returns:
+        A lowercase language tag (e.g. ``"python"``, ``"typescript"``), or
+        ``None`` when the extension is unknown.
+    """
+    dot = path.rfind(".")
+    if dot == -1:
+        return None
+    return _EXT_TO_LANGUAGE.get(path[dot:].lower())
+
+
 def _resolve_changed(
     link: Link,
     *,
@@ -113,6 +176,8 @@ def _resolve_changed(
     current_to_hash: ContentHash,
     current_from_closure_hash: str | None = None,
     current_to_closure_hash: str | None = None,
+    from_closure_comparable: bool = True,
+    to_closure_comparable: bool = True,
 ) -> tuple[bool, bool]:
     """Return ``(from_changed, to_changed)`` honouring the prior-hash override (§3.3).
 
@@ -125,6 +190,21 @@ def _resolve_changed(
     if a callee's body changed, ``closure_hash`` differs even when the caller's
     own AST is unchanged.  Backward compat: a ``None`` baseline closure hash
     means "no closure comparison available" and never causes a false positive.
+
+    When ``from_closure_comparable`` (or ``to_closure_comparable``) is
+    ``False``, the closure-hash comparison for that endpoint is suppressed.
+    Per DESIGN.md §5.3, only the ``complete`` and ``partial`` statuses produce
+    a closure hash that is real and comparable; ``unsupported``,
+    ``lsp_unavailable``, and ``lsp_error`` all fall back to AST-only hashing
+    and emit either ``_EMPTY_SHA256`` or an unreliable partial-walk hash.
+    Comparing those values against a baseline that was captured under
+    ``complete``/``partial`` would produce a spurious ``code-changed`` purely
+    from LSP availability transitions (review-w4a HIGH fix expanding the
+    original lsp_error-only suppression).  §5.1 v3.1 mandates that the
+    *content* hash (own AST) is still compared normally; only the
+    closure-derived signal is skipped.  The caller's ``drift-unknown`` check
+    (step 8 in ``evaluate_link_drift``) then surfaces the uncertainty when
+    the trigger was specifically ``lsp_error``.
     """
     from_ref: ContentHash = link.prior_from_content_hash or link.from_content_hash
     to_ref: ContentHash = link.prior_to_content_hash or link.to_content_hash
@@ -132,15 +212,22 @@ def _resolve_changed(
     from_content_changed = current_from_hash != from_ref
     to_content_changed = current_to_hash != to_ref
 
-    # Closure hash comparison: fires only when BOTH the baseline and current
-    # closure hashes are available — missing baseline hash never triggers.
+    # Closure hash comparison fires only when:
+    #   1. Both baseline and current closure hashes are available (None
+    #      baseline never false-positives — backward compat for old links)
+    #   2. The current anchor's transitive_hash_status indicates a real
+    #      closure value (``complete`` or ``partial`` per §5.3); ``unsupported``,
+    #      ``lsp_unavailable``, and ``lsp_error`` all produce unreliable
+    #      hashes that must not be compared (review-w4a HIGH fix).
     from_closure_changed = (
-        link.from_closure_hash is not None
+        from_closure_comparable
+        and link.from_closure_hash is not None
         and current_from_closure_hash is not None
         and current_from_closure_hash != link.from_closure_hash
     )
     to_closure_changed = (
-        link.to_closure_hash is not None
+        to_closure_comparable
+        and link.to_closure_hash is not None
         and current_to_closure_hash is not None
         and current_to_closure_hash != link.to_closure_hash
     )
@@ -184,6 +271,38 @@ def _changed_to_status(
 # ---------------------------------------------------------------------------
 
 
+def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    """Compute cosine similarity between two float vectors.
+
+    Returns a value in ``[-1.0, 1.0]``:
+        - ``1.0``  — identical direction (parallel vectors)
+        - ``0.0``  — orthogonal
+        - ``-1.0`` — opposite directions
+
+    Returns ``0.0`` when either vector has zero magnitude or the vectors
+    have different lengths, so the degenerate cases never raise an exception.
+
+    This function operates on plain Python sequences; see
+    :func:`scry.embed.cosine_similarity` for the serialised-blob variant
+    used in retrieval scoring.
+
+    Args:
+        a: First vector.
+        b: Second vector.
+
+    Returns:
+        Cosine similarity in ``[-1.0, 1.0]``.
+    """
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(y * y for y in b))
+    if mag_a == 0.0 or mag_b == 0.0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
 def evaluate_semantic_drift(
     link: Link,
     *,
@@ -192,15 +311,33 @@ def evaluate_semantic_drift(
 ) -> bool | None:
     """Compute the ``semantic_drift`` flag for a ``mirrors`` link (§5.1 v3.1).
 
+    Compares the **current** embeddings of both endpoint anchors in the shared
+    vector space (DESIGN.md §3.1 — all three anchor types share one embedding
+    space, so doc-to-code ``mirrors`` links evaluate correctly without special
+    treatment).
+
+    **Cross-language CODE↔CODE pairs** (W4b): when both endpoints are ``CODE``
+    anchors whose file extensions resolve to different programming languages,
+    the 0.25 threshold is not calibrated for the cross-language embedding
+    distance distribution (§5.1 v3.1).  Scry handles this case as follows:
+
+    * If ``config.cross_language_threshold`` is ``None`` (default): return
+      ``None`` and emit a ``WARNING``-level log so ``scry doctor`` can surface
+      it.  The flag will appear as ``null`` in the anchor packet.
+    * If ``config.cross_language_threshold`` is set: use that threshold
+      instead of the default, enabling cross-language drift checking for
+      users who have calibrated their threshold.
+
+    ``SECTION`` and ``CODE_IN_DOC`` anchors are language-neutral (they carry
+    natural-language text rather than source code), so a ``SECTION``→``CODE``
+    ``mirrors`` link is never treated as cross-language.
+
     Returns:
-        ``True``  — cosine distance between endpoint embeddings exceeds
-                    ``config.semantic_drift_threshold`` (default 0.25).
+        ``True``  — cosine distance exceeds the applicable threshold.
         ``False`` — within threshold.
         ``None``  — one or both embeddings are unavailable (missing anchor or
-                    NULL in DB). Cross-language detection is deferred to Wave 6
-                    (TODO W6): the ``Anchor`` model does not expose a language
-                    field, so all pairs with available embeddings receive a
-                    scalar result regardless of language.
+                    NULL in DB), OR a cross-language CODE↔CODE pair without a
+                    configured ``cross_language_threshold``.
     """
     if config is None:
         config = DriftConfig()
@@ -210,13 +347,37 @@ def evaluate_semantic_drift(
     if from_emb is None or to_emb is None:
         return None
 
-    # TODO(W6): detect cross-language mirrors pairs and emit None + warning
-    # when endpoint anchor types resolve to different source languages.
-    # Currently the Anchor model carries no language field, so we cannot
-    # distinguish same-language from cross-language at Wave 2.
+    # Cross-language CODE↔CODE detection (§5.1 v3.1 W4b).
+    # Fetch anchors to check endpoint types; SECTION / CODE_IN_DOC are
+    # language-neutral and never trigger this gate.
+    threshold = config.semantic_drift_threshold
+    from_anchor = db.get_anchor(link.from_id)
+    to_anchor = db.get_anchor(link.to_id)
+    if (
+        from_anchor is not None
+        and to_anchor is not None
+        and from_anchor.type == AnchorType.CODE.value
+        and to_anchor.type == AnchorType.CODE.value
+    ):
+        from_lang = _infer_language(from_anchor.path)
+        to_lang = _infer_language(to_anchor.path)
+        if from_lang is not None and to_lang is not None and from_lang != to_lang:
+            if config.cross_language_threshold is None:
+                logger.warning(
+                    "semantic_drift: cross-language mirrors pair (%s [%s] ↔ %s [%s]); "
+                    "threshold is not calibrated for cross-language pairs — emitting "
+                    "semantic_drift=null. Configure drift.cross_language_threshold to "
+                    "enable cross-language semantic drift checking.",
+                    link.from_id,
+                    from_lang,
+                    link.to_id,
+                    to_lang,
+                )
+                return None
+            threshold = config.cross_language_threshold
 
     dist = _cosine_distance(from_emb, to_emb)
-    return dist > config.semantic_drift_threshold
+    return dist > threshold
 
 
 def evaluate_link_drift(
@@ -224,6 +385,7 @@ def evaluate_link_drift(
     *,
     db: ScryDB,
     merge_conflicts: set[LinkId] | None = None,
+    config: DriftConfig | None = None,
 ) -> DriftEvaluation:
     """Compute the drift status for a single link (DESIGN.md §5.1, post-v3.1).
 
@@ -244,6 +406,12 @@ def evaluate_link_drift(
 
     ``semantic_drift`` is computed for ``mirrors`` links when both endpoints
     have ``overview_embedding`` stored in the DB; ``None`` otherwise.
+
+    The optional *config* threads ``DriftConfig`` (e.g.
+    ``semantic_drift_threshold``, ``cross_language_threshold``) through to
+    ``evaluate_semantic_drift`` so user overrides actually apply
+    (review-w4b BLOCKING fix).  When omitted, defaults from
+    :class:`~scry.models.DriftConfig` are used.
     """
     if merge_conflicts is None:
         merge_conflicts = set()
@@ -277,35 +445,63 @@ def evaluate_link_drift(
     # Steps 4-7 -- hash comparison with prior-hash override (§3.3).
     from_type = AnchorType(from_anchor.type)
     to_type = AnchorType(to_anchor.type)
+
+    # Pre-compute per-endpoint flags driving §5.1 v3.1 logic:
+    #   * ``*_closure_comparable``: True only when the current
+    #     ``transitive_hash_status`` is one of {complete, partial} (§5.3 —
+    #     these are the statuses that produce a real, comparable closure
+    #     hash).  ``unsupported``, ``lsp_unavailable``, and ``lsp_error``
+    #     all emit either the empty sentinel or an unreliable partial-walk
+    #     hash, which must not be compared against a baseline captured
+    #     under a different status (review-w4a HIGH expansion).
+    #   * ``*_lsp_error``: True when the endpoint's transitive status is
+    #     specifically ``lsp_error`` — used to escalate fresh→drift-unknown
+    #     in step 8.
+    # Non-CODE anchors don't carry transitive_hash_status; they are
+    # treated as comparable (no closure to suppress) and never trigger
+    # drift-unknown.
+    _COMPARABLE_STATUSES = {
+        TransitiveHashStatus.COMPLETE,
+        TransitiveHashStatus.PARTIAL,
+    }
+    from_closure_comparable = (
+        from_type != AnchorType.CODE or from_anchor.transitive_hash_status in _COMPARABLE_STATUSES
+    )
+    to_closure_comparable = (
+        to_type != AnchorType.CODE or to_anchor.transitive_hash_status in _COMPARABLE_STATUSES
+    )
+    from_lsp_error = (
+        from_type == AnchorType.CODE
+        and from_anchor.transitive_hash_status == TransitiveHashStatus.LSP_ERROR
+    )
+    to_lsp_error = (
+        to_type == AnchorType.CODE
+        and to_anchor.transitive_hash_status == TransitiveHashStatus.LSP_ERROR
+    )
+
     from_changed, to_changed = _resolve_changed(
         link,
         current_from_hash=from_anchor.content_hash,
         current_to_hash=to_anchor.content_hash,
         current_from_closure_hash=from_anchor.closure_hash,
         current_to_closure_hash=to_anchor.closure_hash,
+        from_closure_comparable=from_closure_comparable,
+        to_closure_comparable=to_closure_comparable,
     )
     status = _changed_to_status(from_changed, to_changed, from_type, to_type)
 
     # Step 8 — drift-unknown when an LSP error prevented reliable closure
     # computation on a CODE endpoint (DESIGN.md §5.1 / §5.3).  Only applies
     # when neither endpoint has already triggered a change status (steps 5-7),
-    # because those signals are more actionable.
-    if status == DriftStatus.FRESH:
-        from_lsp_error = (
-            from_anchor.type == AnchorType.CODE.value
-            and from_anchor.transitive_hash_status == "lsp_error"
-        )
-        to_lsp_error = (
-            to_anchor.type == AnchorType.CODE.value
-            and to_anchor.transitive_hash_status == "lsp_error"
-        )
-        if from_lsp_error or to_lsp_error:
-            status = DriftStatus.DRIFT_UNKNOWN
+    # because those signals are more actionable (§5.1 precedence:
+    # code-changed > drift-unknown).
+    if status == DriftStatus.FRESH and (from_lsp_error or to_lsp_error):
+        status = DriftStatus.DRIFT_UNKNOWN
 
     # Semantic drift (independent of status ladder, mirrors links only — §5.1).
     semantic_drift: bool | None = None
     if link.type == LinkType.MIRRORS:
-        semantic_drift = evaluate_semantic_drift(link, db=db)
+        semantic_drift = evaluate_semantic_drift(link, db=db, config=config)
 
     return DriftEvaluation(link=link, drift_status=status, semantic_drift=semantic_drift)
 
@@ -314,6 +510,7 @@ def evaluate_all_drift(
     *,
     db: ScryDB,
     link_store: LinkStore,
+    config: DriftConfig | None = None,
 ) -> list[DriftEvaluation]:
     """Replay baseline ⊕ current-branch overlay, then evaluate every active link.
 
@@ -321,12 +518,15 @@ def evaluate_all_drift(
     surface merge-conflict link IDs, then delegates each link to
     ``evaluate_link_drift``.
 
+    The optional *config* is forwarded to ``evaluate_link_drift`` so user
+    drift thresholds are honoured end-to-end (review-w4b BLOCKING fix).
+
     Returns a ``DriftEvaluation`` for every link in the active table.
     """
     result = link_store.replay()
     conflicts: set[LinkId] = set(result.merge_conflicts)
     return [
-        evaluate_link_drift(link, db=db, merge_conflicts=conflicts)
+        evaluate_link_drift(link, db=db, merge_conflicts=conflicts, config=config)
         for link in result.active_links.values()
     ]
 

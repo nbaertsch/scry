@@ -72,6 +72,7 @@ from scry.process.ipc import (
     parse_endpoint_uri,
 )
 from scry.process.leader import LeaderLock, read_leader_metadata_if_present
+from scry.reconcile import IndexStateTracker
 from scry.store.db import ScryDB
 from scry.store.overlay import OverlayManager
 
@@ -413,6 +414,7 @@ class MCPServer:
                 indexer=indexer,
                 role="leader",
                 ipc_client=None,
+                index_state_tracker=IndexStateTracker(),
             )
 
             # Step 3f: Build the REAL IPC handler with ctx already wired in.
@@ -489,6 +491,7 @@ class MCPServer:
                 indexer=None,
                 role="follower",
                 ipc_client=ipc_client,
+                index_state_tracker=IndexStateTracker(),
             )
             self._ctx = ctx
 

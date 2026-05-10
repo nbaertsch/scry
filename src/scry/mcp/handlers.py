@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,6 +41,7 @@ from scry.models import (
     AnchorLinkProjection,
     AnchorType,
     Config,
+    DriftConfig,
     IndexState,
     LinkOp,
     LinkRecord,
@@ -48,6 +49,7 @@ from scry.models import (
     new_link_id,
 )
 from scry.process.ipc import IPCClient
+from scry.reconcile import IndexStateTracker
 from scry.retrieve import build_anchor_packet, hybrid_search
 from scry.store.db import ScryDB
 from scry.store.links import ReplayResult
@@ -105,6 +107,8 @@ class MCPContext:
         role:        ``"leader"`` or ``"follower"``.
         ipc_client:  Connected :class:`~scry.process.ipc.IPCClient` for a
                      follower; ``None`` on the leader.
+        index_state_tracker: Mutable state machine for DESIGN.md §7.2 v3.1
+                     auto-reconcile logic (W4d).
     """
 
     repo_root: Path
@@ -116,6 +120,7 @@ class MCPContext:
     indexer: Indexer | None
     role: Literal["leader", "follower"]
     ipc_client: IPCClient | None
+    index_state_tracker: IndexStateTracker = field(default_factory=IndexStateTracker)
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -141,19 +146,23 @@ def _build_link_projections(
     link_types: list[str] | None = None,
     max_out: int = 5,
     max_in: int = 5,
+    drift_config: DriftConfig | None = None,
 ) -> list[AnchorLinkProjection]:
     """Project active links into ``AnchorLinkProjection`` instances.
 
     Evaluates drift for each link so the projection carries live drift status.
 
     Args:
-        anchor_id:  Anchor whose links to project.
-        replay:     Active link table (baseline ⊕ overlay).
-        db:         Live database connection for drift evaluation.
-        direction:  Which direction(s) to include.
-        link_types: Optional allow-list of :class:`~scry.models.LinkType` strings.
-        max_out:    Maximum number of outgoing projections.
-        max_in:     Maximum number of incoming projections.
+        anchor_id:    Anchor whose links to project.
+        replay:       Active link table (baseline ⊕ overlay).
+        db:           Live database connection for drift evaluation.
+        direction:    Which direction(s) to include.
+        link_types:   Optional allow-list of :class:`~scry.models.LinkType` strings.
+        max_out:      Maximum number of outgoing projections.
+        max_in:       Maximum number of incoming projections.
+        drift_config: Optional ``DriftConfig`` so user-tuned semantic-drift
+                      thresholds apply to projection drift evaluation
+                      (review-w4b BLOCKING fix).
 
     Returns:
         List of :class:`~scry.models.AnchorLinkProjection` sorted outgoing-first.
@@ -180,7 +189,9 @@ def _build_link_projections(
         if allowed_types is not None and link.type not in allowed_types:
             continue
 
-        evaluation = evaluate_link_drift(link, db=db, merge_conflicts=conflicts)
+        evaluation = evaluate_link_drift(
+            link, db=db, merge_conflicts=conflicts, config=drift_config
+        )
 
         proj = AnchorLinkProjection(
             to=link.to_id if is_out else link.from_id,
@@ -229,6 +240,16 @@ async def search(
         except ValueError as exc:
             raise MCPServerError(f"Invalid anchor type in 'types': {exc}") from exc
 
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
     results = hybrid_search(
         query,
         db=ctx.db,
@@ -247,7 +268,7 @@ async def search(
             result,
             db=ctx.db,
             config=cfg,
-            index_state=IndexState.FRESH,
+            index_state=index_state,
         )
         links = _build_link_projections(
             result.parent_anchor_id,
@@ -256,6 +277,7 @@ async def search(
             direction="both",
             max_out=cfg.links_per_result.outgoing,
             max_in=cfg.links_per_result.incoming,
+            drift_config=ctx.config.drift,
         )
         packet = packet.model_copy(update={"links": links})
         packets.append(packet.model_dump())
@@ -271,13 +293,24 @@ async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
         id:  Anchor primary key (e.g. ``"docs/spec.md::intro"``).
 
     Returns:
-        The anchor as a dict (including full ``content_text``), or ``None``
-        if the anchor is not in the database.
+        The anchor as a dict (including full ``content_text`` and top-level
+        ``index_state``), or ``None`` if the anchor is not in the database.
     """
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
     anchor = ctx.db.get_anchor(id)
     if anchor is None:
         return None
-    return anchor.model_dump()
+    result = anchor.model_dump()
+    result["index_state"] = index_state
+    return result
 
 
 async def get_links(
@@ -286,7 +319,7 @@ async def get_links(
     *,
     link_types: list[str] | None = None,
     direction: str = "outgoing",
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Return active links for *anchor_id* from the baseline ⊕ overlay table.
 
     Args:
@@ -296,7 +329,8 @@ async def get_links(
         direction:  ``"outgoing"`` (default), ``"incoming"``, or ``"both"``.
 
     Returns:
-        List of link dicts.  Each dict contains: ``link_id``, ``from_id``,
+        Dict with top-level keys ``links`` (list of link dicts) and
+        ``index_state``.  Each link dict contains: ``link_id``, ``from_id``,
         ``to_id``, ``type``, ``drift_status``, ``semantic_drift``,
         ``direction``, and ``from_content_hash`` / ``to_content_hash``.
 
@@ -307,6 +341,16 @@ async def get_links(
         raise MCPServerError(
             f"Invalid direction {direction!r}; expected 'outgoing', 'incoming', or 'both'"
         )
+
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
 
     replay = _replay_active(ctx.overlay_mgr)
     conflicts = set(replay.merge_conflicts)
@@ -328,7 +372,9 @@ async def get_links(
         if allowed_types is not None and link.type not in allowed_types:
             continue
 
-        evaluation = evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts)
+        evaluation = evaluate_link_drift(
+            link, db=ctx.db, merge_conflicts=conflicts, config=ctx.config.drift
+        )
         link_direction = "outgoing" if is_out else "incoming"
 
         rows.append(
@@ -345,7 +391,7 @@ async def get_links(
             }
         )
 
-    return rows
+    return {"links": rows, "index_state": index_state}
 
 
 async def find_drift(
@@ -353,7 +399,7 @@ async def find_drift(
     *,
     scope: str | None = None,
     status_filter: list[str] | None = None,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Evaluate section-level drift for active links (DESIGN.md §5.1).
 
     Wave 2: section-level only.  LSP code-level closure drift is deferred to
@@ -368,10 +414,21 @@ async def find_drift(
                        strings.  When supplied only matching rows are returned.
 
     Returns:
-        List of dicts with keys: ``link_id``, ``from_id``, ``to_id``,
-        ``link_type``, ``drift_status``, ``semantic_drift``,
+        Dict with top-level keys ``entries`` (list of drift dicts) and
+        ``index_state``.  Each entry dict has keys: ``link_id``, ``from_id``,
+        ``to_id``, ``link_type``, ``drift_status``, ``semantic_drift``,
         ``drift_coverage`` (always ``"section-only"`` in Wave 2).
     """
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
     replay = _replay_active(ctx.overlay_mgr)
 
     # Build a minimal LinkStore-compatible adapter: evaluate_all_drift needs a
@@ -381,7 +438,7 @@ async def find_drift(
     conflicts = set(replay.merge_conflicts)
 
     evaluations: list[DriftEvaluation] = [
-        evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts)
+        evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts, config=ctx.config.drift)
         for link in replay.active_links.values()
     ]
 
@@ -409,7 +466,7 @@ async def find_drift(
             }
         )
 
-    return rows
+    return {"entries": rows, "index_state": index_state}
 
 
 async def propose_link(
@@ -489,7 +546,7 @@ async def propose_link(
         "to_id": to_id,
         "link_type": link_type,
         "status": "staged",
-        "index_state": IndexState.FRESH,
+        "index_state": ctx.index_state_tracker.current_state,
     }
 
 
@@ -530,7 +587,7 @@ async def accept_link(
         "to_id": link.to_id,
         "link_type": link.type,
         "status": "accepted",
-        "index_state": IndexState.FRESH,
+        "index_state": ctx.index_state_tracker.current_state,
     }
 
 
@@ -573,6 +630,14 @@ async def status(ctx: MCPContext) -> dict[str, Any]:
         ``merge_conflict_count``, ``index_state``.
     """
     git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
     replay = _replay_active(ctx.overlay_mgr)
     pending = ctx.overlay_mgr.list_pending_overlay_records()
 
@@ -582,7 +647,7 @@ async def status(ctx: MCPContext) -> dict[str, Any]:
         "head_sha": git_ctx.head_sha,
         "pending_count": len(pending),
         "merge_conflict_count": len(replay.merge_conflicts),
-        "index_state": IndexState.FRESH,
+        "index_state": index_state,
     }
 
 
@@ -601,6 +666,14 @@ async def repo_summary(ctx: MCPContext) -> dict[str, Any]:
         ``index_state``, ``branch``.
     """
     git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
 
     # Anchor counts.
     anchors = ctx.db.list_anchors()
@@ -617,7 +690,7 @@ async def repo_summary(ctx: MCPContext) -> dict[str, Any]:
     replay = _replay_active(ctx.overlay_mgr)
     conflicts = set(replay.merge_conflicts)
     evaluations = [
-        evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts)
+        evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts, config=ctx.config.drift)
         for link in replay.active_links.values()
     ]
 
@@ -641,7 +714,7 @@ async def repo_summary(ctx: MCPContext) -> dict[str, Any]:
         "coverage_score": summary.coverage_score,
         "drift_counts": summary.counts.model_dump(),
         "drift_coverage": "section-only",
-        "index_state": IndexState.FRESH,
+        "index_state": index_state,
         "branch": git_ctx.branch,
     }
 
@@ -683,7 +756,8 @@ async def reindex(
     if scope is not None:
         logger.debug("reindex: scope=%r is accepted but ignored in Wave 2", scope)
 
-    result = await _run_index(ctx.indexer, force=force)
+    result = await ctx.index_state_tracker.run_leader_reindex(ctx.indexer, force=force)
+    await ctx.index_state_tracker.mark_fresh()
 
     return {
         "anchors_extracted": result.anchors_extracted,

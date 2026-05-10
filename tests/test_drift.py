@@ -43,6 +43,14 @@ _HA = "sha256:" + "a" * 64  # "original" hash
 _HB = "sha256:" + "b" * 64  # "changed" hash
 _HC = "sha256:" + "c" * 64  # third distinct hash
 
+# SHA-256 of empty bytes — the sentinel stored in ``closure_hash`` by the LSP
+# closure walker for early-exit ``lsp_error`` and ``unsupported`` paths.
+# lsp/closure.py: _EMPTY_SHA256 = "sha256:e3b0c4..."
+_EMPTY_CLOSURE = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# A non-empty closure hash (represents "LSP computed a real closure").
+_CLOSURE_A = "sha256:" + "c" * 64
+_CLOSURE_B = "sha256:" + "d" * 64
+
 _FROM_ID = "docs/spec.md::intro"
 _TO_ID = "src/app.py:main"
 
@@ -70,6 +78,7 @@ def _make_anchor(
     path: str = "docs/spec.md",
     symbol_name: str | None = None,
     transitive_hash_status: TransitiveHashStatus | None = None,
+    closure_hash: str | None = None,
 ) -> Anchor:
     """Build a minimal valid ``Anchor`` for testing."""
     return Anchor(
@@ -81,6 +90,7 @@ def _make_anchor(
         fingerprint_simhash=0xDEAD,
         symbol_name=symbol_name,
         transitive_hash_status=transitive_hash_status,
+        closure_hash=closure_hash,
     )
 
 
@@ -88,6 +98,8 @@ def _make_code_anchor(
     anchor_id: str = _TO_ID,
     *,
     content_hash: str = _HA,
+    transitive_hash_status: TransitiveHashStatus = TransitiveHashStatus.LSP_UNAVAILABLE,
+    closure_hash: str | None = None,
 ) -> Anchor:
     """Build a minimal CODE anchor."""
     return _make_anchor(
@@ -95,7 +107,8 @@ def _make_code_anchor(
         anchor_type=AnchorType.CODE,
         content_hash=content_hash,
         path="src/app.py",
-        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+        transitive_hash_status=transitive_hash_status,
+        closure_hash=closure_hash,
     )
 
 
@@ -110,6 +123,8 @@ def _make_link(
     to_hash: str = _HA,
     prior_from_hash: str | None = None,
     prior_to_hash: str | None = None,
+    from_closure_hash: str | None = None,
+    to_closure_hash: str | None = None,
     link_id: str | None = None,
 ) -> Link:
     """Build a minimal valid ``Link`` for testing."""
@@ -124,6 +139,8 @@ def _make_link(
         to_content_hash=to_hash,
         prior_from_content_hash=prior_from_hash,
         prior_to_content_hash=prior_to_hash,
+        from_closure_hash=from_closure_hash,
+        to_closure_hash=to_closure_hash,
         last_event_id=new_event_id(),
     )
 
@@ -834,3 +851,501 @@ class TestCodeInDocAnchorType:
         ev = evaluate_link_drift(link, db=db)
 
         assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+
+# ─── Tests: drift-unknown signal (§5.1 v3.1, W4a) ────────────────────────────
+
+
+class TestDriftUnknown:
+    """Regression tests for the ``drift-unknown`` status (DESIGN.md §5.1 v3.1).
+
+    ``drift-unknown`` fires when status would be ``fresh`` (both content/closure
+    hashes match) but a CODE endpoint carries ``transitive_hash_status == "lsp_error"``.
+    This means the closure-derived signal is missing; the link cannot be fully
+    evaluated.  CI policy default is to fail on ``drift-unknown``.
+
+    Precedence (§5.1): code-changed > drift-unknown > fresh.  So drift-unknown
+    is only produced when the hash comparison doesn't surface a concrete change.
+    """
+
+    def test_drift_unknown_from_lsp_error(self, db: ScryDB) -> None:
+        """from=CODE with lsp_error, hashes unchanged → drift-unknown (§5.1)."""
+        db.upsert_anchor(
+            _make_code_anchor(
+                _FROM_ID,
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        db.upsert_anchor(_make_code_anchor(content_hash=_HA))
+        link = _make_link(
+            from_type=AnchorType.CODE,
+            to_type=AnchorType.CODE,
+            from_hash=_HA,
+            to_hash=_HA,
+        )
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.DRIFT_UNKNOWN
+
+    def test_drift_unknown_to_lsp_error(self, db: ScryDB) -> None:
+        """to=CODE with lsp_error, hashes unchanged → drift-unknown (§5.1, target side)."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))  # from=SECTION, fresh
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.DRIFT_UNKNOWN
+
+    def test_drift_unknown_both_lsp_error(self, db: ScryDB) -> None:
+        """Both CODE endpoints have lsp_error → drift-unknown."""
+        db.upsert_anchor(
+            _make_code_anchor(
+                _FROM_ID,
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        link = _make_link(
+            from_type=AnchorType.CODE,
+            to_type=AnchorType.CODE,
+            from_hash=_HA,
+            to_hash=_HA,
+        )
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.DRIFT_UNKNOWN
+
+    def test_drift_unknown_not_from_partial_status(self, db: ScryDB) -> None:
+        """partial transitive_hash_status does NOT trigger drift-unknown (§5.3).
+
+        ``partial`` means some callees resolved; the hash still reflects real data.
+        Only ``lsp_error`` warrants ``drift-unknown``.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.PARTIAL,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_drift_unknown_not_from_unsupported_status(self, db: ScryDB) -> None:
+        """unsupported transitive_hash_status does NOT trigger drift-unknown (§5.3).
+
+        ``unsupported`` means the LSP lacks callHierarchy; the anchor's own AST
+        hash is the complete signal available.  No closure info was expected.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.UNSUPPORTED,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_drift_unknown_not_from_lsp_unavailable_status(self, db: ScryDB) -> None:
+        """lsp_unavailable does NOT trigger drift-unknown (§5.3).
+
+        ``lsp_unavailable`` means the LSP binary is absent from PATH; this is
+        expected when scry is run without a language server installed.  The signal
+        is weaker but not a runtime failure.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_drift_unknown_not_from_section_anchor(self, db: ScryDB) -> None:
+        """SECTION anchors have no transitive_hash_status → drift-unknown never fires.
+
+        §5.1 field placement rule: ``transitive_hash_status`` is omitted from
+        JSON for non-CODE targets; no LSP inference for markdown sections.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))  # SECTION from
+        db.upsert_anchor(_make_anchor(_TO_ID, content_hash=_HA, path="docs/target.md"))
+        link = _make_link(
+            to_type=AnchorType.SECTION,
+            from_hash=_HA,
+            to_hash=_HA,
+        )
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_drift_unknown_not_from_code_in_doc_anchor(self, db: ScryDB) -> None:
+        """CODE_IN_DOC anchors are never CODE-typed → drift-unknown never fires for them."""
+        from_id = "docs/spec.md::intro::snippet"
+        db.upsert_anchor(
+            Anchor(
+                id=from_id,
+                type=AnchorType.CODE_IN_DOC,
+                path="docs/spec.md",
+                content_text="fn example() {}",
+                content_hash=_HA,
+                fingerprint_simhash=0,
+            )
+        )
+        db.upsert_anchor(_make_anchor(_TO_ID, content_hash=_HA, path="docs/b.md"))
+        link = _make_link(
+            from_id=from_id,
+            from_type=AnchorType.CODE_IN_DOC,
+            to_type=AnchorType.SECTION,
+            from_hash=_HA,
+            to_hash=_HA,
+        )
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+
+# ─── Tests: drift-unknown vs. code-changed precedence (§5.1 v3.1) ────────────
+
+
+class TestDriftUnknownPrecedence:
+    """§5.1 precedence: code-changed / spec-changed beat drift-unknown.
+
+    When a CODE endpoint has ``lsp_error`` BUT also has a changed content hash
+    or changed closure hash (from non-error signal), the concrete change status
+    wins over drift-unknown.
+    """
+
+    def test_code_changed_beats_drift_unknown_content_hash(self, db: ScryDB) -> None:
+        """content_hash changed + lsp_error → code-changed (not drift-unknown).
+
+        §5.1: code-changed > drift-unknown.  When the AST text changed we have
+        a concrete signal; LSP uncertainty is secondary.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HB,  # changed AST
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        # Link stored _HA; current anchor is _HB → content diff detected.
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+    def test_spec_changed_beats_drift_unknown(self, db: ScryDB) -> None:
+        """spec endpoint changed + to-CODE has lsp_error → spec-changed (not drift-unknown)."""
+        db.upsert_anchor(_make_anchor(content_hash=_HB))  # spec changed
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.SPEC_CHANGED
+
+    def test_both_changed_beats_drift_unknown(self, db: ScryDB) -> None:
+        """Both content hashes changed + lsp_error → both-changed (not drift-unknown)."""
+        db.upsert_anchor(_make_anchor(content_hash=_HB))  # spec changed
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HB,  # code content changed
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.BOTH_CHANGED
+
+
+# ─── Tests: closure-hash-based code-changed (§5.3, W3d) ──────────────────────
+
+
+class TestClosureHashDrift:
+    """Tests for the §5.3 transitive-closure hash comparison in ``_resolve_changed``.
+
+    ``code-changed`` can fire when the caller's own AST is unchanged but a
+    callee's body changed (surfaced via ``closure_hash`` comparison).
+    Several edge cases guard against false positives.
+    """
+
+    def test_closure_hash_changed_to_endpoint_gives_code_changed(self, db: ScryDB) -> None:
+        """to=CODE closure_hash changed → code-changed even if content_hash unchanged.
+
+        §5.3: "if a callee's body changed, closure_hash differs even when the
+        caller's own AST is unchanged."
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))  # spec unchanged
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,  # own AST unchanged
+                transitive_hash_status=TransitiveHashStatus.PARTIAL,
+                closure_hash=_CLOSURE_B,  # callee changed → hash differs
+            )
+        )
+        # Baseline link stored _CLOSURE_A as the to-endpoint closure hash.
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+    def test_closure_hash_changed_from_endpoint_gives_code_changed(self, db: ScryDB) -> None:
+        """from=CODE closure_hash changed → code-changed (from-endpoint side)."""
+        db.upsert_anchor(
+            _make_code_anchor(
+                _FROM_ID,
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.COMPLETE,
+                closure_hash=_CLOSURE_B,  # callee changed
+            )
+        )
+        # to-anchor: a SECTION at _TO_ID so that it exists in the DB.
+        db.upsert_anchor(_make_anchor(_TO_ID, content_hash=_HA, path="src/app.py"))
+        link = _make_link(
+            from_type=AnchorType.CODE,
+            to_type=AnchorType.SECTION,
+            from_hash=_HA,
+            to_hash=_HA,
+            from_closure_hash=_CLOSURE_A,  # baseline stored _CLOSURE_A
+        )
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+    def test_closure_hash_unchanged_stays_fresh(self, db: ScryDB) -> None:
+        """closure_hash matches baseline → fresh (no false positive)."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.COMPLETE,
+                closure_hash=_CLOSURE_A,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_no_baseline_closure_hash_no_false_positive(self, db: ScryDB) -> None:
+        """Backward compat: link.to_closure_hash=None → no closure comparison (W3d).
+
+        Old links created before the closure-hash field was added have
+        ``to_closure_hash=None``; we must never fire ``code-changed`` from
+        comparing against an absent baseline.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.COMPLETE,
+                closure_hash=_CLOSURE_A,  # current has a closure hash
+            )
+        )
+        # link.to_closure_hash=None — no baseline to compare against.
+        link = _make_link(from_hash=_HA, to_hash=_HA)  # to_closure_hash defaults to None
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH
+
+    def test_lsp_error_suppresses_closure_comparison_no_false_positive(self, db: ScryDB) -> None:
+        """KEY REGRESSION: lsp_error must NOT produce code-changed via closure diff.
+
+        Scenario: link was created when LSP worked (real closure hash stored).
+        LSP later fails → anchor.closure_hash becomes _EMPTY_SHA256 (sentinel).
+        Without the guard, ``_EMPTY_SHA256 != real_hash`` → false-positive
+        ``code-changed``.  With the guard, closure comparison is suppressed and
+        ``drift-unknown`` fires instead (§5.1 v3.1: "text hashes match so not
+        code-changed, but closure-derived signal is missing").
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,  # own AST unchanged
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+                closure_hash=_EMPTY_CLOSURE,  # early-exit lsp_error sentinel
+            )
+        )
+        # Baseline link recorded a real closure hash from when LSP worked.
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        # Must be drift-unknown, NOT code-changed.
+        assert ev.drift_status == DriftStatus.DRIFT_UNKNOWN
+
+    def test_lsp_error_with_content_change_still_code_changed(self, db: ScryDB) -> None:
+        """lsp_error + content_hash changed → code-changed (AST is authoritative).
+
+        Even when LSP errored and we suppress closure comparison, a real change
+        to the anchor's own AST text produces ``code-changed``.  The concrete
+        change signal takes precedence over the uncertain closure state.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HB,  # AST CHANGED
+                transitive_hash_status=TransitiveHashStatus.LSP_ERROR,
+                closure_hash=_EMPTY_CLOSURE,
+            )
+        )
+        # Baseline stored _HA; AST changed → code-changed, not drift-unknown.
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+    def test_partial_status_closure_hash_change_gives_code_changed(self, db: ScryDB) -> None:
+        """partial status does NOT suppress closure comparison — its hash is usable.
+
+        §5.3: partial means at least one symbol was unresolvable; the hash still
+        incorporates whatever was resolved.  If that partial hash differs from
+        baseline, a real callee change is detected → code-changed.
+        """
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.PARTIAL,
+                closure_hash=_CLOSURE_B,  # partial but changed
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+
+# ─── Regression: closure suppression for ALL non-comparable statuses ───
+# (review-w4a HIGH expansion: was lsp_error-only; now {unsupported, lsp_unavailable, lsp_error}.)
+
+
+class TestRegressionClosureSuppressionExpandedW4a:
+    """Regression: review-w4a HIGH — closure suppression must apply for all
+    non-comparable transitive_hash_status values, not just lsp_error.
+
+    Per DESIGN.md §5.3, only ``complete`` and ``partial`` produce a real,
+    comparable closure hash.  ``unsupported``, ``lsp_unavailable``, and
+    ``lsp_error`` all fall back to AST-only hashing and may emit either
+    the empty sentinel or an unreliable partial-walk hash — comparing
+    them against a baseline captured under ``complete``/``partial`` would
+    produce a spurious ``code-changed`` purely from LSP availability
+    transitions (e.g. user uninstalls pyright, or upgrades to a config
+    that skips Python).
+    """
+
+    def test_unsupported_status_suppresses_closure_comparison(self, db: ScryDB) -> None:
+        """Baseline real closure_hash + current unsupported empty → fresh."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,  # AST unchanged
+                transitive_hash_status=TransitiveHashStatus.UNSUPPORTED,
+                closure_hash=_EMPTY_CLOSURE,  # empty sentinel
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        # Must NOT be code-changed; unsupported isn't an error so also
+        # NOT drift-unknown.  AST is unchanged → fresh.
+        assert ev.drift_status == DriftStatus.FRESH, (
+            f"unsupported status must suppress closure comparison and "
+            f"resolve to fresh when AST is unchanged; got {ev.drift_status}"
+        )
+
+    def test_lsp_unavailable_status_suppresses_closure_comparison(self, db: ScryDB) -> None:
+        """Baseline real closure_hash + current lsp_unavailable empty → fresh."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+                closure_hash=_EMPTY_CLOSURE,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.FRESH, (
+            f"lsp_unavailable must suppress closure comparison; got {ev.drift_status}"
+        )
+
+    def test_unsupported_status_with_content_change_still_code_changed(self, db: ScryDB) -> None:
+        """Even with closure suppressed, real AST change still produces code-changed."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HB,  # AST changed
+                transitive_hash_status=TransitiveHashStatus.UNSUPPORTED,
+                closure_hash=_EMPTY_CLOSURE,
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED
+
+    def test_complete_status_does_not_suppress_closure(self, db: ScryDB) -> None:
+        """Sanity: complete status is comparable → real change still detected."""
+        db.upsert_anchor(_make_anchor(content_hash=_HA))
+        db.upsert_anchor(
+            _make_code_anchor(
+                content_hash=_HA,
+                transitive_hash_status=TransitiveHashStatus.COMPLETE,
+                closure_hash=_CLOSURE_B,  # different from baseline _CLOSURE_A
+            )
+        )
+        link = _make_link(from_hash=_HA, to_hash=_HA, to_closure_hash=_CLOSURE_A)
+
+        ev = evaluate_link_drift(link, db=db)
+
+        assert ev.drift_status == DriftStatus.CODE_CHANGED, (
+            "complete status MUST allow closure comparison to fire"
+        )
