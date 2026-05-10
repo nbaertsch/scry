@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
+from scry.lsp.adapters import get_adapter
 from scry.lsp.proto import LSPMessage, LSPProtocolError, LSPStreamReader, LSPStreamWriter
 from scry.models import CodeAnchorsConfig
 
@@ -141,6 +142,7 @@ class LSPSession:
     language: str
     spec: LSPLaunchSpec
     capabilities: dict[str, Any] = field(default_factory=dict)
+    allow_untrusted: bool = field(default=False)
 
     # ── Internal state — set by start(), not part of __init__ ──────────
     _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
@@ -196,21 +198,52 @@ class LSPSession:
         )
 
         # Initialize handshake (LSP §3.1)
-        try:
-            result = await self.request(
-                "initialize",
-                {
-                    "processId": os.getpid(),
-                    "rootUri": self.spec.cwd.as_uri(),
-                    "capabilities": {
+        # Look up a per-language adapter (W3c).  If one exists, delegate
+        # both the initialize params and the post-initialize workspace
+        # settings to it; otherwise fall back to minimal inline params so
+        # that languages without a dedicated adapter (go, rust) still work.
+        adapter = get_adapter(self.language)
+        if adapter is not None:
+            init_params: dict[str, Any] = adapter.prepare_initialize_params(
+                self.spec.cwd, self.allow_untrusted
+            )
+        else:
+            # Fallback for languages without a W3c adapter (go, rust).
+            # Capability shape MUST nest under textDocument per LSP spec
+            # (review-w3c MEDIUM fix); a flat top-level "callHierarchy"
+            # is silently ignored by servers, weakening §5.3 transitive
+            # drift detection on the fallback path.
+            init_params = {
+                "processId": os.getpid(),
+                "rootUri": self.spec.cwd.as_uri(),
+                "capabilities": {
+                    "textDocument": {
                         "callHierarchy": {"dynamicRegistration": False},
                     },
                 },
+            }
+
+        try:
+            result = await self.request(
+                "initialize",
+                init_params,
                 timeout=30.0,
             )
             if isinstance(result, dict):
                 self.capabilities = result.get("capabilities", {})
             await self.notify("initialized", {})
+
+            # Post-initialize: push workspace settings to the server.
+            # Sent as a notification (fire-and-forget) per LSP spec.
+            # Only dispatched when the adapter provides non-empty settings;
+            # ZLS (and fallback adapters) skip this step automatically.
+            if adapter is not None:
+                settings = adapter.initial_workspace_settings()
+                if settings:
+                    await self.notify(
+                        "workspace/didChangeConfiguration",
+                        {"settings": settings},
+                    )
         except Exception as exc:
             await self._kill_subprocess()
             raise LSPInitializeError(
@@ -524,7 +557,7 @@ class LSPManager:
             return None
 
         # Spawn and handshake
-        session = LSPSession(language=language, spec=spec)
+        session = LSPSession(language=language, spec=spec, allow_untrusted=self._allow_untrusted)
         try:
             await session.start()
         except (LSPLaunchError, LSPInitializeError) as exc:
