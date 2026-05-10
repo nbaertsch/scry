@@ -27,6 +27,8 @@ dependencies = [
   "fastembed >=0.4,<1",
   # MCP server
   "fastmcp >=2.0,<3",
+  # HTTP client (LLM provider API calls)
+  "httpx >=0.25,<1",
   # Pydantic v2 for models
   "pydantic >=2.6,<3",
   # YAML for config
@@ -38,6 +40,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# pip install "scry-cli[litellm]" — enables LiteLLMProvider for multi-provider routing.
+litellm = ["litellm >=1.0,<2"]
 windows = ["pywin32 >=306; platform_system == 'Windows'"]
 dev = [
   "pytest >=8.0,<9",
@@ -100,7 +104,7 @@ mypy_path = "src"
 packages = ["scry"]
 
 [[tool.mypy.overrides]]
-module = ["sqlite_vec.*", "fastembed.*", "tree_sitter_language_pack.*", "simhash.*"]
+module = ["sqlite_vec.*", "fastembed.*", "tree_sitter_language_pack.*", "simhash.*", "litellm.*"]
 ignore_missing_imports = true
 
 # ─── pytest ──────────────────────────────────────────────────────────

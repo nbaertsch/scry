@@ -633,6 +633,31 @@ class IPCConfig(BaseModel):
     idempotency_cache_size: int = Field(default=10_000, gt=0)
 
 
+class LLMConfig(BaseModel):
+    """Configuration for the LLM provider (DESIGN.md §11, Wave 5).
+
+    API keys are NEVER stored here — read from environment variables at
+    provider construction time (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``).
+    The default provider is ``'ollama'`` (local-first: no API key, no cost).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["ollama", "openai", "anthropic", "litellm"] = "ollama"
+    """LLM backend.  ``'ollama'`` (default) requires a running Ollama daemon."""
+
+    model: str = "llama3.2"
+    """Model identifier interpreted by the provider (e.g. ``'gpt-4o-mini'``,
+    ``'claude-3-5-haiku-20241022'``, ``'llama3.2'``)."""
+
+    base_url: str | None = None
+    """Override the provider's default API base URL.  ``None`` uses the
+    provider's built-in default (e.g. ``http://localhost:11434`` for Ollama)."""
+
+    timeout: float = Field(default=60.0, gt=0.0)
+    """HTTP request timeout in seconds."""
+
+
 class Config(BaseModel):
     """Top-level `.scry/config.yaml` shape (DESIGN.md §6)."""
 
@@ -649,6 +674,7 @@ class Config(BaseModel):
     drift: DriftConfig = Field(default_factory=DriftConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     ipc: IPCConfig = Field(default_factory=IPCConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -712,7 +738,6 @@ def is_well_formed_anchor_id(s: str) -> bool:
 
 __all__ = [
     "DRIFT_PRECEDENCE",
-    "DRIFT_PRECEDENCE",
     "Anchor",
     "AnchorId",
     "AnchorLinkProjection",
@@ -739,6 +764,7 @@ __all__ = [
     "IndexConfig",
     "IndexMetadata",
     "IndexState",
+    "LLMConfig",
     "Link",
     "LinkId",
     "LinkOp",

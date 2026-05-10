@@ -265,8 +265,9 @@ class TestInit:
             "Malformed ~/.claude.json was silently overwritten — review-w2j HIGH bug regressed."
         )
         # And the warning must have surfaced to the user.
-        assert "refusing to register" in (result.output + result.stderr), (
-            f"Expected refusal warning in output; got: {result.output!r} stderr={result.stderr!r}"
+        # Click's CliRunner mixes stderr into output by default; just check output.
+        assert "refusing to register" in result.output, (
+            f"Expected refusal warning in output; got: {result.output!r}"
         )
 
     def test_register_global_refuses_non_dict_root(
@@ -288,7 +289,7 @@ class TestInit:
 
         assert result.exit_code == 0, result.output
         assert claude_json.read_text(encoding="utf-8") == '["not", "an", "object"]'
-        assert "refusing to register" in (result.output + result.stderr)
+        assert "refusing to register" in result.output
 
     def test_gitattributes_gets_union_line(self, runner: CliRunner, tmp_path: Path) -> None:
         """scry init adds merge=union line to .gitattributes."""
@@ -422,10 +423,10 @@ class TestCheck:
         # null = pass; no actual links in hailstorm so coverage = null.
         assert result.exit_code == 0, result.output
 
-    def test_check_no_db_exits_1(self, runner: CliRunner, indexed_repo: Path) -> None:
-        """scry check without vectors.db exits 1."""
+    def test_check_no_db_exits_2(self, runner: CliRunner, indexed_repo: Path) -> None:
+        """scry check without vectors.db exits 2 (operational error per §5.2 v3.1)."""
         result = _run(runner, ["check"], repo=indexed_repo)
-        assert result.exit_code == 1
+        assert result.exit_code == 2
 
     def test_check_require_fresh_embedder_mismatch(
         self, runner: CliRunner, indexed_and_built_repo: Path
@@ -438,10 +439,10 @@ class TestCheck:
             ["check", "--require-fresh-embedder", "--format", "json"],
             repo=indexed_and_built_repo,
         )
-        # When provider/model mismatch exits 1; when match exits 0.
+        # When provider/model mismatch exits 2 (error); when match exits 0.
         # With StubEmbedder the stored model is "stub" but config.embeddings.provider="local"
-        # so this should exit 1 (mismatch).
-        assert result.exit_code in (0, 1)
+        # so this should exit 2 (mismatch).
+        assert result.exit_code in (0, 2)
 
 
 # ---------------------------------------------------------------------------

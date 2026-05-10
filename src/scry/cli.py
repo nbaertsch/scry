@@ -354,9 +354,19 @@ def watch(ctx: click.Context) -> None:
     type=click.Choice(["json", "md"]),
     default="md",
     show_default=True,
-    help="Output format.",
+    help="Output format (json|md).",
 )
-@click.option("--ci", is_flag=True, help="Exit non-zero when thresholds are violated.")
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    help="Shorthand for --format json (machine-readable output).",
+)
+@click.option(
+    "--ci",
+    is_flag=True,
+    help="Exit 1 when thresholds are violated; exit 2 on error (§5.2 v3.1).",
+)
 @click.option(
     "--drift-min",
     type=float,
@@ -372,34 +382,66 @@ def watch(ctx: click.Context) -> None:
 @click.option(
     "--require-fresh-embedder",
     is_flag=True,
-    help="Error if the stored embedding model differs from config.",
+    help="Error (exit 2) if the stored embedding model differs from config.",
+)
+@click.option(
+    "--ignore-lsp-error",
+    is_flag=True,
+    help=(
+        "Exclude drift-unknown (caused by lsp_error) from the failure set. "
+        "Links still appear in output counts. "
+        "Overrides §5.1 default of failing on drift-unknown."
+    ),
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help=(
+        "Any non-fresh link is a failure (exit 1). "
+        "With --ignore-lsp-error, drift-unknown is excluded from the failure set."
+    ),
 )
 @click.pass_context
 def check(
     ctx: click.Context,
     fmt: str,
+    json_flag: bool,
     ci: bool,
     drift_min: float | None,
     coverage_min: float | None,
     require_fresh_embedder: bool,
+    ignore_lsp_error: bool,
+    strict: bool,
 ) -> None:
-    """Drift + coverage scores.
+    """Drift + coverage scores (§5.2 v3.1).
 
-    Evaluates all active links for drift and reports scores.  With
-    ``--ci`` exits non-zero when ``drift_score < drift_min`` OR
+    Evaluates all active links for drift and reports scores.
+
+    Exit codes: 0 = clean, 1 = drift detected, 2 = operational error.
+
+    With ``--ci`` exits 1 when ``drift_score < drift_min`` OR
     ``coverage_score < coverage_min``.  A ``null`` score is always a PASS.
+
+    With ``--strict`` any non-fresh link causes exit 1.
+
+    With ``--ignore-lsp-error`` links with ``drift-unknown`` status are
+    excluded from the failure set but still appear in the output counts
+    (§5.1 override for broken LSPs).
     """
+    if json_flag:
+        fmt = "json"
+
     repo = _resolve_repo_root(ctx)
     try:
         config = load_config(repo)
     except ConfigError as exc:
         click.echo(f"error: {exc}", err=True)
-        raise SystemExit(1) from None
+        raise SystemExit(2) from None
 
     db_path = repo / ".scry" / "vectors.db"
     if not db_path.exists():
         click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
-        raise SystemExit(1) from None
+        raise SystemExit(2) from None
 
     try:
         with ScryDB(repo, read_only=True) as db:
@@ -416,7 +458,7 @@ def check(
                             "Run `scry index --reembed` to migrate.",
                             err=True,
                         )
-                        raise SystemExit(1) from None
+                        raise SystemExit(2) from None
 
             link_store = LinkStore(repo)
             git_ctx = GitContextProvider(repo)
@@ -461,7 +503,9 @@ def check(
             )
     except (LockTimeout, OSError) as exc:
         click.echo(f"error: {exc}", err=True)
-        raise SystemExit(1) from None
+        raise SystemExit(2) from None
+
+    c = summary.counts
 
     if fmt == "json":
         click.echo(summary.model_dump_json(indent=2))
@@ -476,7 +520,6 @@ def check(
         click.echo(f"| coverage_score | {cs} |")
         click.echo(f"| drift_coverage | {summary.drift_coverage} |")
         click.echo("\n### Counts\n")
-        c = summary.counts
         click.echo("| Status | Count |")
         click.echo("|--------|-------|")
         click.echo(f"| fresh | {c.fresh} |")
@@ -486,15 +529,53 @@ def check(
         click.echo(f"| broken_source | {c.broken_source} |")
         click.echo(f"| broken_target | {c.broken_target} |")
         click.echo(f"| merge_conflict | {c.merge_conflict} |")
+        click.echo(f"| drift_unknown | {c.drift_unknown} |")
         click.echo(f"| semantic_drift_flagged | {c.semantic_drift_flagged} |")
         click.echo(f"| total | {c.total} |")
 
+    # --strict: any non-fresh link is a failure (exit 1).
+    # With --ignore-lsp-error, drift-unknown is excluded from the failure set.
+    if strict:
+        non_fresh = (
+            c.broken_source
+            + c.broken_target
+            + c.merge_conflict
+            + c.both_changed
+            + c.spec_changed
+            + c.code_changed
+            + (0 if ignore_lsp_error else c.drift_unknown)
+        )
+        if non_fresh > 0:
+            click.echo(
+                f"FAIL (strict): {non_fresh} non-fresh link(s) detected",
+                err=True,
+            )
+            raise SystemExit(1) from None
+
+    # --ci: threshold-based gate (§5.2 v3.1).
+    # With --ignore-lsp-error, drift_unknown links are excluded from the effective
+    # drift_score used for threshold comparisons.
     if ci:
+        # Compute effective_drift_score: when --ignore-lsp-error is active and there are
+        # drift_unknown links, back out their weight from the score so they don't push
+        # the score below the threshold.
+        effective_drift_score = summary.drift_score
+        if ignore_lsp_error and c.drift_unknown > 0 and summary.drift_score is not None:
+            scoring = config.drift.scoring
+            adj_total = c.total - c.drift_unknown
+            if adj_total == 0:
+                effective_drift_score = None  # all links were drift_unknown → null = pass
+            else:
+                # Reverse the formula: weighted_sum = (1 - score/100) * total
+                ws = (1.0 - summary.drift_score / 100.0) * c.total
+                adj_ws = ws - scoring.drift_unknown * c.drift_unknown
+                effective_drift_score = max(0.0, min(100.0, 100.0 * (1.0 - adj_ws / adj_total)))
+
         failed = False
         if (
             drift_min is not None
-            and summary.drift_score is not None
-            and summary.drift_score < drift_min
+            and effective_drift_score is not None
+            and effective_drift_score < drift_min
         ):
             click.echo(
                 f"CI FAIL: drift_score {summary.drift_score:.1f} < {drift_min}",
