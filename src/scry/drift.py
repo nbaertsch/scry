@@ -416,6 +416,7 @@ def evaluate_link_drift(
     if merge_conflicts is None:
         merge_conflicts = set()
 
+    # UAT-R5-5 PR-C simulation: injected comment to trigger code_changed drift.
     # Step 1 — merge-conflict (highest precedence).
     if link.link_id in merge_conflicts:
         return DriftEvaluation(
