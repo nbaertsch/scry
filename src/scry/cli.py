@@ -215,6 +215,36 @@ def _lsp_binary_for(language: str) -> str:
     return _LSP_BINARY_FOR_LANG.get(language, f"the {language} language server")
 
 
+# UAT-6: concrete install commands per LSP binary.  Day-1 users don't
+# know whether pyright-langserver is npm/pip/system or where rust-analyzer
+# comes from; the previous "Install pyright-langserver" hint was correct
+# but unhelpful.  These commands are well-known canonical installs.
+_LSP_INSTALL_COMMANDS: dict[str, str] = {
+    "pyright-langserver": "npm install -g pyright    (Node.js required)",
+    "typescript-language-server": (
+        "npm install -g typescript typescript-language-server    (Node.js required)"
+    ),
+    "gopls": "go install golang.org/x/tools/gopls@latest    (Go required)",
+    "rust-analyzer": "rustup component add rust-analyzer    (Rust toolchain required)",
+    "zls": "see https://github.com/zigtools/zls#installation",
+}
+
+
+def _lsp_install_hint(language: str) -> str:
+    """Return a multi-line "how to install" hint for *language*'s LSP.
+
+    UAT-6: the historical "Install pyright-langserver" note told users
+    WHAT but not HOW.  This returns a concrete install command (with
+    runtime dependency in parentheses) for the languages we know.
+    Falls back to the binary name alone when we don't have a recipe.
+    """
+    binary = _lsp_binary_for(language)
+    install = _LSP_INSTALL_COMMANDS.get(binary)
+    if install is None:
+        return f"Install {binary}"
+    return f"Install command: {install}"
+
+
 def _path_excluded(p: Path, repo: Path, exclude_patterns: list[str]) -> bool:
     """Return True if *p* (a directory) matches any exclude glob in the config.
 
@@ -1547,8 +1577,9 @@ def callers(ctx: click.Context, anchor_id: str, max_depth: int, as_json: bool) -
             click.echo(
                 "No callers found.\n"
                 f"  note: LSP for {anchor_lang} is '{lsp_status}'; results may be "
-                f"incomplete.  Install {_lsp_binary_for(anchor_lang)} or configure "
-                "code_anchors.languages in .scry/config.yaml."
+                f"incomplete.\n"
+                f"        {_lsp_install_hint(anchor_lang)}\n"
+                "        Or configure code_anchors.languages in .scry/config.yaml."
             )
         else:
             click.echo("No callers found.")
@@ -1631,8 +1662,9 @@ def subclasses(ctx: click.Context, anchor_id: str, as_json: bool) -> None:
             click.echo(
                 "No subclasses found.\n"
                 f"  note: LSP for {anchor_lang} is '{lsp_status}'; results may be "
-                f"incomplete.  Install {_lsp_binary_for(anchor_lang)} or configure "
-                "code_anchors.languages in .scry/config.yaml."
+                f"incomplete.\n"
+                f"        {_lsp_install_hint(anchor_lang)}\n"
+                "        Or configure code_anchors.languages in .scry/config.yaml."
             )
         else:
             click.echo("No subclasses found.")
@@ -1764,6 +1796,13 @@ def doctor(ctx: click.Context) -> None:
     click.echo("\nLSP allowlist (§6.2):")
     for lang, binaries in _LSP_ALLOWLIST.items():
         click.echo(f"  {lang}: {', '.join(binaries)}")
+        # UAT-6 review-u3 LOW: surface install command per language so users
+        # troubleshooting LSP setup via doctor get the same actionable hint
+        # callers/subclasses give them.
+        primary = binaries[0]
+        install = _LSP_INSTALL_COMMANDS.get(primary)
+        if install is not None:
+            click.echo(f"      install: {install}")
 
     if allow_untrusted:
         click.echo(

@@ -638,6 +638,25 @@ def test_uat_1_indexer_emits_progress_for_all_phases(tmp_path: Path) -> None:
     )
 
 
+def test_uat_6_lsp_install_hint_includes_concrete_command() -> None:
+    """UAT-6: _lsp_install_hint must give a runnable install command, not
+    just the binary name.  Day-1 users don't know if pyright-langserver
+    is npm/pip/system; the hint must say "npm install -g pyright"."""
+    from scry.cli import _lsp_install_hint
+
+    py_hint = _lsp_install_hint("python")
+    assert "npm install" in py_hint and "pyright" in py_hint, py_hint
+
+    go_hint = _lsp_install_hint("go")
+    assert "go install" in go_hint and "gopls" in go_hint, go_hint
+
+    rust_hint = _lsp_install_hint("rust")
+    assert "rustup" in rust_hint and "rust-analyzer" in rust_hint, rust_hint
+
+    ts_hint = _lsp_install_hint("typescript")
+    assert "npm install" in ts_hint, ts_hint
+
+
 async def test_uat_2_litellm_connection_error_normalized_to_network_error() -> None:
     """UAT-2 review-u2: LiteLLMProvider must normalize connection-class
     exceptions (litellm.exceptions.APIConnectionError, etc.) to
