@@ -73,7 +73,18 @@ _TOKEN_RE: re.Pattern[str] = re.compile(r"^tok_[A-Za-z0-9_-]+$")
 
 #: Operations that require an ``idempotency_token`` and benefit from the LRU
 #: cache.  Read ops bypass the cache entirely (DESIGN.md §10.3 v3.1).
-WRITE_OPS: frozenset[str] = frozenset({"propose_link", "accept_link", "commit_links", "reindex"})
+WRITE_OPS: frozenset[str] = frozenset(
+    {
+        "propose_link",
+        "accept_link",
+        "commit_links",
+        "reindex",
+        # UAT-R5-2: agent-driven suggest-links — apply_link_suggestions is
+        # the write half of the two-phase API (suggest_links_candidates is
+        # read-only and stays out of WRITE_OPS).
+        "apply_link_suggestions",
+    }
+)
 
 # ─── Endpoint URI helpers ─────────────────────────────────────────────
 

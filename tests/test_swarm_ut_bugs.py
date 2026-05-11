@@ -711,6 +711,148 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_r5_2_suggest_links_candidates_only_no_llm(tmp_path: Path) -> None:
+    """UAT-R5-2: scry suggest-links --candidates-only must produce
+    a complete agent-driven payload (system_prompt + schema + pairs)
+    WITHOUT calling any LLM provider.
+    """
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["suggest-links", "--help"])
+    assert result.exit_code == 0
+    assert "--candidates-only" in result.output, (
+        "scry suggest-links --help must advertise --candidates-only (UAT-R5-2)"
+    )
+    assert "--from-file" in result.output, (
+        "scry suggest-links --help must advertise --from-file (UAT-R5-2)"
+    )
+
+
+def test_uat_r5_2_build_candidates_payload_shape() -> None:
+    """UAT-R5-2: build_candidates_payload returns system_prompt + schema + pairs."""
+    from scry.models import Anchor, AnchorType
+    from scry.suggest import build_candidates_payload
+
+    code = Anchor(
+        id="src/m.py:f",
+        type=AnchorType.CODE.value,
+        path="src/m.py",
+        symbol_name="f",
+        content_text="def f(): pass",
+        content_hash="sha256:" + "0" * 64,
+        fingerprint_simhash=0,
+    )
+    doc = Anchor(
+        id="d/s.md::sec",
+        type=AnchorType.SECTION.value,
+        path="d/s.md",
+        heading_path=("sec",),
+        content_text="spec",
+        content_hash="sha256:" + "0" * 64,
+        fingerprint_simhash=0,
+    )
+    payload = build_candidates_payload([(code, doc)])
+    assert "system_prompt" in payload and isinstance(payload["system_prompt"], str)
+    assert "schema" in payload
+    assert "pairs" in payload and len(payload["pairs"]) == 1
+    assert payload["pairs"][0]["pair_id"] == "p_0"
+    assert payload["pairs"][0]["code"]["id"] == "src/m.py:f"
+    assert payload["pairs"][0]["doc"]["id"] == "d/s.md::sec"
+
+
+def test_uat_r5_2_parse_agent_suggestions_validates() -> None:
+    """UAT-R5-2: parse_agent_suggestions enforces same threshold/type
+    rules the LLM-provider path uses."""
+    from scry.models import Anchor, AnchorType
+    from scry.suggest import parse_agent_suggestions
+
+    code = Anchor(
+        id="src/m.py:f",
+        type=AnchorType.CODE.value,
+        path="src/m.py",
+        symbol_name="f",
+        content_text="x",
+        content_hash="sha256:" + "0" * 64,
+        fingerprint_simhash=0,
+    )
+    doc = Anchor(
+        id="d/s.md::sec",
+        type=AnchorType.SECTION.value,
+        path="d/s.md",
+        heading_path=("sec",),
+        content_text="y",
+        content_hash="sha256:" + "0" * 64,
+        fingerprint_simhash=0,
+    )
+    raw = {
+        "suggestions": [
+            {
+                "pair_id": "p_0",
+                "should_link": True,
+                "link_type": "implements",
+                "confidence": 0.92,
+                "reason": "matches",
+            },
+            # Should be filtered: should_link=false
+            {
+                "pair_id": "p_0",
+                "should_link": False,
+                "link_type": "implements",
+                "confidence": 0.4,
+                "reason": "no match",
+            },
+            # Should be filtered: bad link_type
+            {
+                "pair_id": "p_0",
+                "should_link": True,
+                "link_type": "invented",
+                "confidence": 0.99,
+                "reason": "fake",
+            },
+        ]
+    }
+    out = parse_agent_suggestions(raw, pairs=[(code, doc)], min_confidence=0.5)
+    assert len(out) == 1
+    assert out[0].link_type == "implements"
+    assert out[0].confidence == 0.92
+
+
+def test_uat_r5_2_mcp_handlers_include_agent_driven() -> None:
+    """UAT-R5-2: HANDLERS dict must include both new agent-driven tools."""
+    from scry.mcp.handlers import HANDLERS
+
+    assert "suggest_links_candidates" in HANDLERS
+    assert "apply_link_suggestions" in HANDLERS
+
+
+def test_uat_r5_1_lazy_mcp_keeps_cli_startup_fast() -> None:
+    """UAT-R5-1: scry/mcp/__init__.py must NOT eagerly import MCPServer
+    so cli.py doesn't pay the ~3.3s fastmcp import tax on every command.
+    """
+    import inspect
+
+    from scry import mcp as _mcp_pkg
+
+    src = inspect.getsource(_mcp_pkg)
+    # Top-level (non-TYPE_CHECKING) import of MCPServer would defeat the fix.
+    assert "def __getattr__" in src, (
+        "scry/mcp/__init__.py must use __getattr__ to lazy-load MCPServer (UAT-R5-1)"
+    )
+    # The import must be inside the lazy loader, not at module level.
+    top_level_imports = [
+        line
+        for line in src.splitlines()
+        if line.startswith("from scry.mcp.server import") and "MCPServer" in line
+    ]
+    assert not top_level_imports, (
+        "scry/mcp/__init__.py must not eagerly 'from scry.mcp.server import MCPServer' "
+        "at module level (UAT-R5-1)"
+    )
+
+
 def test_uat_19_link_warns_on_inverted_direction() -> None:
     """UAT-19: scry link warns when implements/tests/examples direction
     looks inverted vs DESIGN.md §3.6 canonical orientation.

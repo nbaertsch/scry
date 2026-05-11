@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, cast
@@ -122,13 +124,14 @@ class MCPServer:
         # (op, idempotency_token).  Mirrors IPCServer's _IdempotencyCache
         # so duplicate MCP calls via the leader's stdio path are
         # deduplicated the same way IPC follower→leader forwards are.
-        self._leader_idem_cache: dict[tuple[str, str], Any] = {}
-        # SR1-2: per-(op, token) lock so concurrent leader-direct calls
-        # with the same idempotency_token serialize and the second call
+        self._leader_idem_cache: dict[tuple[str, str, str], Any] = {}
+        # SR1-2: per-(op, token, args_hash) lock so concurrent leader-direct
+        # calls with the same idempotency_token + args serialize and the
+        # second call
         # observes the cached result of the first instead of also
         # executing the handler.  Locks are evicted alongside cache
         # entries to bound memory.
-        self._leader_idem_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._leader_idem_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._mcp: FastMCP = FastMCP(name="scry", version=scry.__version__)
         self._started = False
         self._register_tools()
@@ -361,6 +364,64 @@ class MCPServer:
                 ),
             )
 
+        @mcp.tool(annotations=_read)
+        async def suggest_links_candidates(
+            scope: str | None = None,
+            source: str = "both",
+            limit: int = 25,
+        ) -> dict[str, Any]:
+            """Surface (code, doc) pair candidates plus a classifier prompt.
+
+            UAT-R5-2: when an LLM-powered MCP client is calling scry,
+            requiring scry to ALSO have its own LLM provider is wasteful.
+            This tool returns the candidate pairs + system prompt + JSON
+            output schema so the calling agent can run the classifier
+            itself, then feed the result to ``apply_link_suggestions``.
+
+            No LLM call is made by scry in this path.  Cap ``limit`` to
+            keep the payload within the agent's context budget.
+            """
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "suggest_links_candidates",
+                    {"scope": scope, "source": source, "limit": limit},
+                ),
+            )
+
+        @mcp.tool(annotations=_idem_write)
+        async def apply_link_suggestions(
+            suggestions: list[dict[str, Any]],
+            pair_payloads: list[dict[str, Any]],
+            min_confidence: float = 0.7,
+            apply: bool = False,
+            idempotency_token: str | None = None,
+        ) -> dict[str, Any]:
+            """Apply (or preview) agent-classified link suggestions.
+
+            Companion to ``suggest_links_candidates``.  When ``apply=False``
+            (default) returns the validated, threshold-filtered suggestion
+            list WITHOUT writing.  When ``apply=true`` writes each
+            surviving suggestion to the current branch overlay.
+
+            ``pair_payloads`` is the ``pairs`` list from the prior
+            ``suggest_links_candidates`` call — required to resolve
+            ``pair_id`` back to anchor IDs.
+            """
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "apply_link_suggestions",
+                    {
+                        "suggestions": suggestions,
+                        "pair_payloads": pair_payloads,
+                        "min_confidence": min_confidence,
+                        "apply": apply,
+                        "idempotency_token": idempotency_token,
+                    },
+                ),
+            )
+
     # ─── Dispatch ────────────────────────────────────────────────────────────
 
     async def _dispatch(self, op: str, args: dict[str, Any]) -> Any:
@@ -410,12 +471,29 @@ class MCPServer:
         # SR1-2 fix: serialize concurrent same-token requests on a
         # per-(op, token) asyncio.Lock so the second request awaits
         # the first instead of racing into the handler.
-        cache_key: tuple[str, str] | None = None
+        #
+        # UAT-R5-2 review-r5-1-2 HIGH: include a stable args fingerprint
+        # in the cache key so two retries with the same token but
+        # different payloads don't share a cached response (a preview
+        # apply=false call could otherwise poison a later apply=true
+        # call with the same token, returning the preview's empty
+        # write count).  We hash args with idempotency_token excluded
+        # since the token is already in the key.
+        cache_key: tuple[str, str, str] | None = None
         token_arg: str | None = None
         if op in WRITE_OPS and ctx.role == "leader":
             token_arg = args.get("idempotency_token")
             if token_arg:
-                cache_key = (op, token_arg)
+                args_for_hash = {k: v for k, v in args.items() if k != "idempotency_token"}
+                try:
+                    args_hash = hashlib.sha256(
+                        json.dumps(args_for_hash, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()[:16]
+                except Exception:
+                    # Defensive: an args dict that isn't JSON-serialisable falls
+                    # back to no-args-fingerprint behaviour (matches pre-fix).
+                    args_hash = ""
+                cache_key = (op, token_arg, args_hash)
                 lock = self._leader_idem_locks.setdefault(cache_key, asyncio.Lock())
                 await lock.acquire()
         try:

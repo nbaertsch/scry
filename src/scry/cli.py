@@ -1869,6 +1869,25 @@ def unlink_cmd(ctx: click.Context, link_id: str, reason: str | None) -> None:
     show_default=True,
     help="Which anchor type to scan for unlinked neighbors.",
 )
+@click.option(
+    "--candidates-only",
+    is_flag=True,
+    help=(
+        "UAT-R5-2: print just the candidate pairs + classifier prompt as JSON "
+        "instead of running the LLM.  Use this when the LLM lives in your "
+        "MCP client (Claude/Copilot) instead of being configured in scry."
+    ),
+)
+@click.option(
+    "--from-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "UAT-R5-2: feed agent-classified suggestions back from a JSON file "
+        "(produced by an LLM responding to --candidates-only output).  Combine "
+        "with --apply to write surviving suggestions to the overlay."
+    ),
+)
 @click.pass_context
 def suggest_links(
     ctx: click.Context,
@@ -1880,6 +1899,8 @@ def suggest_links(
     yes: bool,
     as_json: bool,
     source: str,
+    candidates_only: bool,
+    from_file: Path | None,
 ) -> None:
     """AI-augmented batch link suggestions (requires LLM provider).
 
@@ -1923,6 +1944,201 @@ def suggest_links(
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(1) from None
 
+    # ── UAT-R5-2 agent-driven flows ────────────────────────────────────────
+    if candidates_only and from_file is not None:
+        click.echo(
+            "error: --candidates-only and --from-file are mutually exclusive.  "
+            "Use --candidates-only to PRODUCE candidate JSON for an agent; "
+            "use --from-file to APPLY agent-classified suggestions.",
+            err=True,
+        )
+        raise SystemExit(2) from None
+
+    if candidates_only:
+        # Produce candidate-pair JSON for an external LLM agent.  No LLM call.
+        from scry.suggest import build_candidates_payload, select_candidate_pairs
+
+        embedder_cands = _get_embedder(config)
+        suggest_cfg_cands = SuggestConfig(
+            min_confidence=effective_confidence,
+            limit=limit,
+            source=source_typed,
+            scope=scope,
+        )
+        try:
+            with ScryDB(repo, read_only=True) as _cands_db:
+                git_ctx_cands = GitContextProvider(repo)
+                base_link_store = _LinkStore(repo)
+                cands_overlay_mgr = OverlayManager(
+                    repo, git_context=git_ctx_cands, link_store=base_link_store
+                )
+                cands_overlay = cands_overlay_mgr.current_overlay_path()
+
+                class _BranchLinkStoreCands(_LinkStore):
+                    def replay(self, *, overlay_path: Path | None = None) -> Any:
+                        return super().replay(overlay_path=overlay_path or cands_overlay)
+
+                cands_link_store = _BranchLinkStoreCands(repo)
+                pairs = select_candidate_pairs(
+                    db=_cands_db,
+                    active_links=cands_link_store.replay().active_links,
+                    embedder=embedder_cands,
+                    config=suggest_cfg_cands,
+                )
+                payload = build_candidates_payload(pairs)
+                click.echo(json.dumps(payload, indent=2))
+                return
+        except (LockTimeout, OSError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            raise SystemExit(1) from None
+
+    if from_file is not None:
+        # Apply agent-classified suggestions from a JSON file.  No LLM call.
+        # NOTE: do NOT re-import new_link_id / new_event_id locally — they're
+        # already imported at module level (lines 61-62).  A local import
+        # here would SHADOW them function-wide and break the original
+        # LLM-provider write path when from_file is None.
+        try:
+            agent_payload = json.loads(from_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            click.echo(f"error: --from-file {from_file}: {exc}", err=True)
+            raise SystemExit(2) from None
+
+        suggestions_in = agent_payload.get("suggestions", [])
+        # UAT-R5-2 review-r5-1-2 MEDIUM: distinguish missing from empty.
+        # An agent that produces zero candidates (fully-linked repo) is
+        # a valid no-op; only error when the keys are completely absent.
+        if "pair_payloads" in agent_payload:
+            pair_payloads_in = agent_payload["pair_payloads"]
+        elif "pairs" in agent_payload:
+            pair_payloads_in = agent_payload["pairs"]
+        else:
+            click.echo(
+                "error: --from-file payload must include the 'pair_payloads' "
+                "(or 'pairs') key from the matching --candidates-only output.",
+                err=True,
+            )
+            raise SystemExit(2) from None
+
+        # Build pair_id → (from_id, to_id) map.
+        pair_id_to_anchors: dict[str, tuple[str, str]] = {}
+        for pp in pair_payloads_in:
+            pid = pp.get("pair_id")
+            code = (pp.get("code") or {}).get("id")
+            doc = (pp.get("doc") or {}).get("id")
+            if isinstance(pid, str) and isinstance(code, str) and isinstance(doc, str):
+                pair_id_to_anchors[pid] = (code, doc)
+
+        # Validate + filter using the same rules as the LLM-provider path.
+        validated: list[tuple[str, str, str, float, str]] = []
+        rejected = 0
+        for item in suggestions_in:
+            if not isinstance(item, dict):
+                rejected += 1
+                continue
+            pid = str(item.get("pair_id", ""))
+            if pid not in pair_id_to_anchors:
+                rejected += 1
+                continue
+            if not bool(item.get("should_link", False)):
+                rejected += 1
+                continue
+            link_type = str(item.get("link_type", ""))
+            if link_type not in ("mirrors", "implements", "references"):
+                rejected += 1
+                continue
+            try:
+                conf = float(item.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                rejected += 1
+                continue
+            if not (0.0 <= conf <= 1.0) or conf < effective_confidence:
+                rejected += 1
+                continue
+            from_id, to_id = pair_id_to_anchors[pid]
+            validated.append((from_id, to_id, link_type, conf, str(item.get("reason", ""))))
+
+        validated.sort(key=lambda v: v[3], reverse=True)
+
+        if as_json and not apply:
+            click.echo(
+                json.dumps(
+                    {
+                        "suggestions": [
+                            {
+                                "from_id": fi,
+                                "to_id": ti,
+                                "link_type": lt,
+                                "confidence": cf,
+                                "reason": rs,
+                            }
+                            for fi, ti, lt, cf, rs in validated
+                        ],
+                        "rejected": rejected,
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        if not validated:
+            click.echo(f"No surviving suggestions (rejected={rejected}).")
+            return
+
+        if not apply:
+            click.echo(f"Would write {len(validated)} suggestion(s) (rejected={rejected}):")
+            for fi, ti, lt, cf, _ in validated:
+                click.echo(f"  {fi} --[{lt} conf={cf:.2f}]--> {ti}")
+            click.echo("\nRe-run with --apply to write to the overlay.")
+            return
+
+        # Apply path: write each surviving suggestion to the overlay.
+        try:
+            with ScryDB(repo, read_only=True) as _apply_db:
+                git_ctx_apply = GitContextProvider(repo).get()
+                base_link_store_apply = _LinkStore(repo)
+                apply_overlay_mgr = OverlayManager(
+                    repo,
+                    git_context=GitContextProvider(repo),
+                    link_store=base_link_store_apply,
+                )
+                written = 0
+                for fi, ti, lt, _, rs in validated:
+                    fa = _apply_db.get_anchor(fi)
+                    ta = _apply_db.get_anchor(ti)
+                    if fa is None or ta is None:
+                        rejected += 1
+                        continue
+                    record = LinkRecord.model_validate(
+                        {
+                            "op": LinkOp.UPSERT,
+                            "link_id": new_link_id(),
+                            "event_id": new_event_id(),
+                            "from": fi,
+                            "from_type": fa.type,
+                            "to": ti,
+                            "to_type": ta.type,
+                            "type": lt,
+                            "from_content_hash": fa.content_hash,
+                            "to_content_hash": ta.content_hash,
+                            "commit_sha": git_ctx_apply.head_sha,
+                            "worktree_dirty": bool(git_ctx_apply.dirty_files),
+                            "evidence": rs,
+                        }
+                    )
+                    try:
+                        apply_overlay_mgr.append_to_current_branch_overlay(record)
+                        written += 1
+                    except Exception as exc:
+                        click.echo(f"warning: skip {fi} -> {ti}: {exc}", err=True)
+                        rejected += 1
+                click.echo(f"Applied {written} link(s); rejected {rejected}.")
+                return
+        except (LockTimeout, OSError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            raise SystemExit(1) from None
+
+    # ── Original LLM-provider flow ─────────────────────────────────────────
     try:
         provider = make_provider(config.llm)
     except LLMError as exc:

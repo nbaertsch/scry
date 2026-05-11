@@ -1157,6 +1157,230 @@ async def get_subclasses(
     return {"subclasses": subclasses_out, "index_state": index_state}
 
 
+# ─── Agent-driven suggest-links (UAT-R5-2) ───────────────────────────────────
+
+
+async def suggest_links_candidates(
+    ctx: MCPContext,
+    *,
+    scope: str | None = None,
+    source: str = "both",
+    limit: int | None = 25,
+) -> dict[str, Any]:
+    """Return a candidate-pair payload for an LLM-powered MCP client to classify.
+
+    UAT-R5-2: when an LLM-powered MCP client (Claude/Copilot/Cursor) is
+    calling scry, requiring scry to ALSO have its own LLM provider
+    configured is wasteful and a real adoption barrier.  This tool
+    surfaces just the candidate (code, doc) pairs plus the system
+    prompt + JSON schema; the calling agent runs the classifier
+    itself, then feeds the result to :func:`apply_link_suggestions`.
+
+    No LLM call is made by scry in this path.
+
+    Args:
+        ctx:    Injected :class:`MCPContext`.
+        scope:  Optional path-prefix filter applied to both sides.
+        source: ``"code"`` (scan from code → docs), ``"doc"`` (scan
+                from docs → code), or ``"both"`` (default).
+        limit:  Maximum candidate pairs to return.  Defaults to 25 to
+                fit within typical LLM agent context budgets.
+
+    Returns:
+        Dict with ``system_prompt`` (string), ``schema`` (JSON-output
+        contract the agent must follow), and ``pairs`` (list of
+        ``{pair_id, code, doc}`` records).
+    """
+    from scry.suggest import (
+        DEFAULT_MIN_CONFIDENCE,
+        SuggestConfig,
+        build_candidates_payload,
+        select_candidate_pairs,
+    )
+
+    if source not in ("code", "doc", "both"):
+        raise MCPServerError(f"'source' must be one of 'code' / 'doc' / 'both', got {source!r}")
+
+    # UAT-R5-2 review-r5-1-2 HIGH: replay MUST include the current branch
+    # overlay so already-applied suggestions are excluded from candidate
+    # selection.  Without this, an agent that runs candidates → apply →
+    # candidates again would re-surface the same pairs.
+    replay = ctx.overlay_mgr.replay_active()
+    cfg = SuggestConfig(
+        min_confidence=DEFAULT_MIN_CONFIDENCE,
+        limit=limit,
+        source=source,  # type: ignore[arg-type]
+        scope=scope,
+    )
+    pairs = select_candidate_pairs(
+        db=ctx.db,
+        active_links=replay.active_links,
+        embedder=ctx.embedder,
+        config=cfg,
+    )
+    return build_candidates_payload(pairs)
+
+
+async def apply_link_suggestions(
+    ctx: MCPContext,
+    *,
+    suggestions: list[dict[str, Any]],
+    pair_payloads: list[dict[str, Any]] | None = None,
+    min_confidence: float = 0.7,
+    apply: bool = False,
+    idempotency_token: str | None = None,
+) -> dict[str, Any]:
+    """Apply (or preview) agent-classified link suggestions.
+
+    Companion to :func:`suggest_links_candidates`: takes the agent's
+    structured classification of (code, doc) pairs and turns it into
+    real overlay link records.
+
+    Args:
+        ctx:               Injected :class:`MCPContext`.
+        suggestions:       Agent's classification output, matching the
+                           ``schema`` returned by ``suggest_links_candidates``
+                           (one entry per ``pair_id``).
+        pair_payloads:     The ``pairs`` list from the prior
+                           ``suggest_links_candidates`` call, used to
+                           resolve ``pair_id`` → anchor IDs.  Required
+                           because the candidate selection isn't
+                           deterministic across separate MCP turns.
+        min_confidence:    Threshold below which suggestions are dropped.
+        apply:             When ``False`` (default), returns the
+                           filtered, validated suggestion list WITHOUT
+                           writing.  When ``True``, writes each surviving
+                           suggestion to the current branch overlay via
+                           the same code-path as ``propose_link``.
+        idempotency_token: Optional token for retry-safety.
+
+    Returns:
+        ``{"suggestions": [...], "applied": <count|0>, "rejected": <count>}``.
+    """
+    from scry.models import LinkOp, LinkRecord, new_event_id, new_link_id
+    from scry.store.links import LinkStore
+    from scry.store.overlay import OverlayManager
+    from scry.suggest import LinkSuggestion
+
+    if pair_payloads is None:
+        raise MCPServerError(
+            "apply_link_suggestions requires 'pair_payloads' from the "
+            "preceding suggest_links_candidates call (used to resolve "
+            "pair_id back to anchor IDs)."
+        )
+
+    # Build pair_id → (from_id, to_id) lookup from the supplied payload.
+    pair_id_to_anchors: dict[str, tuple[str, str]] = {}
+    for pp in pair_payloads:
+        pid = pp.get("pair_id")
+        code = pp.get("code", {}).get("id")
+        doc = pp.get("doc", {}).get("id")
+        if isinstance(pid, str) and isinstance(code, str) and isinstance(doc, str):
+            pair_id_to_anchors[pid] = (code, doc)
+
+    # Validate + filter using the same parser the LLM-provider path uses.
+    validated: list[LinkSuggestion] = []
+    rejected = 0
+    for item in suggestions:
+        if not isinstance(item, dict):
+            rejected += 1
+            continue
+        pid = str(item.get("pair_id", ""))
+        if pid not in pair_id_to_anchors:
+            rejected += 1
+            continue
+        if not bool(item.get("should_link", False)):
+            rejected += 1
+            continue
+        link_type = str(item.get("link_type", ""))
+        if link_type not in ("mirrors", "implements", "references"):
+            rejected += 1
+            continue
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            rejected += 1
+            continue
+        if not (0.0 <= confidence <= 1.0) or confidence < min_confidence:
+            rejected += 1
+            continue
+        from_id, to_id = pair_id_to_anchors[pid]
+        validated.append(
+            LinkSuggestion(
+                from_id=from_id,
+                to_id=to_id,
+                link_type=link_type,
+                confidence=confidence,
+                reason=str(item.get("reason", "")),
+            )
+        )
+
+    validated.sort(key=lambda s: s.confidence, reverse=True)
+
+    out: dict[str, Any] = {
+        "suggestions": [
+            {
+                "from_id": s.from_id,
+                "to_id": s.to_id,
+                "link_type": s.link_type,
+                "confidence": s.confidence,
+                "reason": s.reason,
+            }
+            for s in validated
+        ],
+        "applied": 0,
+        "rejected": rejected,
+    }
+
+    if not apply:
+        return out
+
+    # ── Write path ──────────────────────────────────────────────────────────
+    if ctx.indexer is None:
+        raise MCPServerError(
+            "apply_link_suggestions(apply=true) is a write op — this process "
+            "is a follower and has no Indexer.  The request should be "
+            "forwarded to the leader via IPC."
+        )
+
+    link_store = LinkStore(ctx.repo_root)
+    overlay_mgr = OverlayManager(ctx.repo_root, git_context=ctx.git_context, link_store=link_store)
+    git_ctx = ctx.git_context.get()
+    written = 0
+    for s in validated:
+        # Look up endpoint anchors for type + content_hash.
+        from_anchor = ctx.db.get_anchor(s.from_id)
+        to_anchor = ctx.db.get_anchor(s.to_id)
+        if from_anchor is None or to_anchor is None:
+            continue
+        record = LinkRecord.model_validate(
+            {
+                "op": LinkOp.UPSERT,
+                "link_id": new_link_id(),
+                "event_id": new_event_id(),
+                "from": s.from_id,
+                "from_type": from_anchor.type,
+                "to": s.to_id,
+                "to_type": to_anchor.type,
+                "type": s.link_type,
+                "from_content_hash": from_anchor.content_hash,
+                "to_content_hash": to_anchor.content_hash,
+                "commit_sha": git_ctx.head_sha,
+                "worktree_dirty": bool(git_ctx.dirty_files),
+                "evidence": s.reason,
+            }
+        )
+        try:
+            overlay_mgr.append_to_current_branch_overlay(record)
+            written += 1
+        except Exception as exc:
+            logger.warning(
+                "apply_link_suggestions: failed to write %s -> %s: %s", s.from_id, s.to_id, exc
+            )
+    out["applied"] = written
+    return out
+
+
 # ─── Dispatch table ───────────────────────────────────────────────────────────
 
 #: Maps MCP tool names to their handler functions.
@@ -1174,4 +1398,7 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     "reindex": reindex,
     "get_callers": get_callers,
     "get_subclasses": get_subclasses,
+    # UAT-R5-2: agent-driven suggest-links (no scry-side LLM required).
+    "suggest_links_candidates": suggest_links_candidates,
+    "apply_link_suggestions": apply_link_suggestions,
 }

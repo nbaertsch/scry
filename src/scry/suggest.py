@@ -48,6 +48,8 @@ __all__ = [
     "LinkSuggestion",
     "SuggestConfig",
     "batch_llm_evaluate",
+    "build_candidates_payload",
+    "parse_agent_suggestions",
     "run_suggest_links",
     "select_candidate_pairs",
 ]
@@ -257,6 +259,123 @@ def _anchor_payload(anchor: Anchor) -> dict[str, Any]:
     if anchor.heading_path:
         payload["heading"] = " > ".join(anchor.heading_path)
     return payload
+
+
+# ─── Agent-driven (no scry-side LLM) flow ────────────────────────────────────
+#
+# UAT-R5-2 / "offload LLM to consuming MCP agent": when an LLM-powered MCP
+# client (Claude/Copilot/Cursor) is calling scry, requiring scry to ALSO
+# have its own LLM provider (Ollama/OpenAI/etc.) is wasteful and a real
+# adoption barrier — the user is paying for one LLM token budget already.
+#
+# Two-phase API:
+#   1. ``build_candidates_payload(pairs)`` returns the system prompt,
+#      JSON-output schema, and per-pair payloads.  The agent (Claude)
+#      runs the classifier prompt itself.
+#   2. ``parse_agent_suggestions(raw)`` validates the agent's structured
+#      response (same shape as :func:`_parse_llm_batch` accepts from a
+#      provider) and turns it into a list of :class:`LinkSuggestion`.
+#
+# CLI / MCP wrappers in cli.py and mcp/handlers.py expose this as
+# ``suggest_links_candidates`` (read) and ``apply_link_suggestions`` (write).
+
+
+def build_candidates_payload(
+    pairs: list[tuple[Anchor, Anchor]],
+) -> dict[str, Any]:
+    """Return a complete agent-driven prompt payload for *pairs*.
+
+    The returned dict carries the ``system_prompt``, the JSON-output
+    ``schema``, and a list of ``pairs`` where each pair has a stable
+    ``pair_id`` plus compact ``code`` / ``doc`` anchor payloads.
+
+    The agent (e.g. the Claude session that called this MCP tool)
+    is expected to:
+
+    1. Read ``system_prompt`` and follow it.
+    2. Apply it to each entry in ``pairs``, returning a JSON document
+       conforming to ``schema``.
+    3. Pass the JSON back to ``apply_link_suggestions`` (or feed it
+       to :func:`parse_agent_suggestions` directly).
+
+    No LLM call is made by scry in this path.
+    """
+    pair_payloads: list[dict[str, Any]] = []
+    for i, (code, doc) in enumerate(pairs):
+        pair_payloads.append(
+            {
+                "pair_id": f"p_{i}",
+                "code": _anchor_payload(code),
+                "doc": _anchor_payload(doc),
+            }
+        )
+    return {
+        "system_prompt": _SYSTEM_PROMPT,
+        "schema": {
+            "suggestions": [
+                {
+                    "pair_id": "<string from input>",
+                    "should_link": "<boolean>",
+                    "link_type": "<one of: mirrors | implements | references>",
+                    "confidence": "<float 0.0..1.0>",
+                    "reason": "<one-sentence explanation>",
+                }
+            ]
+        },
+        "pairs": pair_payloads,
+        "_count": len(pair_payloads),
+    }
+
+
+def parse_agent_suggestions(
+    raw: dict[str, Any] | str,
+    *,
+    pairs: list[tuple[Anchor, Anchor]],
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+) -> list[LinkSuggestion]:
+    """Validate an agent-supplied classifier response.
+
+    Accepts either a parsed dict matching the
+    :func:`build_candidates_payload` schema, or a JSON string.
+    Returns the validated, threshold-filtered, confidence-sorted
+    :class:`LinkSuggestion` list — same shape :func:`run_suggest_links`
+    returns from a scry-side LLM provider, so downstream code
+    (``--apply``, overlay writes) is identical.
+
+    Drops entries with ``should_link=false``, unknown ``pair_id``,
+    unrecognised ``link_type``, or out-of-range confidence — same
+    tolerances as :func:`_parse_llm_batch`.
+    """
+    if isinstance(raw, str):
+        try:
+            data: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"agent suggestions are not valid JSON: {exc}") from exc
+    else:
+        data = raw
+
+    pair_id_to_pair: dict[str, tuple[Anchor, Anchor]] = {
+        f"p_{i}": pair for i, pair in enumerate(pairs)
+    }
+    parsed = _parse_llm_batch(json.dumps(data), list(pair_id_to_pair.keys()))
+    suggestions: list[LinkSuggestion] = []
+    for item in parsed:
+        pair = pair_id_to_pair.get(item["pair_id"])
+        if pair is None:
+            continue
+        code, doc = pair
+        suggestions.append(
+            LinkSuggestion(
+                from_id=code.id,
+                to_id=doc.id,
+                link_type=item["link_type"],
+                confidence=item["confidence"],
+                reason=item["reason"],
+            )
+        )
+    suggestions = [s for s in suggestions if s.confidence >= min_confidence]
+    suggestions.sort(key=lambda s: s.confidence, reverse=True)
+    return suggestions
 
 
 def _parse_llm_batch(
