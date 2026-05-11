@@ -624,6 +624,12 @@ class Indexer:
             )
             db.write_index_metadata(new_meta)
 
+            # UAT-23: checkpoint the WAL so a subsequent doctor / read-only
+            # ScryDB sees the just-written manifest, even if the process is
+            # interrupted before SQLite would naturally checkpoint on close.
+            with contextlib.suppress(Exception):
+                db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
         elapsed = time.monotonic() - start
         return IndexResult(
             files_processed=files_processed,
@@ -794,6 +800,11 @@ class Indexer:
             )
             db.write_index_metadata(new_meta)
 
+            # UAT-23: checkpoint WAL so doctor / read-only consumers see
+            # the just-written manifest immediately (parity with sync index()).
+            with contextlib.suppress(Exception):
+                db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
         elapsed = time.monotonic() - start
         return IndexResult(
             files_processed=files_processed,
@@ -958,6 +969,12 @@ class Indexer:
             if total == 0:
                 with conn:
                     _write_meta_in_txn(conn, updated_meta_kwargs)
+
+            # UAT-23 review-u4-u6: reembed must also checkpoint the WAL so
+            # readers see the new embedding metadata immediately (parity
+            # with index() / index_async()).
+            with contextlib.suppress(Exception):
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         elapsed = time.monotonic() - start
         return IndexResult(

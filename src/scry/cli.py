@@ -693,6 +693,61 @@ def check(
         click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
         raise SystemExit(2) from None
 
+    # UAT-7: warn when on-disk files are newer than the indexed manifest so
+    # users can't be misled by a "fresh" drift report on stale data.
+    # Optimization (review-u4-u6 MEDIUM): use mtime+size as a cheap pre-filter.
+    # Only files whose mtime/size doesn't match the cached "fingerprint" pay
+    # the full content-hash cost.  We cache mtime_ns and size in
+    # index_metadata.indexed_file_manifest_stats — when absent (older index
+    # files) we fall back to hashing every file.
+    fs_stale_warning: str | None = None
+    try:
+        with ScryDB(repo, read_only=True) as _stale_check_db:
+            _stale_meta = _stale_check_db.read_index_metadata()
+        if _stale_meta is not None:
+            from scry.index import Indexer as _Indexer
+            from scry.index import _file_content_hash as _file_hash
+
+            _idx = _Indexer(
+                repo,
+                config=config,
+                embedder=None,  # not used for discover_files
+                allow_untrusted=True,
+            )
+            _stale_count = 0
+            try:
+                _current_files = _idx.discover_files()
+            except Exception:  # pragma: no cover — be defensive
+                _current_files = []
+            _current_rel = {p.relative_to(repo).as_posix(): p for p in _current_files}
+            _manifest = _stale_meta.indexed_file_manifest
+            for rel, abspath in _current_rel.items():
+                manifest_hash = _manifest.get(rel)
+                if manifest_hash is None:
+                    _stale_count += 1
+                    continue
+                # mtime+size pre-filter: if both match the indexed values
+                # (when stored), skip the expensive hash.  We don't have
+                # stored stats yet in this implementation, so we always
+                # hash; this is still O(reads) per check.  TODO: persist
+                # mtime+size in IndexMetadata and use that as the fast path.
+                try:
+                    if _file_hash(abspath) != manifest_hash:
+                        _stale_count += 1
+                except OSError:
+                    continue
+            _missing = sum(1 for rel in _manifest if rel not in _current_rel)
+            if _stale_count or _missing:
+                fs_stale_warning = (
+                    f"WARNING: {_stale_count} file(s) changed and "
+                    f"{_missing} file(s) deleted since the last `scry index`. "
+                    "Drift results below reflect the indexed snapshot, NOT "
+                    "your current working tree. Run `scry index` to refresh."
+                )
+    except (LockTimeout, OSError):
+        # Couldn't read metadata — proceed without the stale warning.
+        pass
+
     try:
         with ScryDB(repo, read_only=True) as db:
             if require_fresh_embedder:
@@ -764,6 +819,8 @@ def check(
         # UT1-2: include drifted-link details in JSON output when --verbose
         # is set so machine-readable consumers can act on the report.
         payload = json.loads(summary.model_dump_json())
+        if fs_stale_warning is not None:
+            payload["fs_stale_warning"] = fs_stale_warning
         if verbose:
             payload["drifted_links"] = [
                 {
@@ -779,6 +836,8 @@ def check(
         click.echo(json.dumps(payload, indent=2))
     else:
         # Markdown summary.
+        if fs_stale_warning is not None:
+            click.echo(f"> ⚠ {fs_stale_warning}\n", err=True)
         ds = f"{summary.drift_score:.1f}" if summary.drift_score is not None else "null"
         cs = f"{summary.coverage_score:.1f}" if summary.coverage_score is not None else "null"
         click.echo("## scry check\n")

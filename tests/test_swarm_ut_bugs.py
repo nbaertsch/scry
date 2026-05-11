@@ -657,6 +657,91 @@ def test_uat_6_lsp_install_hint_includes_concrete_command() -> None:
     assert "npm install" in ts_hint, ts_hint
 
 
+def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
+    """UAT-7: scry check must surface a clear warning when on-disk files
+    have changed since the last index, so users can't be misled by a
+    "drift_score: 100 / fresh" report on stale data.
+    """
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    repo = tmp_path
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "init",
+            "--allow-empty",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "spec.md").write_text("# Spec\n\nbody\n")
+    (repo / "code.py").write_text("def f(): pass\n")
+    (repo / ".scry").mkdir(exist_ok=True)
+    (repo / ".scry" / "config.yaml").write_text(
+        "include:\n  - '**/*.py'\n  - '**/*.md'\nexclude: []\n"
+    )
+
+    import os as _os
+
+    cwd0 = _os.getcwd()
+    try:
+        _os.chdir(repo)
+        env = {**_os.environ, "SCRY_EMBEDDER": "stub"}
+        # Index then mutate a file then check.
+        runner.invoke(main, ["index", "--quiet"], env=env)
+        (repo / "code.py").write_text("def f(): return 'changed'\n")
+        result = runner.invoke(main, ["check"], env=env)
+        assert "WARNING" in result.output, (
+            f"UAT-7: scry check must warn when fs is newer than index; output:\n{result.output}"
+        )
+        assert "scry index" in result.output, (
+            "UAT-7: warning must point users at the remediation command"
+        )
+    finally:
+        _os.chdir(cwd0)
+
+
+def test_uat_23_reembed_runs_wal_checkpoint() -> None:
+    """UAT-23 review-u4-u6 HIGH: reembed must also checkpoint the WAL so
+    embedding-model migrations are visible to read-only consumers
+    immediately (parity with index() / index_async())."""
+    import inspect
+
+    from scry.index import Indexer
+
+    src = inspect.getsource(Indexer.reembed)
+    assert "wal_checkpoint" in src, (
+        "UAT-23: Indexer.reembed() must also run PRAGMA wal_checkpoint after "
+        "writing index_metadata; missed in initial fix per review-u4-u6 HIGH."
+    )
+
+
+def test_uat_23_index_runs_wal_checkpoint(tmp_path: Path) -> None:
+    """UAT-23: Indexer.index() runs PRAGMA wal_checkpoint(TRUNCATE) so a
+    subsequent doctor / read-only consumer sees the just-written manifest
+    even if SQLite hasn't naturally checkpointed.
+    """
+    import inspect
+
+    from scry.index import Indexer
+
+    src = inspect.getsource(Indexer.index)
+    assert "wal_checkpoint" in src, (
+        "UAT-23: Indexer.index() must run PRAGMA wal_checkpoint after writing "
+        "the index_metadata to prevent silent stale-state on interrupted runs"
+    )
+
+
 async def test_uat_2_litellm_connection_error_normalized_to_network_error() -> None:
     """UAT-2 review-u2: LiteLLMProvider must normalize connection-class
     exceptions (litellm.exceptions.APIConnectionError, etc.) to
