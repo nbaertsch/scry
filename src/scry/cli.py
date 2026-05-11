@@ -1143,6 +1143,126 @@ def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str |
             click.echo(f"  {excerpt}")
 
 
+# ─── scry get-anchor / scry get-link / scry get-links / scry show ────────────
+
+
+@main.command("get-anchor")
+@click.argument("anchor_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of formatted text.")
+@click.pass_context
+def get_anchor_cmd(ctx: click.Context, anchor_id: str, as_json: bool) -> None:
+    """Print a single anchor's full record by primary ID (UAT-3).
+
+    DESIGN.md §8 promises CLI mirrors MCP 1:1.  Spec authors and
+    reviewers reach for this immediately after `scry search` returns
+    candidate IDs; previously it was MCP-only.
+    """
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(1) from None
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            anchor = db.get_anchor(anchor_id)
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+    if anchor is None:
+        click.echo(f"error: anchor not found: {anchor_id}", err=True)
+        raise SystemExit(1) from None
+    if as_json:
+        click.echo(anchor.model_dump_json(indent=2))
+        return
+    click.echo(f"id:           {anchor.id}")
+    click.echo(f"type:         {anchor.type}")
+    click.echo(f"path:         {anchor.path}")
+    if anchor.symbol_name:
+        click.echo(f"symbol_name:  {anchor.symbol_name}")
+    if anchor.heading_path:
+        click.echo(f"heading_path: {' / '.join(anchor.heading_path)}")
+    click.echo(f"content_hash: {anchor.content_hash}")
+    if anchor.transitive_hash_status:
+        click.echo(f"lsp_status:   {anchor.transitive_hash_status}")
+    click.echo(f"\n--- content ({len(anchor.content_text)} chars) ---")
+    click.echo(anchor.content_text)
+
+
+@main.command("show")
+@click.argument("anchor_id")
+@click.pass_context
+def show_cmd(ctx: click.Context, anchor_id: str) -> None:
+    """Print just the content_text of an anchor (UAT-5).
+
+    Equivalent to ``scry get-anchor`` minus the metadata header — the
+    "self-contained read the source" command UAT3 #1 was missing.
+    """
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(1) from None
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            anchor = db.get_anchor(anchor_id)
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+    if anchor is None:
+        click.echo(f"error: anchor not found: {anchor_id}", err=True)
+        raise SystemExit(1) from None
+    # UAT-5 review-u8 MEDIUM: write content_text verbatim — no Click-added
+    # trailing newline — so `scry show <id> > file` produces exactly the
+    # canonicalised content (which preserves its own trailing-newline state).
+    sys.stdout.write(anchor.content_text)
+    sys.stdout.flush()
+
+
+@main.command("get-link")
+@click.argument("link_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON.")
+@click.pass_context
+def get_link_cmd(ctx: click.Context, link_id: str, as_json: bool) -> None:
+    """Print a single link record by link_id (UAT-3 / UAT4 #2).
+
+    Searches the active link table (baseline ⊕ current branch overlay)
+    for the requested link.  Returns exit 1 if the link doesn't exist
+    (or has been tombstoned).
+    """
+    from scry.store.links import LinkValidationError, MergeConflictError
+
+    repo = _resolve_repo_root(ctx)
+    try:
+        link_store = LinkStore(repo)
+        git_ctx = GitContextProvider(repo)
+        overlay_mgr = OverlayManager(repo, git_context=git_ctx, link_store=link_store)
+        replay = link_store.replay(overlay_path=overlay_mgr.current_overlay_path())
+    except (GitContextError, LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+    except (LinkValidationError, MergeConflictError) as exc:
+        # UAT-3 review-u8 HIGH: clean error if the link table is mid-write
+        # by another process (or has unresolved merge conflicts) rather
+        # than a stack trace.
+        click.echo(f"error: link table inconsistent: {exc}", err=True)
+        raise SystemExit(2) from None
+    link = replay.active_links.get(link_id)
+    if link is None:
+        click.echo(f"error: link not found in active table: {link_id}", err=True)
+        raise SystemExit(1) from None
+    if as_json:
+        click.echo(link.model_dump_json(indent=2))
+        return
+    click.echo(f"link_id:           {link.link_id}")
+    click.echo(f"from:              {link.from_id}  ({link.from_type})")
+    click.echo(f"to:                {link.to_id}  ({link.to_type})")
+    click.echo(f"type:              {link.type}")
+    click.echo(f"from_content_hash: {link.from_content_hash}")
+    click.echo(f"to_content_hash:   {link.to_content_hash}")
+    if link.evidence:
+        click.echo(f"evidence:          {link.evidence}")
+
+
 # ─── scry link ────────────────────────────────────────────────────────────────
 
 

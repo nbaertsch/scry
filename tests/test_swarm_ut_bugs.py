@@ -711,6 +711,42 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_3_get_anchor_cli_command_exists() -> None:
+    """UAT-3: scry get-anchor must exist as a CLI command, not MCP-only."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["get-anchor", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "anchor" in result.output.lower()
+
+
+def test_uat_3_get_link_cli_command_exists() -> None:
+    """UAT-3 / UAT4 #2: scry get-link must exist as a CLI command."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["get-link", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "link" in result.output.lower()
+
+
+def test_uat_5_show_cli_command_exists() -> None:
+    """UAT-5: scry show <anchor_id> must exist (UAT3's #1 missing feature)."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["show", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "content" in result.output.lower() or "source" in result.output.lower()
+
+
 def test_uat_24_js_require_calls_not_extracted_as_anchors(tmp_path: Path) -> None:
     """UAT-24: ``const x = require('y')`` and ``const x = require('y').member``
     must not produce anchors (CommonJS module imports, not real symbols).
