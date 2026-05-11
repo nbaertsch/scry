@@ -301,9 +301,50 @@ async def search(
             drift_config=ctx.config.drift,
         )
         packet = packet.model_copy(update={"links": links})
-        packets.append(packet.model_dump())
+        packets.append(_compact_packet(packet.model_dump()))
 
     return packets
+
+
+# UAT-13: keys to strip from default MCP responses to reduce token bloat
+# (5-result search ≈ 4-8k tokens otherwise; UAT5 finding).  These are
+# internal-only fields useful for storage / debugging but not for LLM
+# decision-making.  The CLI surface still has access to the full record
+# via ``scry get-anchor``.
+_COMPACT_DROP_KEYS: tuple[str, ...] = (
+    "content_hash",
+    "fingerprint_simhash",
+    "def_line",
+    "def_char",
+    "closure_hash",
+    "overview_embedding",
+    # NOTE: transitive_hash_status is INTENTIONALLY kept (review-u16-18 MEDIUM):
+    # it's the small LLM-relevant signal that tells agents when LSP coverage
+    # is incomplete (lsp_unavailable / lsp_error / partial).  Bulky hashes
+    # are dropped; this single status field stays.
+)
+
+
+def _compact_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Return *packet* with internal-only fields removed (UAT-13).
+
+    Recursively strips :data:`_COMPACT_DROP_KEYS` from the packet and
+    its nested ``anchor`` / ``links`` entries.  Token-bloat reduction
+    only — semantics unchanged.
+    """
+    if not isinstance(packet, dict):
+        return packet
+    out: dict[str, Any] = {}
+    for k, v in packet.items():
+        if k in _COMPACT_DROP_KEYS:
+            continue
+        if isinstance(v, dict):
+            out[k] = _compact_packet(v)
+        elif isinstance(v, list):
+            out[k] = [_compact_packet(item) if isinstance(item, dict) else item for item in v]
+        else:
+            out[k] = v
+    return out
 
 
 async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
@@ -314,8 +355,13 @@ async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
         id:  Anchor primary key (e.g. ``"docs/spec.md::intro"``).
 
     Returns:
-        The anchor as a dict (including full ``content_text`` and top-level
-        ``index_state``), or ``None`` if the anchor is not in the database.
+        The anchor as a dict (full ``content_text`` + ``index_state``)
+        or ``None`` if the anchor is not in the database.
+
+    UAT-13: per-anchor internal fields (``content_hash``,
+    ``fingerprint_simhash``, ``def_line``/``def_char``, etc.) are
+    stripped from the response to reduce token bloat in LLM contexts.
+    Use the CLI ``scry get-anchor`` command for the full record.
     """
     git_ctx = ctx.git_context.get()
     index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
@@ -329,7 +375,7 @@ async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
     anchor = ctx.db.get_anchor(id)
     if anchor is None:
         return None
-    result = anchor.model_dump()
+    result = _compact_packet(anchor.model_dump())
     result["index_state"] = index_state
     return result
 

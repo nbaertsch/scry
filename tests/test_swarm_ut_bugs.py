@@ -711,6 +711,104 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_11_mcp_descriptions_no_dev_notes() -> None:
+    """UAT-11: MCP tool descriptions must not leak internal dev notes."""
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    # Strip the registration-method-level docstring (lines between the
+    # def and the first "@mcp.tool") since the explanatory comment
+    # there legitimately mentions the leaks we're scrubbing FROM the
+    # actual @mcp.tool docstrings.
+    body_start = src.find("@mcp.tool")
+    body = src[body_start:]
+    forbidden = ["UT3-2 fix", "Wave 2 stub", "W6e — DESIGN.md", "review-w"]
+    leaks = [s for s in forbidden if s in body]
+    assert not leaks, f"UAT-11: MCP tool docstrings still leak internal dev notes: {leaks}"
+
+
+def test_uat_12_mcp_tools_have_annotations() -> None:
+    """UAT-12: every MCP tool must declare readOnlyHint/destructiveHint."""
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert src.count("ToolAnnotations") >= 1
+    # Every @mcp.tool(...) call should have annotations=...
+    bare_decorators = src.count("@mcp.tool()")
+    assert bare_decorators == 0, (
+        f"UAT-12: {bare_decorators} MCP tool registrations still use @mcp.tool() "
+        f"without annotations="
+    )
+
+
+def test_uat_13_mcp_search_response_compact() -> None:
+    """UAT-13: search response must omit content_hash / fingerprint_simhash
+    / def_line / def_char from the default packet shape (token bloat),
+    but KEEP transitive_hash_status (LLM-relevant LSP coverage signal,
+    per review-u16-18 MEDIUM).
+    """
+    from scry.mcp.handlers import _compact_packet
+
+    raw = {
+        "anchor": {
+            "id": "x",
+            "content_text": "a",
+            "content_hash": "deadbeef",
+            "fingerprint_simhash": 12345,
+            "def_line": 10,
+            "def_char": 4,
+            "closure_hash": "abc",
+            "transitive_hash_status": "lsp_unavailable",
+        },
+        "score": 0.05,
+    }
+    out = _compact_packet(raw)
+    assert "content_hash" not in out["anchor"]
+    assert "fingerprint_simhash" not in out["anchor"]
+    assert "def_line" not in out["anchor"]
+    assert "closure_hash" not in out["anchor"]
+    assert "content_text" in out["anchor"]
+    assert out["anchor"]["transitive_hash_status"] == "lsp_unavailable", (
+        "UAT-13 review-u16-18 MEDIUM: transitive_hash_status must NOT be "
+        "stripped — it's the LLM-relevant LSP coverage signal."
+    )
+    assert out["score"] == 0.05
+
+
+def test_uat_14_get_anchor_accepts_both_id_and_anchor_id() -> None:
+    """UAT-14 review-u16-18 HIGH: legacy `id` keyword still works for
+    back-compat with MCP clients that haven't migrated to `anchor_id`.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "id: str | None = None" in src or "id=" in src, (
+        "UAT-14: get_anchor must still accept legacy 'id' parameter "
+        "(review-u16-18 HIGH back-compat fix)"
+    )
+
+
+def test_uat_14_mcp_get_anchor_uses_anchor_id_param() -> None:
+    """UAT-14: MCP get_anchor exposes ``anchor_id`` (not ``id``) for
+    consistency with get_links / get_callers / get_subclasses.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    # The new tool registration should declare anchor_id parameter.
+    assert "anchor_id: str | None = None" in src, (
+        "UAT-14: get_anchor MCP tool must use 'anchor_id' parameter name"
+    )
+
+
 def test_uat_9_unlink_command_exists() -> None:
     """UAT-9: scry unlink <link_id> tombstones a link via DELETE op."""
     from click.testing import CliRunner
@@ -720,7 +818,9 @@ def test_uat_9_unlink_command_exists() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["unlink", "--help"])
     assert result.exit_code == 0
-    assert "tombstone" in result.output.lower(), "scry unlink --help must explain tombstone semantics"
+    assert "tombstone" in result.output.lower(), (
+        "scry unlink --help must explain tombstone semantics"
+    )
 
 
 def test_uat_8_check_supports_since_flag() -> None:

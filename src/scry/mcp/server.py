@@ -141,27 +141,63 @@ class MCPServer:
         Each tool is a thin async closure that resolves the current
         :class:`~scry.mcp.handlers.MCPContext` and delegates to
         :func:`_dispatch`.
-        """
-        mcp = self._mcp
 
-        @mcp.tool()
+        UAT-11: tool descriptions are end-user-facing — visible to LLM
+        agents via ``tools/list``.  Internal dev notes ("UT3-2 fix",
+        "Wave 2 stub", "W6e — DESIGN.md line ...") have been removed
+        from the docstrings; rationale is preserved in code comments
+        below where appropriate.
+
+        UAT-12: every tool carries explicit ``readOnlyHint`` /
+        ``destructiveHint`` annotations so MCP clients (and LLM agents)
+        can distinguish safe queries from mutations without parsing
+        descriptions.
+        """
+        from mcp.types import ToolAnnotations
+
+        mcp = self._mcp
+        _read = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
+        _write = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+        _idem_write = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+
+        @mcp.tool(annotations=_read)
         async def search(
             query: str,
             types: list[str] | None = None,
             top_k: int = 10,
         ) -> list[dict[str, Any]]:
-            """Hybrid BM25 + vector retrieval over the indexed repository."""
+            """Hybrid BM25 + vector retrieval over the indexed repository.
+
+            Returns ranked anchor packets.  Use ``types`` to restrict to
+            ``["section"]``, ``["code"]``, or ``["code_in_doc"]``.
+            """
             return cast(
                 list[dict[str, Any]],
                 await self._dispatch("search", {"query": query, "types": types, "top_k": top_k}),
             )
 
-        @mcp.tool()
-        async def get_anchor(id: str) -> dict[str, Any] | None:
-            """Load a single anchor by primary ID (full content, no truncation)."""
-            return cast(dict[str, Any] | None, await self._dispatch("get_anchor", {"id": id}))
+        @mcp.tool(annotations=_read)
+        async def get_anchor(
+            anchor_id: str | None = None,
+            id: str | None = None,
+        ) -> dict[str, Any] | None:
+            """Load a single anchor by its primary ID (full content, no truncation).
 
-        @mcp.tool()
+            UAT-14: parameter renamed from ``id`` → ``anchor_id`` for
+            consistency with ``get_links`` / ``get_callers`` / etc.
+            The legacy ``id`` keyword is still accepted (review-u16-18
+            HIGH back-compat fix); supply EITHER ``anchor_id`` (preferred)
+            OR ``id``.
+            """
+            resolved = anchor_id if anchor_id is not None else id
+            if resolved is None:
+                raise MCPServerError("get_anchor requires 'anchor_id' (or legacy 'id')")
+            return cast(
+                dict[str, Any] | None,
+                await self._dispatch("get_anchor", {"id": resolved}),
+            )
+
+        @mcp.tool(annotations=_read)
         async def get_links(
             anchor_id: str,
             link_types: list[str] | None = None,
@@ -169,9 +205,9 @@ class MCPServer:
         ) -> dict[str, Any]:
             """Return active links for an anchor from the baseline ⊕ overlay table.
 
-            Returns a dict ``{"links": [...], "index_state": "..."}`` per
-            §7.3 (UT3-2 fix: was ``-> list`` which never matched the
-            handler's actual return shape).
+            Returns ``{"links": [...], "index_state": "..."}`` per §7.3.
+            Each link entry includes ``link_type``, drift status, and
+            content hashes.
             """
             return cast(
                 dict[str, Any],
@@ -181,15 +217,17 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_read)
         async def find_drift(
             scope: str | None = None,
             status_filter: list[str] | None = None,
         ) -> dict[str, Any]:
-            """Evaluate section-level drift for active links (Wave 2: section-only).
+            """Evaluate section-level drift for active links.
 
-            Returns a dict ``{"entries": [...], "index_state": "..."}`` per
-            §7.3 (UT3-3 fix: was ``-> list``).
+            Returns ``{"entries": [...], "index_state": "..."}`` per §7.3.
+            ``scope`` accepts a path-prefix glob; ``status_filter`` is
+            an allow-list of drift status values
+            (``"fresh"``, ``"code-changed"``, ``"spec-changed"``, etc.).
             """
             return cast(
                 dict[str, Any],
@@ -198,7 +236,7 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_write)
         async def propose_link(
             from_id: str,
             to_id: str,
@@ -206,7 +244,13 @@ class MCPServer:
             evidence: str | None = None,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
-            """Stage a new typed link in the current branch overlay."""
+            """Stage a new typed link in the current branch overlay.
+
+            Each invocation mints a new link_id; supply
+            ``idempotency_token`` to make retries safe (a duplicate
+            call with the same token returns the cached response
+            without re-executing).
+            """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
@@ -221,12 +265,17 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_write)
         async def accept_link(
             proposed_id: str,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
-            """Confirm an overlay-staged link proposal (Wave 2 stub — no status persistence)."""
+            """Confirm an overlay-staged link proposal.
+
+            Acknowledges a proposal and returns its current state.
+            Status persistence is currently a no-op; the call returns
+            the proposal record for client-side bookkeeping.
+            """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
@@ -235,16 +284,15 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_idem_write)
         async def commit_links(
             scope: str | None = None,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
             """Promote pending overlay records to the baseline link store.
 
-            Returns ``{"promoted": [...], "index_state": "..."}`` per
-            §7.3 (UT3-5 fix: was ``-> list[str]`` which dropped the
-            required index_state field).
+            Returns ``{"promoted": [...], "index_state": "..."}`` per §7.3.
+            Use ``scope`` to restrict the promotion to a path prefix.
             """
             return cast(
                 dict[str, Any],
@@ -254,23 +302,27 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_read)
         async def status() -> dict[str, Any]:
-            """Return current server + overlay status."""
+            """Return current server + overlay status (branch, HEAD, pending records)."""
             return cast(dict[str, Any], await self._dispatch("status", {}))
 
-        @mcp.tool()
+        @mcp.tool(annotations=_read)
         async def repo_summary() -> dict[str, Any]:
-            """Return a high-level repository summary with drift score (section-only)."""
+            """Return a high-level repository summary with section-level drift score."""
             return cast(dict[str, Any], await self._dispatch("repo_summary", {}))
 
-        @mcp.tool()
+        @mcp.tool(annotations=_idem_write)
         async def reindex(
             scope: str | None = None,
             force: bool = False,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
-            """Trigger an incremental (or forced) re-index of the repository."""
+            """Trigger an incremental (or forced) re-index of the repository.
+
+            ``force=True`` drops and rebuilds the entire index; use
+            sparingly.  ``scope`` is accepted but currently ignored.
+            """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
@@ -279,9 +331,13 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_read)
         async def get_callers(anchor_id: str, max_depth: int = 1) -> dict[str, Any]:
-            """Return symbols that CALL the given code anchor (W6e — DESIGN.md line 1444)."""
+            """Return symbols that CALL the given code anchor.
+
+            Requires an LSP for the anchor's language; without one
+            the response will indicate ``lsp_unavailable``.
+            """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
@@ -290,9 +346,13 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool()
+        @mcp.tool(annotations=_read)
         async def get_subclasses(anchor_id: str) -> dict[str, Any]:
-            """Return classes that EXTEND the given class anchor (W6e — DESIGN.md line 1445)."""
+            """Return classes that EXTEND the given class anchor.
+
+            Requires an LSP for the anchor's language; without one
+            the response will indicate ``lsp_unavailable``.
+            """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
