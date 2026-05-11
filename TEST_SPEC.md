@@ -10,7 +10,9 @@
 The `scry check` command evaluates all active links for drift and reports
 scores to stdout. It must support `--ci`, `--json`, `--strict`,
 `--since`, `--ignore-lsp-error`, and `--require-fresh-embedder` flags.
-Exit codes are defined as: 0 = clean, 1 = drift, 2 = operational error.
+Exit codes are: 0 = clean, 1 = drift detected, 2 = operational error.
+**CHANGED FOR PR-B SIM**: Added a new requirement — the check command must
+emit a machine-readable summary even when no links are scoped by --since.
 
 ---
 
