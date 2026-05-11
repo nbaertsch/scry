@@ -73,6 +73,8 @@ from scry.models import Anchor, AnchorType, Config, Frontmatter, IndexMetadata, 
 from scry.store.db import ScryDB, _now_iso, _upsert_anchor_in_txn
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from scry.lsp.manager import LSPManager
 
 __all__ = [
@@ -394,8 +396,21 @@ class Indexer:
 
         return ExtractionTarget(kind="skip")
 
-    def index(self, *, force: bool = False) -> IndexResult:
+    def index(
+        self,
+        *,
+        force: bool = False,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> IndexResult:
         """Build or refresh the vector store.
+
+        UAT-1: pass a *progress_callback* (e.g. CLI progress bar updater)
+        to receive ``(phase, processed_n, total_n, current_label)`` updates
+        during each long-running phase: ``"extract"`` (per file), ``"lsp"``
+        (per code anchor), and ``"embed"`` (per anchor).  Without a callback
+        the indexer is silent, preserving library-use semantics; with a
+        callback the CLI can emit a per-step line to stderr so 10-30 minute
+        runs are no longer indistinguishable from a hang.
 
         Incremental (``force=False``)
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -504,9 +519,12 @@ class Indexer:
 
             # ── Phase 1: Extract anchors from all files ──────────────────
             all_anchors: list[Anchor] = []
-            for path in files_to_process:
+            total_files = len(files_to_process)
+            for file_idx, path in enumerate(files_to_process, start=1):
                 target = self.classify_for_extraction(path)
                 if target.kind == "skip":
+                    if progress_callback is not None:
+                        progress_callback("extract", file_idx, total_files, path.name)
                     continue
 
                 rel = path.relative_to(self._repo_root).as_posix()
@@ -520,6 +538,8 @@ class Indexer:
                 all_anchors.extend(extracted)
                 files_processed += 1
                 anchors_extracted += len(extracted)
+                if progress_callback is not None:
+                    progress_callback("extract", file_idx, total_files, path.name)
 
             # Track which anchor IDs are newly extracted (vs. loaded from DB).
             newly_extracted_ids: set[str] = {a.id for a in all_anchors}
@@ -547,6 +567,7 @@ class Indexer:
                     self._repo_root,
                     max_depth=max_depth,
                     transitive_resolution=config.code_anchors.transitive_resolution,
+                    progress_callback=progress_callback,
                 )
                 try:
                     asyncio.get_running_loop()
@@ -569,9 +590,13 @@ class Indexer:
             if existing_enriched:
                 db.upsert_anchors(existing_enriched)
 
-            for anchor in all_anchors:
-                if anchor.id not in newly_extracted_ids:
-                    continue
+            # UAT-1 review-u1 MEDIUM #2: progress for the embed phase too.
+            # The CLI complaint was the multi-minute silent embedding pass;
+            # progress on extract alone hits 100% and then the user is back
+            # in the dark.
+            anchors_to_embed = [a for a in all_anchors if a.id in newly_extracted_ids]
+            embed_total = len(anchors_to_embed)
+            for embed_idx, anchor in enumerate(anchors_to_embed, start=1):
                 n = _process_anchor(
                     anchor,
                     db,
@@ -581,6 +606,8 @@ class Indexer:
                 )
                 anchors_embedded += 1
                 chunks_written += n
+                if progress_callback is not None:
+                    progress_callback("embed", embed_idx, embed_total, anchor.id)
 
             # ── Write index_metadata ─────────────────────────────────────
             indexed_branch = git_ctx.branch or f"detached-{git_ctx.head_short}"
@@ -728,6 +755,10 @@ class Indexer:
                     self._repo_root,
                     max_depth=max_depth,
                     transitive_resolution=config.code_anchors.transitive_resolution,
+                    # index_async is MCP-only today; no progress callback wired
+                    # into MCP responses.  TODO: stream progress for MCP reindex
+                    # via FastMCP server-sent updates if/when the protocol
+                    # supports it.
                 )
 
             # ── Phase 3: Embed and store ─────────────────────────────────
@@ -773,7 +804,11 @@ class Indexer:
             elapsed_seconds=elapsed,
         )
 
-    def reembed(self) -> IndexResult:
+    def reembed(
+        self,
+        *,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> IndexResult:
         """Surgical embedding-model migration (DESIGN.md §7.2.1).
 
         Re-embeds every anchor that still has a source file using the current
@@ -912,6 +947,8 @@ class Indexer:
                                 )
                                 chunks_written += 1
                         anchors_embedded += 1
+                        if progress_callback is not None:
+                            progress_callback("reembed", anchors_embedded, total, anchor.id)
 
                     # Commit updated index_metadata only in the final batch.
                     if is_final:
@@ -1199,6 +1236,7 @@ async def _enrich_all_with_lsp(
     max_depth: int,
     transitive_resolution: Literal["call_only", "full"] = "call_only",
     timeout_per_call: float = 10.0,
+    progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> list[Anchor]:
     """Run the LSP closure walk for every CODE anchor and return updated list.
 
@@ -1315,7 +1353,12 @@ async def _enrich_all_with_lsp(
                 )
 
             try:
-                for anchor in lang_anchors:
+                # UAT-1 review-u1-r2: emit per-anchor LSP progress so the
+                # potentially-long enrichment phase isn't silent.  We use
+                # the language-anchor count as the phase total — separate
+                # bars per language keep ETAs meaningful.
+                lsp_total = len(lang_anchors)
+                for anchor_idx, anchor in enumerate(lang_anchors, start=1):
                     abs_path = repo_root / anchor.path
                     file_uri = abs_path.as_uri()
 
@@ -1366,6 +1409,8 @@ async def _enrich_all_with_lsp(
                         }
                     )
                     anchor_callees[anchor.id] = result.callees
+                    if progress_callback is not None:
+                        progress_callback(f"lsp:{lang}", anchor_idx, lsp_total, anchor.id)
             finally:
                 # Always close opened documents to satisfy LSP protocol.
                 for uri in opened_uris:

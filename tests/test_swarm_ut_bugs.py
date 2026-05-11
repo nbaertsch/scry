@@ -569,6 +569,124 @@ def test_sr5_4_lang_from_anchor_id() -> None:
     assert _lsp_binary_for("zig") == "zls"
 
 
+# ─── UAT round-4 regression tests ─────────────────────────────────────────────
+
+
+def test_uat_1_indexer_emits_progress_for_all_phases(tmp_path: Path) -> None:
+    """UAT-1: Indexer.index() fires progress_callback for extract / lsp / embed.
+
+    Verifies the per-phase progress contract so the silent-burn UX bug
+    (UAT1's most painful moment) cannot regress.
+    """
+    import subprocess as _subprocess
+
+    from scry.config import load_config
+    from scry.embed import StubEmbedder
+    from scry.index import Indexer
+
+    repo = tmp_path
+    _subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "init",
+            "--allow-empty",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "a.py").write_text("def foo():\n    pass\n")
+    (repo / "spec.md").write_text("# Spec\n\nbody\n")
+
+    # Minimal config so load_config doesn't reach for .scry/config.yaml.
+    (repo / ".scry").mkdir()
+    (repo / ".scry" / "config.yaml").write_text(
+        "include:\n  - '**/*.py'\n  - '**/*.md'\nexclude: []\n"
+    )
+
+    config = load_config(repo)
+    embedder = StubEmbedder()
+    indexer = Indexer(repo, config=config, embedder=embedder, allow_untrusted=True)
+
+    events: list[tuple[str, int, int, str]] = []
+
+    def cb(phase: str, processed: int, total: int, label: str) -> None:
+        events.append((phase, processed, total, label))
+
+    indexer.index(force=True, progress_callback=cb)
+
+    # We expect at least one extract event AND at least one embed event.
+    phases_seen = {e[0] for e in events}
+    assert "extract" in phases_seen, (
+        f"UAT-1: progress_callback must fire for the extract phase; got phases={phases_seen}"
+    )
+    assert "embed" in phases_seen, (
+        f"UAT-1: progress_callback must ALSO fire for the embed phase per "
+        f"review-u1-r2 MEDIUM #1; got phases={phases_seen}"
+    )
+    # Final extract event should reach total.
+    extract_events = [e for e in events if e[0] == "extract"]
+    assert extract_events[-1][1] == extract_events[-1][2], (
+        "UAT-1: last extract progress event must reach total (n == total)"
+    )
+
+
+def test_uat_1_indexer_silent_when_no_callback(tmp_path: Path) -> None:
+    """UAT-1: Indexer remains library-pure (no stdout/stderr emission)
+    when no progress_callback is supplied — preserves MCP/library use.
+    """
+    import io
+    import subprocess as _subprocess
+    from contextlib import redirect_stderr, redirect_stdout
+
+    from scry.config import load_config
+    from scry.embed import StubEmbedder
+    from scry.index import Indexer
+
+    repo = tmp_path
+    _subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "i",
+            "--allow-empty",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "a.py").write_text("def foo(): pass\n")
+    (repo / ".scry").mkdir()
+    (repo / ".scry" / "config.yaml").write_text("include:\n  - '**/*.py'\nexclude: []\n")
+
+    config = load_config(repo)
+    embedder = StubEmbedder()
+    indexer = Indexer(repo, config=config, embedder=embedder, allow_untrusted=True)
+
+    out = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        indexer.index(force=True)
+    # Logger output may go to stderr depending on logging config but we
+    # don't assert on it here.  We only assert that the indexer didn't
+    # print to stdout via click/print directly.
+    assert out.getvalue() == "", (
+        f"UAT-1: Indexer must be silent on stdout when no progress_callback; "
+        f"got: {out.getvalue()!r}"
+    )
+
+
 # ─── SR2 concurrency regression tests ─────────────────────────────────────────
 
 

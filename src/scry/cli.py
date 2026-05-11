@@ -403,8 +403,14 @@ def init(ctx: click.Context, force: bool, register_global: bool) -> None:
     is_flag=True,
     help="Re-embed existing anchors with the current model (preserves anchors, links).",
 )
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress per-file progress output (UAT-1).",
+)
 @click.pass_context
-def index(ctx: click.Context, force: bool, reembed: bool) -> None:
+def index(ctx: click.Context, force: bool, reembed: bool, quiet: bool) -> None:
     """Build or refresh the vector store.
 
     ``--force`` and ``--reembed`` are mutually exclusive.
@@ -428,10 +434,57 @@ def index(ctx: click.Context, force: bool, reembed: bool) -> None:
     )
 
     try:
-        if reembed:
-            result: IndexResult = indexer.reembed()
+        # UAT-1 (review-u1): the CLI reports per-phase progress through a
+        # single callback the indexer fires during extract / lsp / embed
+        # (and reembed for the --reembed path).  --quiet truly suppresses
+        # output (the callback is None); non-TTY emits a sparse stderr
+        # line every 25 items per phase; TTY uses click.progressbar.
+        if quiet:
+            cb = None
+        elif not sys.stderr.isatty():
+            phase_state: dict[str, int] = {}
+
+            def _progress_log(phase: str, processed: int, total: int, label: str) -> None:
+                last = phase_state.get(phase, 0)
+                if processed - last >= 25 or processed == total or processed == 1:
+                    click.echo(
+                        f"  {phase} {processed}/{total} ({label})",
+                        err=True,
+                    )
+                    phase_state[phase] = processed
+
+            cb = _progress_log
         else:
-            result = indexer.index(force=force)
+            # TTY: one progressbar per phase.  We close+reopen as the
+            # phase changes so the ETA stays meaningful.
+            bar_state: dict[str, Any] = {"phase": None, "bar": None}
+
+            def _progress_bar(phase: str, processed: int, total: int, label: str) -> None:
+                if bar_state["phase"] != phase:
+                    if bar_state["bar"] is not None:
+                        bar_state["bar"].render_finish()
+                    bar_state["bar"] = click.progressbar(
+                        length=max(total, 1),
+                        label=phase,
+                        file=sys.stderr,
+                    )
+                    bar_state["bar"].render_progress()
+                    bar_state["phase"] = phase
+                bar_state["bar"].update(1, current_item=label)
+
+            cb = _progress_bar
+
+        try:
+            if reembed:
+                result: IndexResult = indexer.reembed(progress_callback=cb)
+            else:
+                result = indexer.index(force=force, progress_callback=cb)
+        finally:
+            # Make sure any outstanding TTY bar is closed cleanly.
+            if not quiet and sys.stderr.isatty():
+                final_bar = bar_state.get("bar") if "bar_state" in dir() else None
+                if final_bar is not None:
+                    final_bar.render_finish()
     except (IndexerError, LockTimeout) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(1) from None
