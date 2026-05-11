@@ -711,6 +711,57 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_24_js_require_calls_not_extracted_as_anchors(tmp_path: Path) -> None:
+    """UAT-24: ``const x = require('y')`` and ``const x = require('y').member``
+    must not produce anchors (CommonJS module imports, not real symbols).
+    """
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"const fs = require('fs');\n"
+        b"const path = require('path');\n"
+        b"const read = require('fs').readFileSync;\n"  # member-form
+        b"const realThing = function() { return 1; };\n"
+        b"const realArrow = (x) => x + 1;\n"
+    )
+    f = tmp_path / "lib.js"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="javascript")
+    names = {a.symbol_name for a in anchors}
+    assert "fs" not in names, "UAT-24: require('fs') must not be extracted"
+    assert "path" not in names, "UAT-24: require('path') must not be extracted"
+    assert "read" not in names, (
+        "UAT-24 review-u7 MEDIUM: require('fs').readFileSync alias must also "
+        "be filtered (member-form)"
+    )
+    assert "realThing" in names, "real const arrow / fn should still be extracted"
+    assert "realArrow" in names
+
+
+def test_uat_25_rust_impl_method_symbol_name_avoids_collision(tmp_path: Path) -> None:
+    """UAT-25: distinct Rust impl methods sharing a method name must NOT
+    collide on symbol_name (which is used for retrieval grouping).
+    """
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"pub struct User {}\n"
+        b"pub struct Order {}\n"
+        b"impl User { pub fn validate(&self) -> bool { true } }\n"
+        b"impl Order { pub fn validate(&self) -> bool { true } }\n"
+    )
+    f = tmp_path / "m.rs"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="rust")
+    impl_methods = [a for a in anchors if "validate" in a.id and "impl_" in a.id]
+    assert len(impl_methods) == 2, f"expected 2 impl methods named validate; got {impl_methods}"
+    sym_names = {a.symbol_name for a in impl_methods}
+    assert len(sym_names) == 2, (
+        f"UAT-25: impl_User.validate and impl_Order.validate must have distinct "
+        f"symbol_name values; got {sym_names}"
+    )
+
+
 def test_uat_23_reembed_runs_wal_checkpoint() -> None:
     """UAT-23 review-u4-u6 HIGH: reembed must also checkpoint the WAL so
     embedding-model migrations are visible to read-only consumers

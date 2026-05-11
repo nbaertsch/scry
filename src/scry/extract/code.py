@@ -316,6 +316,41 @@ def _walk_python(
 # ---------------------------------------------------------------------------
 
 
+def _ts_initializer_is_require_import(declarator: Any, src: bytes) -> bool:
+    """Return True if a TS/JS variable_declarator's value is a CommonJS import.
+
+    UAT-24 / review-u7 MEDIUM: handles both ``const x = require('y')`` and
+    ``const x = require('y').member`` (member_expression rooted at a bare
+    ``require(...)`` call).  ``module.require(...)`` is NOT treated as a
+    CommonJS import (the call expression's function is a member_expression,
+    not a bare ``require``).  ``require.resolve(...)`` is also NOT treated
+    as an import (the function is a member_expression on require).
+    """
+
+    def _is_bare_require_call(call_node: Any) -> bool:
+        if call_node.type != "call_expression":
+            return False
+        fn = _child_of_type(call_node, "identifier")
+        if fn is None:
+            return False
+        fn_text = src[fn.start_byte : fn.end_byte].decode("utf-8", errors="replace")
+        return fn_text == "require"
+
+    # Direct: ``const x = require('y')``
+    direct = _child_of_type(declarator, "call_expression")
+    if direct is not None and _is_bare_require_call(direct):
+        return True
+    # Member: ``const x = require('y').member`` parses as
+    # member_expression → object: call_expression → fn: identifier(require)
+    member = _child_of_type(declarator, "member_expression")
+    if member is not None:
+        # The leftmost child of member_expression should be the call.
+        for child in member.children:
+            if child.type == "call_expression" and _is_bare_require_call(child):
+                return True
+    return False
+
+
 def _ts_symbol_name(node: Any, src: bytes) -> str | None:
     """Return the identifier for a TypeScript top-level declaration."""
     # SR5-2: ``lexical_declaration`` (e.g. ``const fn = () => {}``) wraps
@@ -326,6 +361,14 @@ def _ts_symbol_name(node: Any, src: bytes) -> str | None:
         if declarator is not None:
             ident = _child_of_type(declarator, "identifier", "property_identifier")
             if ident is not None:
+                # UAT-24: skip ``const x = require('y')`` (or any call_expression
+                # whose function is a bare ``require`` identifier).  Per
+                # review-u7 MEDIUM: also catch ``const x = require('y').member``
+                # which parses as a member_expression rooted at a require call.
+                # ``module.require(...)`` and ``require.resolve(...)`` are out
+                # of scope (latter is a method call ON require, not require()).
+                if _ts_initializer_is_require_import(declarator, src):
+                    return None
                 return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
         return None
     # Most TS declarations use ``identifier`` or ``type_identifier`` as the
@@ -820,8 +863,25 @@ def _make_anchor(
     # collision suffix AND the `@<sig-hash>` overload suffix stripped, to
     # keep it human-readable.  The suffix-stripping regex matches `@`
     # followed by digits (collision) OR by hex chars (sig hash).
-    leaf = symbol_path.split(".")[-1]
-    symbol_name = _re.sub(r"@(?:\d+|[0-9a-f]+)$", "", leaf)
+    #
+    # UAT-25: Rust impl methods are qualified as ``impl_<Type>.<method>``
+    # (e.g. ``impl_User.validate``).  Stripping to the leaf collapses
+    # ``impl_User.validate`` and ``impl_Order.validate`` both to
+    # ``validate`` — a collision hazard.  For ``impl_*.<method>`` paths
+    # in Rust source files we retain the full qualified path as
+    # ``symbol_name`` so distinct impls of the same method name remain
+    # distinguishable.  Per review-u7 LOW: scoping by the path's .rs
+    # extension prevents accidental cross-language API drift (e.g. a
+    # Python class literally named ``impl_User`` would otherwise also
+    # be affected).
+    is_rust_impl = (
+        path_str.endswith(".rs") and symbol_path.startswith("impl_") and "." in symbol_path
+    )
+    if is_rust_impl:
+        symbol_name = _re.sub(r"@(?:\d+|[0-9a-f]+)$", "", symbol_path)
+    else:
+        leaf = symbol_path.split(".")[-1]
+        symbol_name = _re.sub(r"@(?:\d+|[0-9a-f]+)$", "", leaf)
 
     return Anchor(
         id=f"{path_str}:{symbol_path}",
