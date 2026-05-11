@@ -515,7 +515,25 @@ class LiteLLMProvider:
         try:
             resp: Any = await self._litellm.acompletion(**kwargs)
         except Exception as exc:
-            # LiteLLM raises its own exception hierarchy; normalize to LLMError.
+            # LiteLLM raises its own exception hierarchy; normalize to
+            # LLMError, but route obvious connection-class failures to
+            # LLMNetworkError so the suggest-links fail-fast path
+            # (UAT-2) can short-circuit instead of iterating 800 batches.
+            msg = str(exc).lower()
+            cls = type(exc).__name__.lower()
+            if (
+                "connection" in msg
+                or "refused" in msg
+                or "unreachable" in msg
+                or "timeout" in msg
+                or "timed out" in msg
+                or "no route to host" in msg
+                or "name or service not known" in msg
+                or "connect" in cls
+                or "timeout" in cls
+                or "network" in cls
+            ):
+                raise LLMNetworkError(f"LiteLLM network error: {exc}") from exc
             raise LLMError(f"LiteLLM error: {exc}") from exc
 
         # Wrap response parsing too — incompatible LiteLLM versions can raise

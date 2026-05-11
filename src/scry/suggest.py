@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from scry.embed import Embedder
-from scry.llm import LLMError, LLMJSONModeError, LLMProvider, LLMRequest
+from scry.llm import LLMError, LLMJSONModeError, LLMNetworkError, LLMProvider, LLMRequest
 from scry.models import Anchor, AnchorType, Link, LinkId, RetrievalConfig
 from scry.retrieve import hybrid_search
 from scry.store.db import ScryDB
@@ -390,6 +390,16 @@ async def batch_llm_evaluate(
 
         try:
             resp = await provider.complete(req)
+        except LLMNetworkError:
+            # UAT-2: connection errors mean the LLM is unreachable
+            # (down / wrong port / firewalled).  Iterating the remaining
+            # 800+ candidate pairs printing the same error per batch is
+            # a 5-minute time-sink with zero useful output.  Abort
+            # IMMEDIATELY on the first network failure; the CLI owns the
+            # user-facing error message via its `except LLMError` clause.
+            # Other LLMError subclasses (rate limits, bad JSON) remain
+            # per-batch since those can be transient.
+            raise
         except LLMJSONModeError as exc:
             logger.warning(
                 "suggest-links: LLM returned non-JSON for batch at index %d: %s",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -605,7 +606,7 @@ def test_uat_1_indexer_emits_progress_for_all_phases(tmp_path: Path) -> None:
     (repo / "spec.md").write_text("# Spec\n\nbody\n")
 
     # Minimal config so load_config doesn't reach for .scry/config.yaml.
-    (repo / ".scry").mkdir()
+    (repo / ".scry").mkdir(exist_ok=True)
     (repo / ".scry" / "config.yaml").write_text(
         "include:\n  - '**/*.py'\n  - '**/*.md'\nexclude: []\n"
     )
@@ -637,7 +638,146 @@ def test_uat_1_indexer_emits_progress_for_all_phases(tmp_path: Path) -> None:
     )
 
 
+async def test_uat_2_litellm_connection_error_normalized_to_network_error() -> None:
+    """UAT-2 review-u2: LiteLLMProvider must normalize connection-class
+    exceptions (litellm.exceptions.APIConnectionError, etc.) to
+    LLMNetworkError so the suggest-links fail-fast path triggers in
+    real-world Ollama-via-LiteLLM scenarios, not just synthetic ones.
+    """
+    pytest.importorskip("litellm")
+    from scry.llm import LiteLLMProvider, LLMConfig, LLMError, LLMNetworkError, LLMRequest
+
+    cfg = LLMConfig(provider="litellm", model="ollama/llama3.2")
+    provider = LiteLLMProvider(cfg)
+
+    class _ConnectionRefused(Exception):
+        def __str__(self) -> str:
+            return "Connection refused: cannot reach http://localhost:11434"
+
+    async def _stub_acompletion(**_kw: object) -> object:
+        raise _ConnectionRefused()
+
+    provider._litellm.acompletion = _stub_acompletion  # type: ignore[attr-defined]
+
+    raised: BaseException | None = None
+    try:
+        await provider.complete(LLMRequest(system="s", messages=[{"role": "user", "content": "h"}]))
+    except BaseException as exc:
+        raised = exc
+
+    assert isinstance(raised, LLMNetworkError), (
+        f"UAT-2: connection-class exceptions must be normalized to LLMNetworkError; "
+        f"got {type(raised).__name__}: {raised}"
+    )
+    assert isinstance(raised, LLMError), "LLMNetworkError must remain a LLMError subclass"
+
+
+async def test_uat_2_suggest_links_fails_fast_on_network_error() -> None:
+    """UAT-2: evaluate_pairs_batched MUST abort on the first batch when an
+    LLMNetworkError fires, instead of iterating 800+ pairs printing the
+    same error per batch (UAT2's 5-minute time-sink).
+    """
+    from scry.llm import LLMError, LLMNetworkError, LLMRequest, LLMResponse
+    from scry.models import Anchor, AnchorType
+    from scry.suggest import batch_llm_evaluate
+
+    call_count = 0
+
+    class _UnreachableProvider:
+        async def complete(self, req: LLMRequest) -> LLMResponse:
+            nonlocal call_count
+            call_count += 1
+            raise LLMNetworkError("Ollama is not reachable at http://localhost:11434")
+
+    pairs = []
+    for i in range(100):
+        code = Anchor(
+            id=f"src/m{i}.py:f",
+            type=AnchorType.CODE.value,
+            path=f"src/m{i}.py",
+            symbol_name="f",
+            content_text="def f(): pass",
+            content_hash="sha256:" + "0" * 64,
+            fingerprint_simhash=0,
+        )
+        doc = Anchor(
+            id=f"d/s{i}.md::sec",
+            type=AnchorType.SECTION.value,
+            path=f"d/s{i}.md",
+            heading_path=("sec",),
+            content_text="spec",
+            content_hash="sha256:" + "0" * 64,
+            fingerprint_simhash=0,
+        )
+        pairs.append((code, doc))
+
+    try:
+        await batch_llm_evaluate(
+            pairs,
+            provider=cast("Any", _UnreachableProvider()),
+            batch_size=20,
+        )
+    except LLMNetworkError:
+        pass
+    except LLMError as exc:
+        raise AssertionError(
+            f"UAT-2: expected LLMNetworkError to abort the loop; got {type(exc).__name__}: {exc}"
+        ) from exc
+    else:
+        raise AssertionError(
+            "UAT-2: expected LLMNetworkError to abort the loop; nothing was raised"
+        )
+
+    assert call_count == 1, (
+        f"UAT-2: must fail-fast on first network error; got call_count={call_count} "
+        f"(was 5 before the fix — that's the 800-pair iteration bug)"
+    )
+
+
 def test_uat_1_indexer_silent_when_no_callback(tmp_path: Path) -> None:
+    """UAT-1: Indexer remains library-pure (no stdout emission)
+    when no progress_callback is supplied — preserves MCP/library use.
+    """
+    import io
+    import subprocess as _subprocess
+    from contextlib import redirect_stdout
+
+    from scry.config import load_config
+    from scry.embed import StubEmbedder
+    from scry.index import Indexer
+
+    repo = tmp_path
+    _subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    _subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "i",
+            "--allow-empty",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "a.py").write_text("def foo(): pass\n")
+    (repo / ".scry").mkdir(exist_ok=True)
+    (repo / ".scry" / "config.yaml").write_text("include:\n  - '**/*.py'\nexclude: []\n")
+
+    config = load_config(repo)
+    embedder = StubEmbedder()
+    indexer = Indexer(repo, config=config, embedder=embedder, allow_untrusted=True)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        indexer.index(force=True)
+    assert out.getvalue() == "", (
+        f"UAT-1: Indexer must be silent on stdout when no progress_callback; "
+        f"got: {out.getvalue()!r}"
+    )
     """UAT-1: Indexer remains library-pure (no stdout/stderr emission)
     when no progress_callback is supplied — preserves MCP/library use.
     """
@@ -667,7 +807,7 @@ def test_uat_1_indexer_silent_when_no_callback(tmp_path: Path) -> None:
         check=True,
     )
     (repo / "a.py").write_text("def foo(): pass\n")
-    (repo / ".scry").mkdir()
+    (repo / ".scry").mkdir(exist_ok=True)
     (repo / ".scry" / "config.yaml").write_text("include:\n  - '**/*.py'\nexclude: []\n")
 
     config = load_config(repo)
