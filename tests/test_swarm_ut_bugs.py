@@ -434,6 +434,101 @@ def test_sr1_4_daemon_exits_when_not_leader() -> None:
     )
 
 
+# ─── SR5 polyglot regression tests ────────────────────────────────────────────
+
+
+def test_sr5_1_go_extraction(tmp_path: Path) -> None:
+    """SR5-1: Go source extracts function/method/type anchors."""
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"package main\n"
+        b"type Service struct { name string }\n"
+        b"type Handler interface { Handle() string }\n"
+        b"func NewService() *Service { return &Service{} }\n"
+        b"func (s *Service) Hello(name string) string { return s.name }\n"
+        b"type Alias = string\n"
+    )
+    f = tmp_path / "h.go"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="go")
+    names = {a.symbol_name for a in anchors}
+    assert "NewService" in names, "Go function_declaration must be extracted (SR5-1)"
+    assert "Service" in names, "Go struct via type_declaration must be extracted (SR5-1)"
+    assert "Handler" in names, "Go interface via type_declaration must be extracted (SR5-1)"
+    assert "Alias" in names, "Go type alias must be extracted (SR5-1)"
+    # Receiver method gets qualified path Service.Hello
+    qualified = {a.id.split(":", 1)[1] for a in anchors}
+    assert "Service.Hello" in qualified, "Go receiver method must be qualified (SR5-1)"
+
+
+def test_sr5_1_rust_extraction(tmp_path: Path) -> None:
+    """SR5-1: Rust source extracts fn/struct/trait/impl/macro anchors."""
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+        b"pub struct Config { name: String }\n"
+        b"pub trait Handler { fn handle(&self) -> String; }\n"
+        b"impl Config { pub fn new() -> Self { Self { name: String::new() } } }\n"
+        b"macro_rules! my_macro { () => { () } }\n"
+        b"pub enum Status { Ok, Err }\n"
+    )
+    f = tmp_path / "m.rs"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="rust")
+    names = {a.symbol_name for a in anchors}
+    assert "add" in names, "Rust pub fn must be extracted (SR5-1)"
+    assert "Config" in names, "Rust struct must be extracted (SR5-1)"
+    assert "Handler" in names, "Rust trait must be extracted (SR5-1)"
+    assert "my_macro" in names, "Rust macro_rules must be extracted (SR5-1)"
+    assert "Status" in names, "Rust enum must be extracted (SR5-1)"
+    # Impl methods get qualified path impl_<Type>.<method>
+    qualified = {a.id.split(":", 1)[1] for a in anchors}
+    assert "impl_Config.new" in qualified, "Rust impl method must be qualified (SR5-1)"
+
+
+def test_sr5_2_typescript_export_const_arrow(tmp_path: Path) -> None:
+    """SR5-2: TypeScript `export const fn = () => {}` produces an anchor."""
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"export const createContext = (id: string): any => ({});\n"
+        b"export enum StatusCode { OK = 200 }\n"
+        b"export namespace Config { export const PORT = 3000; }\n"
+    )
+    f = tmp_path / "s.ts"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="typescript")
+    names = {a.symbol_name for a in anchors}
+    assert "createContext" in names, "TS export const arrow fn must be extracted (SR5-2)"
+    assert "StatusCode" in names, "TS export enum must be extracted (SR5-2)"
+    assert "Config" in names, "TS export namespace must be extracted (SR5-2)"
+
+
+def test_sr5_3_javascript_arrow_and_class_expression(tmp_path: Path) -> None:
+    """SR5-3: JavaScript `const fn = () =>` and `const Cls = class {}` indexed."""
+    from scry.extract.code import extract_code_symbols
+
+    src = (
+        b"const delay = (ms) => new Promise((r) => setTimeout(r, ms));\n"
+        b"const Cache = class { constructor() {} };\n"
+    )
+    f = tmp_path / "l.js"
+    f.write_bytes(src)
+    anchors = extract_code_symbols(f, tmp_path, language="javascript")
+    names = {a.symbol_name for a in anchors}
+    assert "delay" in names, "JS const arrow fn must be extracted (SR5-3)"
+    assert "Cache" in names, "JS const class expression must be extracted (SR5-3)"
+
+
+def test_sr5_7_watch_ignores_vendor_dir() -> None:
+    """SR5-7: cmd_watch._IGNORE_DIRS includes Go's vendor/ directory."""
+    from scry.cmd_watch import _IGNORE_DIRS
+
+    assert "vendor" in _IGNORE_DIRS, "watch must ignore vendor/ (SR5-7)"
+
+
 def test_sr1_5_pyproject_filterwarnings_includes_authlib() -> None:
     """SR1-5: pyproject ``filterwarnings`` MUST include the AuthlibDeprecationWarning
     ignore so pytest's per-test warning-filter reset doesn't undo the
@@ -450,4 +545,88 @@ def test_sr1_5_pyproject_filterwarnings_includes_authlib() -> None:
     assert matches, (
         "pyproject [tool.pytest.ini_options].filterwarnings must include "
         "an ignore for AuthlibDeprecationWarning (SR1-5)"
+    )
+
+
+def test_sr5_4_lang_from_anchor_id() -> None:
+    """SR5-4: callers/subclasses must derive language from anchor ID extension."""
+    from scry.cli import _lang_from_anchor_id, _lsp_binary_for
+
+    assert _lang_from_anchor_id("src/foo.py:bar") == "python"
+    assert _lang_from_anchor_id("src/foo.ts:bar") == "typescript"
+    assert _lang_from_anchor_id("src/foo.go:Bar") == "go"
+    assert _lang_from_anchor_id("src/foo.rs:Bar.baz") == "rust"
+    assert _lang_from_anchor_id("src/foo.zig:bar") == "zig"
+    # Unknown extensions fall back to python (preserves historical behaviour)
+    assert _lang_from_anchor_id("src/foo.unknown:bar") == "python"
+
+    assert _lsp_binary_for("python") == "pyright-langserver"
+    assert _lsp_binary_for("typescript") == "typescript-language-server"
+    assert _lsp_binary_for("go") == "gopls"
+    assert _lsp_binary_for("rust") == "rust-analyzer"
+    assert _lsp_binary_for("zig") == "zls"
+
+
+# ─── SR2 concurrency regression tests ─────────────────────────────────────────
+
+
+async def test_sr2_1_ipc_idempotency_serializes_concurrent_same_token() -> None:
+    """SR2-1 BLOCKING: 3 concurrent same-token IPC requests MUST execute the
+    handler exactly once.  Previously the check-then-execute-then-store
+    sequence had a TOCTOU window where 2-3 of 3 concurrent calls would
+    all see a cache miss and all run the handler.
+    """
+    import asyncio as _asyncio
+
+    from scry.process.ipc import (
+        IPCConfig,
+        IPCRequest,
+        IPCResponse,
+        _IdempotencyCache,
+        _run_dispatch_logic,
+    )
+
+    handler_calls = 0
+
+    async def slow_handler(req: IPCRequest) -> IPCResponse:
+        nonlocal handler_calls
+        handler_calls += 1
+        await _asyncio.sleep(0.05)
+        return IPCResponse(request_id=req.request_id, ok=True, result={"n": handler_calls})
+
+    cache = _IdempotencyCache(maxsize=10)
+    cfg = IPCConfig()
+    from scry.models import new_idempotency_token
+
+    token = new_idempotency_token()  # generates a valid tok_<alphanum>
+    reqs = [
+        IPCRequest(
+            request_id=i,
+            op="propose_link",
+            args={"x": 1},
+            idempotency_token=token,
+        )
+        for i in range(3)
+    ]
+    responses = await _asyncio.gather(
+        *[_run_dispatch_logic(r, slow_handler, cache, cfg) for r in reqs]
+    )
+    assert handler_calls == 1, (
+        f"handler must run exactly once for 3 concurrent same-token requests; "
+        f"got {handler_calls} (SR2-1 BLOCKING regression)"
+    )
+    assert all(r.ok for r in responses)
+    # All 3 responses share the same payload (the first one's).
+    payloads = {r.result["n"] if r.result else None for r in responses}
+    assert payloads == {1}, f"all responses must mirror the first handler's result; got {payloads}"
+
+
+def test_sr2_4_ipc_client_docstring_no_longer_claims_not_implemented() -> None:
+    """SR2-4: IPCClient docstring must NOT claim Windows raises NotImplementedError."""
+    from scry.process.ipc import IPCClient
+
+    doc = IPCClient.__doc__ or ""
+    assert "NotImplementedError" not in doc, (
+        "IPCClient docstring is stale — Windows IPC is fully implemented "
+        "via _WinPipeIO (Wave 6b).  Remove the NotImplementedError claim."
     )

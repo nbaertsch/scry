@@ -84,16 +84,43 @@ _DEFAULT_SYMBOL_KINDS: dict[str, list[str]] = {
         "class_declaration",
         "interface_declaration",
         "type_alias_declaration",
+        # SR5-2: catch ``export const fn = () => {}`` / ``export const Cls = class {}``
+        "lexical_declaration",
+        "enum_declaration",
+        "internal_module",  # tree-sitter TS spelling for ``namespace N {}``
     ],
     "tsx": [
         "function_declaration",
         "class_declaration",
         "interface_declaration",
         "type_alias_declaration",
+        "lexical_declaration",
+        "enum_declaration",
+        "internal_module",
     ],
-    "javascript": ["function_declaration", "class_declaration"],
-    "jsx": ["function_declaration", "class_declaration"],
+    # SR5-3: JS arrow fns / class expressions live inside lexical_declaration
+    "javascript": ["function_declaration", "class_declaration", "lexical_declaration"],
+    "jsx": ["function_declaration", "class_declaration", "lexical_declaration"],
     "zig": ["FnProto", "ContainerDecl"],
+    # SR5-1: Go top-level declarations.  ``method_declaration`` covers
+    # receiver methods (``func (s *T) Bar()``); ``type_declaration``
+    # wraps ``type_spec`` / ``type_alias`` for struct, interface, alias.
+    "go": [
+        "function_declaration",
+        "method_declaration",
+        "type_declaration",
+    ],
+    # SR5-1: Rust items.  ``impl_item`` so we capture method bodies via
+    # the impl walker; ``macro_definition`` for ``macro_rules!``.
+    "rust": [
+        "function_item",
+        "struct_item",
+        "trait_item",
+        "impl_item",
+        "macro_definition",
+        "enum_item",
+        "type_item",
+    ],
 }
 
 # Normalise user-supplied language names → tree-sitter-language-pack grammar names.
@@ -107,6 +134,13 @@ _GRAMMAR_NAME: dict[str, str] = {
     "js": "javascript",
     "jsx": "jsx",
     "zig": "zig",
+    # SR5-1: Go and Rust grammars are bundled with tree_sitter_language_pack
+    # and were already routed by index._EXT_TO_LANG; we just need the
+    # walkers (defined below).
+    "go": "go",
+    "golang": "go",
+    "rust": "rust",
+    "rs": "rust",
 }
 
 _DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB (matches IndexConfig default)
@@ -284,6 +318,16 @@ def _walk_python(
 
 def _ts_symbol_name(node: Any, src: bytes) -> str | None:
     """Return the identifier for a TypeScript top-level declaration."""
+    # SR5-2: ``lexical_declaration`` (e.g. ``const fn = () => {}``) wraps
+    # one or more ``variable_declarator`` children whose first child is
+    # the identifier we want.  Pull the FIRST declarator's name.
+    if node.type == "lexical_declaration":
+        declarator = _child_of_type(node, "variable_declarator")
+        if declarator is not None:
+            ident = _child_of_type(declarator, "identifier", "property_identifier")
+            if ident is not None:
+                return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+        return None
     # Most TS declarations use ``identifier`` or ``type_identifier`` as the
     # second child (after keyword).
     for child in node.children:
@@ -527,6 +571,221 @@ def _walk_zig(
 
 
 # ---------------------------------------------------------------------------
+# Go extraction (SR5-1)
+# ---------------------------------------------------------------------------
+
+
+def _go_method_receiver_type(method_node: Any, src: bytes) -> str | None:
+    """Return the (struct) type name from a Go ``method_declaration`` receiver.
+
+    A receiver looks like ``func (s *Service) Bar()`` or
+    ``func (s Service) Bar()``.  We pull the unqualified type name from
+    the first ``parameter_list`` (the receiver list, which always
+    precedes the method name).
+    """
+    receiver = _child_of_type(method_node, "parameter_list")
+    if receiver is None:
+        return None
+    decl = _child_of_type(receiver, "parameter_declaration")
+    if decl is None:
+        return None
+    # Pointer receiver: pointer_type → type_identifier
+    pointer = _child_of_type(decl, "pointer_type")
+    if pointer is not None:
+        ident = _child_of_type(pointer, "type_identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+    # Value receiver: type_identifier directly under parameter_declaration
+    ident = _child_of_type(decl, "type_identifier")
+    if ident is not None:
+        return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _go_symbol_name(node: Any, src: bytes) -> str | None:
+    """Return the qualified symbol name for a Go top-level declaration.
+
+    * ``function_declaration`` → ``Foo`` (identifier child)
+    * ``method_declaration``   → ``Service.Bar`` (receiver type + field_identifier)
+    * ``type_declaration``     → ``Service`` (type_spec/type_alias child's type_identifier)
+    """
+    if node.type == "function_declaration":
+        ident = _child_of_type(node, "identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+        return None
+    if node.type == "method_declaration":
+        # field_identifier holds the method name (after the receiver list).
+        method_name_node = _child_of_type(node, "field_identifier")
+        if method_name_node is None:
+            return None
+        method_name = src[method_name_node.start_byte : method_name_node.end_byte].decode(
+            "utf-8", errors="replace"
+        )
+        receiver_type = _go_method_receiver_type(node, src)
+        if receiver_type is not None:
+            return f"{receiver_type}.{method_name}"
+        return method_name
+    if node.type == "type_declaration":
+        # type_declaration wraps either type_spec (struct/interface/alias)
+        # or type_alias (the explicit ``type T = U`` form).
+        spec = _child_of_type(node, "type_spec", "type_alias")
+        if spec is None:
+            return None
+        ident = _child_of_type(spec, "type_identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+        return None
+    return None
+
+
+def _walk_go(
+    nodes: list[Any],
+    src: bytes,
+    kinds: set[str],
+) -> list[_PyRec]:
+    """Return (symbol_path, raw_content) records from Go source nodes.
+
+    Top-level Go declarations are direct children of ``source_file`` so
+    we iterate without recursion (tree-sitter's Go grammar already
+    surfaces method receivers via ``method_declaration``).
+    """
+    raw_names: list[str] = []
+    raw_entries: list[tuple[str, str, int, int]] = []
+
+    for node in nodes:
+        if node.type not in kinds:
+            continue
+        name = _go_symbol_name(node, src)
+        if name is None:
+            continue
+        raw_names.append(name)
+        raw_entries.append((name, _node_text(node, src), node.start_point[0], node.start_point[1]))
+
+    resolved = _apply_collisions(raw_names)
+    results: list[_PyRec] = []
+    for (_, content, def_line, def_char), resolved_name in zip(raw_entries, resolved, strict=True):
+        results.append((resolved_name, content, def_line, def_char))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Rust extraction (SR5-1)
+# ---------------------------------------------------------------------------
+
+
+def _rust_symbol_name(node: Any, src: bytes) -> str | None:
+    """Return the symbol name for a Rust top-level item.
+
+    Most Rust items expose a ``type_identifier`` (struct/trait/enum/type)
+    or ``identifier`` (fn/macro) child.  ``impl_item`` is special: its
+    name is the type being implemented.
+    """
+    if node.type == "function_item":
+        ident = _child_of_type(node, "identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+    elif node.type in ("struct_item", "trait_item", "enum_item", "type_item"):
+        ident = _child_of_type(node, "type_identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+    elif node.type == "impl_item":
+        # Impl block: the implemented type appears as type_identifier.
+        # For ``impl Trait for Type`` we'd ideally encode both; for now
+        # we use the LAST type_identifier child which is the receiver
+        # type.  Distinct impls on the same type get @N collision suffixes.
+        type_idents = [c for c in node.children if c.type == "type_identifier"]
+        if type_idents:
+            ident = type_idents[-1]
+            return "impl_" + src[ident.start_byte : ident.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+    elif node.type == "macro_definition":
+        ident = _child_of_type(node, "identifier")
+        if ident is not None:
+            return src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _walk_rust_impl_methods(impl_node: Any, src: bytes, impl_name: str) -> list[_PyRec]:
+    """Extract method ``function_item`` anchors from a Rust ``impl_item`` body.
+
+    Rust impl blocks contain method definitions inside a ``declaration_list``
+    child.  Each method's symbol path is qualified as ``<impl_name>.<method>``.
+    """
+    body = _child_of_type(impl_node, "declaration_list")
+    if body is None:
+        return []
+    method_names: list[str] = []
+    method_nodes: list[Any] = []
+    for child in body.children:
+        if child.type == "function_item":
+            ident = _child_of_type(child, "identifier")
+            if ident is None:
+                continue
+            method_names.append(
+                src[ident.start_byte : ident.end_byte].decode("utf-8", errors="replace")
+            )
+            method_nodes.append(child)
+    resolved = _apply_collisions(method_names)
+    results: list[_PyRec] = []
+    for method_node, resolved_name in zip(method_nodes, resolved, strict=True):
+        results.append(
+            (
+                f"{impl_name}.{resolved_name}",
+                _node_text(method_node, src),
+                method_node.start_point[0],
+                method_node.start_point[1],
+            )
+        )
+    return results
+
+
+def _walk_rust(
+    nodes: list[Any],
+    src: bytes,
+    kinds: set[str],
+) -> list[_PyRec]:
+    """Return (symbol_path, raw_content) records from Rust source nodes."""
+    raw_names: list[str] = []
+    raw_entries: list[tuple[str, str, int, int]] = []
+    impl_blocks: list[tuple[str, Any]] = []
+
+    for node in nodes:
+        if node.type not in kinds:
+            continue
+        name = _rust_symbol_name(node, src)
+        if name is None:
+            continue
+        raw_names.append(name)
+        raw_entries.append((name, _node_text(node, src), node.start_point[0], node.start_point[1]))
+        if node.type == "impl_item":
+            impl_blocks.append((name, node))
+
+    resolved = _apply_collisions(raw_names)
+    results: list[_PyRec] = []
+    name_remap: dict[int, str] = {}
+    for i, ((_, content, def_line, def_char), resolved_name) in enumerate(
+        zip(raw_entries, resolved, strict=True)
+    ):
+        results.append((resolved_name, content, def_line, def_char))
+        name_remap[i] = resolved_name
+
+    # Recurse into impl blocks to extract method bodies.  Use the
+    # collision-resolved impl name so methods get a stable scope.
+    for original_name, impl_node in impl_blocks:
+        # Find the resolved name we emitted for this exact impl node.
+        resolved_impl = original_name
+        for entry, candidate in zip(raw_entries, resolved, strict=True):
+            if entry[0] == original_name and entry[1] == _node_text(impl_node, src):
+                resolved_impl = candidate
+                break
+        results.extend(_walk_rust_impl_methods(impl_node, src, resolved_impl))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Anchor construction helper
 # ---------------------------------------------------------------------------
 
@@ -711,6 +970,10 @@ def extract_code_symbols(
         records = _walk_typescript(list(root.children), src_bytes, kinds)
     elif grammar_name == "zig":
         records = _walk_zig(root, src_bytes, kinds)
+    elif grammar_name == "go":
+        records = _walk_go(list(root.children), src_bytes, kinds)
+    elif grammar_name == "rust":
+        records = _walk_rust(list(root.children), src_bytes, kinds)
     else:
         logger.warning(
             "extract_code_symbols: no walker for grammar %r (language=%r)",

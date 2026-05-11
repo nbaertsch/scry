@@ -96,8 +96,8 @@ _EXT_TO_LANG: dict[str, str] = {
     ".js": "javascript",
     ".jsx": "jsx",
     ".zig": "zig",
-    # W6d HIGH #1: Go and Rust — LSP enrichment reaches these files even though
-    # tree-sitter extraction returns [] (no Go/Rust grammar bundled yet).
+    # SR5-1: Go and Rust now have full tree-sitter walkers; the historical
+    # comment that said "no Go/Rust grammar bundled" is obsolete.
     ".go": "go",
     ".rs": "rust",
 }

@@ -165,6 +165,55 @@ def _resolve_repo_root(ctx: click.Context) -> Path:
     return root if isinstance(root, Path) else _repo_root()
 
 
+# SR5-4: helpers for "LSP unavailable" messages.  Both ``scry callers``
+# and ``scry subclasses`` need to surface the LSP status for the
+# anchor's actual language (not the hardcoded "python") and recommend
+# the right binary to install.
+_EXT_TO_LANG_FOR_HINT: dict[str, str] = {
+    ".py": "python",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".js": "javascript",
+    ".jsx": "jsx",
+    ".go": "go",
+    ".rs": "rust",
+    ".zig": "zig",
+}
+
+_LSP_BINARY_FOR_LANG: dict[str, str] = {
+    "python": "pyright-langserver",
+    "typescript": "typescript-language-server",
+    "tsx": "typescript-language-server",
+    "javascript": "typescript-language-server",
+    "jsx": "typescript-language-server",
+    "go": "gopls",
+    "rust": "rust-analyzer",
+    "zig": "zls",
+}
+
+
+def _lang_from_anchor_id(anchor_id: str) -> str:
+    """Return the language hint for an anchor ID's file path portion.
+
+    Anchor IDs look like ``path/to/file.py:Symbol`` or
+    ``path/to/file.py:Class.method`` — split on the first ``:`` to
+    isolate the file portion, then map by extension.  Falls back to
+    ``"python"`` for unknown extensions to preserve historical behaviour.
+    """
+    file_part = anchor_id.split(":", 1)[0]
+    ext = Path(file_part).suffix.lower()
+    return _EXT_TO_LANG_FOR_HINT.get(ext, "python")
+
+
+def _lsp_binary_for(language: str) -> str:
+    """Return the recommended LSP binary name for *language*.
+
+    Used in ``scry callers`` / ``scry subclasses`` "LSP unavailable"
+    notes so we don't tell a Go user to install ``pyright-langserver``.
+    """
+    return _LSP_BINARY_FOR_LANG.get(language, f"the {language} language server")
+
+
 def _path_excluded(p: Path, repo: Path, exclude_patterns: list[str]) -> bool:
     """Return True if *p* (a directory) matches any exclude glob in the config.
 
@@ -1419,20 +1468,22 @@ def callers(ctx: click.Context, anchor_id: str, max_depth: int, as_json: bool) -
 
     callers_list: list[dict[str, Any]] = result.get("callers", [])
     if not callers_list:
-        # UT1-4: empty result is ambiguous between "truly no callers" and
-        # "LSP not configured/installed".  Surface the LSP availability
-        # via the same status_for() check the indexer uses.
+        # UT1-4 / SR5-4: empty result is ambiguous between "truly no callers"
+        # and "LSP not configured/installed".  Surface the LSP availability
+        # via the same status_for() check the indexer uses, parameterised
+        # by the actual anchor language (not the hardcoded "python").
         from scry.lsp.manager import LSPManager
 
+        anchor_lang = _lang_from_anchor_id(anchor_id)
         try:
-            lsp_status = LSPManager(repo, config.code_anchors).status_for("python")
+            lsp_status = LSPManager(repo, config.code_anchors).status_for(anchor_lang)
         except Exception:
             lsp_status = "unknown"
         if lsp_status in ("lsp_unavailable", "skip", "unknown"):
             click.echo(
                 "No callers found.\n"
-                f"  note: LSP for python is '{lsp_status}'; results may be "
-                "incomplete.  Install pyright-langserver or configure "
+                f"  note: LSP for {anchor_lang} is '{lsp_status}'; results may be "
+                f"incomplete.  Install {_lsp_binary_for(anchor_lang)} or configure "
                 "code_anchors.languages in .scry/config.yaml."
             )
         else:
@@ -1502,18 +1553,20 @@ def subclasses(ctx: click.Context, anchor_id: str, as_json: bool) -> None:
 
     subs: list[dict[str, Any]] = result.get("subclasses", [])
     if not subs:
-        # UT1-4: same LSP-availability disambiguation as `scry callers`.
+        # UT1-4 / SR5-4: same LSP-availability disambiguation as `scry callers`,
+        # parameterised by the actual anchor language.
         from scry.lsp.manager import LSPManager
 
+        anchor_lang = _lang_from_anchor_id(anchor_id)
         try:
-            lsp_status = LSPManager(repo, config.code_anchors).status_for("python")
+            lsp_status = LSPManager(repo, config.code_anchors).status_for(anchor_lang)
         except Exception:
             lsp_status = "unknown"
         if lsp_status in ("lsp_unavailable", "skip", "unknown"):
             click.echo(
                 "No subclasses found.\n"
-                f"  note: LSP for python is '{lsp_status}'; results may be "
-                "incomplete.  Install pyright-langserver or configure "
+                f"  note: LSP for {anchor_lang} is '{lsp_status}'; results may be "
+                f"incomplete.  Install {_lsp_binary_for(anchor_lang)} or configure "
                 "code_anchors.languages in .scry/config.yaml."
             )
         else:

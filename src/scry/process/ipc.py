@@ -201,14 +201,29 @@ IPCHandler: TypeAlias = Callable[[IPCRequest], Awaitable[IPCResponse]]
 class _IdempotencyCache:
     """Bounded LRU cache: ``idempotency_token → IPCResponse``.
 
-    Single-threaded (asyncio event loop only); no locking required.
+    Single-threaded (asyncio event loop only); no locking required for
+    cache state itself.  However, write handlers can take arbitrary time
+    and the event loop will yield while they ``await``, so concurrent
+    requests with the SAME idempotency_token can race past the
+    ``cache.get`` miss check.  We therefore additionally maintain a
+    ``token → asyncio.Lock`` map and require callers (see
+    :func:`_run_dispatch_logic`) to acquire the lock around their
+    check-then-execute-then-store sequence.
+
     Capacity is :attr:`IPCConfig.idempotency_cache_size` (default 10 000).
     Evicts the least-recently-used entry when at capacity.
+
+    SR2-1 BLOCKING fix: the per-token lock plugs the TOCTOU window that
+    previously let 2-3 concurrent same-token requests all execute the
+    handler and then have the second/third writer's response overwrite
+    the first via :meth:`put`.
     """
 
     def __init__(self, maxsize: int) -> None:
         self._maxsize = maxsize
         self._store: OrderedDict[str, IPCResponse] = OrderedDict()
+        # SR2-1: per-token serialization locks (separate from cache eviction).
+        self._locks: dict[str, asyncio.Lock] = {}
 
     def get(self, key: str) -> IPCResponse | None:
         """Return cached response for *key*, promoting it to MRU. ``None`` on miss."""
@@ -223,7 +238,22 @@ class _IdempotencyCache:
             self._store.move_to_end(key)
         self._store[key] = value
         if len(self._store) > self._maxsize:
-            self._store.popitem(last=False)
+            evicted_key, _ = self._store.popitem(last=False)
+            # Drop the matching lock IFF nobody is waiting on it.  Defensive:
+            # an in-flight handler holding the lock will keep it alive via
+            # the dict reference even after eviction.
+            existing_lock = self._locks.get(evicted_key)
+            if existing_lock is not None and not existing_lock.locked():
+                del self._locks[evicted_key]
+
+    def lock_for(self, key: str) -> asyncio.Lock:
+        """Return (creating if necessary) the per-token serialization lock."""
+        existing = self._locks.get(key)
+        if existing is not None:
+            return existing
+        new_lock = asyncio.Lock()
+        self._locks[key] = new_lock
+        return new_lock
 
     def __len__(self) -> int:
         return len(self._store)
@@ -457,19 +487,56 @@ async def _run_dispatch_logic(
                 error=f"Invalid idempotency_token format: {token!r}",
                 error_type="validation",
             )
-        cached = cache.get(token)
-        if cached is not None:
-            log.debug("IPC: idempotency cache hit token=%s", token)
-            return IPCResponse(
-                request_id=req.request_id,
-                ok=cached.ok,
-                result=cached.result,
-                error=cached.error,
-                error_type=cached.error_type,
-            )
+        # SR2-1 BLOCKING fix: serialize concurrent same-token requests
+        # via the per-token lock so the second request observes the
+        # first's cached response instead of also entering the handler.
+        # The lock is held for the entire check → execute → store
+        # sequence, so the TOCTOU window that previously allowed
+        # handler_ran=2-3 is closed.
+        async with cache.lock_for(token):
+            cached = cache.get(token)
+            if cached is not None:
+                log.debug("IPC: idempotency cache hit token=%s", token)
+                return IPCResponse(
+                    request_id=req.request_id,
+                    ok=cached.ok,
+                    result=cached.result,
+                    error=cached.error,
+                    error_type=cached.error_type,
+                )
 
+            is_long_op = req.op in {"commit_links", "reindex"}
+            server_timeout: float | None = None if is_long_op else config.timeouts.short
+
+            try:
+                if server_timeout is not None:
+                    resp = await asyncio.wait_for(handler(req), timeout=server_timeout)
+                else:
+                    resp = await handler(req)
+            except TimeoutError:
+                return IPCResponse(
+                    request_id=req.request_id,
+                    ok=False,
+                    error=f"Op '{req.op}' timed out on server after {server_timeout}s",
+                    error_type="timeout",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("IPC: handler raised for op=%s", req.op)
+                return IPCResponse(
+                    request_id=req.request_id,
+                    ok=False,
+                    error=str(exc),
+                    error_type="internal",
+                )
+
+            cache.put(token, resp)
+            return resp
+
+    # Non-write path: no idempotency, no lock.
     is_long_op = req.op in {"commit_links", "reindex"}
-    server_timeout: float | None = None if is_long_op else config.timeouts.short
+    server_timeout = None if is_long_op else config.timeouts.short
 
     try:
         if server_timeout is not None:
@@ -493,9 +560,6 @@ async def _run_dispatch_logic(
             error=str(exc),
             error_type="internal",
         )
-
-    if is_write and req.idempotency_token is not None:
-        cache.put(req.idempotency_token, resp)
 
     return resp
 
@@ -1102,8 +1166,11 @@ class IPCClient:
       mechanism keeps it alive (Wave 6 scry watch).
 
     Windows:
-        :meth:`call` raises :exc:`NotImplementedError` (deferred to Wave 6).
-        Followers on Windows serve all read tools directly from the read-only DB.
+        :meth:`call` is fully supported via the ``_WinPipeIO`` path
+        (Wave 6b): named pipes with a current-user-restricted DACL,
+        framed line-delimited JSON, and overlapped I/O via
+        ``asyncio.to_thread`` for the blocking ``ReadFile`` /
+        ``WriteFile`` calls.
     """
 
     def __init__(

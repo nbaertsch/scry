@@ -387,8 +387,10 @@ class TestConfigEdgeCases:
         assert "mod.py:top_func" not in ids
 
     def test_unsupported_language_returns_empty(self, tmp_path: Path) -> None:
-        p, root = _write(tmp_path, "mod.rs", b"fn main() {}")
-        anchors = extract_code_symbols(p, root, language="rust")
+        # SR5-1: Rust now has a walker (and so does Go).  Use a truly
+        # unsupported language to verify the unsupported-language branch.
+        p, root = _write(tmp_path, "mod.cobol", b"PROGRAM-ID. HELLO.")
+        anchors = extract_code_symbols(p, root, language="cobol")
         assert anchors == []
 
 

@@ -107,6 +107,10 @@ _IGNORE_DIRS: frozenset[str] = frozenset(
         ".ruff_cache",
         "tmp",
         ".tmp",
+        # SR5-7: Go's vendor/ contains hundreds of dependency files; ignore
+        # at the watch-level pre-filter for performance (config exclude
+        # already covers correctness).
+        "vendor",
     }
 )
 
