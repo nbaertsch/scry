@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -762,6 +763,16 @@ def watch(ctx: click.Context, debounce_ms: int, once: bool, reconnect_timeout: i
         "linking work (UAT-18)."
     ),
 )
+@click.option(
+    "--since",
+    default=None,
+    metavar="REF",
+    help=(
+        "Diff-aware drift: only evaluate links whose endpoint files appear "
+        "in `git diff --name-only REF..HEAD` (UAT-8).  Use this in PR review "
+        "to scope the drift report to the files this PR actually touched."
+    ),
+)
 @click.pass_context
 def check(
     ctx: click.Context,
@@ -775,6 +786,7 @@ def check(
     strict: bool,
     verbose: bool,
     uncovered: bool,
+    since: str | None,
 ) -> None:
     """Drift + coverage scores (§5.2 v3.1).
 
@@ -894,6 +906,52 @@ def check(
             branch_store = _BranchLinkStore(repo)
 
             evaluations = evaluate_all_drift(db=db, link_store=branch_store, config=config.drift)
+
+            # UAT-8: --since <ref> restricts the drift report to links
+            # whose endpoints touch files modified in `git diff
+            # --name-only <ref>..HEAD`.  Used in PR review so reviewers
+            # see only drift relevant to the PR, not the whole-repo
+            # snapshot.  Failure to resolve <ref> exits 2 with a
+            # message rather than silently returning all links.
+            if since:
+                try:
+                    diff_out = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "diff",
+                            "--name-only",
+                            f"{since}..HEAD",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    click.echo(
+                        f"error: --since {since!r} failed (git: {exc.stderr.strip()})",
+                        err=True,
+                    )
+                    raise SystemExit(2) from None
+                except FileNotFoundError:
+                    click.echo("error: --since requires git on PATH", err=True)
+                    raise SystemExit(2) from None
+                touched: set[str] = {
+                    line.strip() for line in diff_out.stdout.splitlines() if line.strip()
+                }
+
+                def _link_touches_diff(ev: object) -> bool:
+                    from scry.drift import DriftEvaluation as _DE
+
+                    if not isinstance(ev, _DE):
+                        return False
+                    return (
+                        ev.link.from_id.split(":", 1)[0] in touched
+                        or ev.link.to_id.split(":", 1)[0] in touched
+                    )
+
+                evaluations = [ev for ev in evaluations if _link_touches_diff(ev)]
 
             # Count code anchors for coverage.
             code_anchors = db.list_anchors(anchor_type=AnchorType.CODE)

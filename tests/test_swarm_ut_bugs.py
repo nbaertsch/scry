@@ -711,6 +711,18 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_8_check_supports_since_flag() -> None:
+    """UAT-8: scry check --since <ref> diff-aware drift filtering."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["check", "--help"])
+    assert result.exit_code == 0
+    assert "--since" in result.output, "scry check --help must advertise --since (UAT-8)"
+
+
 def test_uat_4_init_auto_detects_languages(tmp_path: Path) -> None:
     """UAT-4: scry init walks the repo and adds Go/Rust/JS to include
     when those files exist, instead of hard-coding md/py/ts only.
