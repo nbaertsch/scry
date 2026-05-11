@@ -156,6 +156,28 @@ def _get_parent_anchor_types(
     return {str(r[0]): AnchorType(str(r[1])) for r in rows}
 
 
+def _get_parent_anchor_paths(
+    parent_ids: Sequence[str],
+    *,
+    db: ScryDB,
+) -> dict[str, str]:
+    """Return the ``path`` for each parent anchor (UAT-15 review-u9-u10 HIGH).
+
+    Used by :func:`hybrid_search` to push a path-glob filter down so
+    ``--scope`` filtering happens BEFORE the final ``top_k`` truncation
+    (otherwise scoped results that rank just outside the global top
+    are silently dropped).
+    """
+    if not parent_ids:
+        return {}
+    placeholders = ",".join("?" * len(parent_ids))
+    rows = db._conn.execute(
+        f"SELECT id, path FROM anchors WHERE id IN ({placeholders})",
+        list(parent_ids),
+    ).fetchall()
+    return {str(r[0]): str(r[1]) for r in rows}
+
+
 def _promote(
     ranked: list[tuple[int, int]],
     rowid_to_parent: dict[int, str],
@@ -276,6 +298,7 @@ def hybrid_search(
     config: RetrievalConfig | None = None,
     top_k: int = 10,
     anchor_types: Sequence[AnchorType] | None = None,
+    path_globs: Sequence[str] | None = None,
 ) -> list[SearchResult]:
     """Run the §4.1 v3.1 hybrid BM25 + vector retrieval algorithm.
 
@@ -357,6 +380,21 @@ def hybrid_search(
         allowed_parents = {pid for pid, atype in parent_type_map.items() if atype in type_set}
         rowid_to_parent = {
             rowid: pid for rowid, pid in rowid_to_parent.items() if pid in allowed_parents
+        }
+
+    # UAT-15 review-u9-u10 HIGH: push the path-glob filter down so it
+    # happens BEFORE the final top_k truncation; otherwise scoped
+    # results that rank just outside the global top are silently dropped.
+    if path_globs:
+        from scry.config import matches_globs as _matches
+
+        path_parent_ids: list[str] = list(set(rowid_to_parent.values()))
+        parent_path_map = _get_parent_anchor_paths(path_parent_ids, db=db)
+        allowed_by_path = {
+            pid for pid, p in parent_path_map.items() if _matches(p, list(path_globs))
+        }
+        rowid_to_parent = {
+            rowid: pid for rowid, pid in rowid_to_parent.items() if pid in allowed_by_path
         }
 
     # Step 3: Assign 1-indexed original ranks to each chunk list, then promote

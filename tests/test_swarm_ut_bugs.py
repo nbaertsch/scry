@@ -711,6 +711,34 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_15_search_supports_scope_glob() -> None:
+    """UAT-15: scry search --scope <glob> filters results to matching paths."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["search", "--help"])
+    assert result.exit_code == 0
+    assert "--scope" in result.output, "scry search --help must advertise --scope (UAT-15)"
+
+
+def test_uat_16_anchors_list_command_exists() -> None:
+    """UAT-16: scry anchors list <scope> must exist as a browse command."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["anchors", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "list" in result.output.lower()
+    list_help = runner.invoke(main, ["anchors", "list", "--help"])
+    assert list_help.exit_code == 0
+    assert "--scope" in list_help.output
+    assert "--type" in list_help.output
+
+
 def test_uat_3_get_anchor_cli_command_exists() -> None:
     """UAT-3: scry get-anchor must exist as a CLI command, not MCP-only."""
     from click.testing import CliRunner

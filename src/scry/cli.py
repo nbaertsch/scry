@@ -1089,8 +1089,23 @@ def commit_links(ctx: click.Context, event_ids: tuple[str, ...]) -> None:
     default=None,
     help="Restrict results to this anchor type.",
 )
+@click.option(
+    "--scope",
+    default=None,
+    help=(
+        "Glob pattern restricting results to matching paths "
+        "(e.g. ``--scope src/scry/*.py``).  Applied AFTER hybrid retrieval; "
+        "increases top-k internally to compensate for the post-filter."
+    ),
+)
 @click.pass_context
-def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str | None) -> None:
+def search(
+    ctx: click.Context,
+    query: str,
+    top_k: int,
+    anchor_type_filter: str | None,
+    scope: str | None,
+) -> None:
     """Hybrid BM25 + vector search over the indexed repository."""
     repo = _resolve_repo_root(ctx)
     try:
@@ -1110,6 +1125,11 @@ def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str |
 
     embedder = _get_embedder(config)
 
+    # UAT-15: --scope post-filters by path glob.  Pushed into hybrid_search
+    # via path_globs= so the scope filter applies BEFORE the final top_k
+    # truncation (review-u9-u10 HIGH: post-filter alone could miss results
+    # ranked just outside the global cutoff).
+
     try:
         with ScryDB(repo, read_only=True) as db:
             results = hybrid_search(
@@ -1119,6 +1139,7 @@ def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str |
                 config=config.retrieval,
                 top_k=top_k,
                 anchor_types=anchor_types,
+                path_globs=[scope] if scope else None,
             )
             packets = [build_anchor_packet(r, db=db, config=config.retrieval) for r in results]
     except (LockTimeout, OSError) as exc:
@@ -1126,7 +1147,7 @@ def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str |
         raise SystemExit(1) from None
 
     if not packets:
-        click.echo("No results.")
+        click.echo("No results." if not scope else f"No results matched scope {scope!r}.")
         return
 
     # UT1-9: scores from sqlite-vec + BM25 RRF are arbitrary-scale
@@ -1141,6 +1162,97 @@ def search(ctx: click.Context, query: str, top_k: int, anchor_type_filter: str |
         click.echo(f"{pkt.anchor.id}  score={pkt.score:.4f}")
         if excerpt:
             click.echo(f"  {excerpt}")
+
+
+# ─── scry anchors list ────────────────────────────────────────────────────────
+
+
+@main.command("anchors")
+@click.argument("subcommand", type=click.Choice(["list"]))
+@click.option(
+    "--scope",
+    default=None,
+    help="Glob restricting which paths to enumerate (e.g. ``--scope src/**/*.py``).",
+)
+@click.option(
+    "--type",
+    "anchor_type_filter",
+    type=click.Choice(["section", "code", "code_in_doc"]),
+    default=None,
+    help="Filter by anchor type.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of one-per-line text.")
+@click.option(
+    "--limit",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Maximum anchors to print.",
+)
+@click.pass_context
+def anchors_cmd(
+    ctx: click.Context,
+    subcommand: str,
+    scope: str | None,
+    anchor_type_filter: str | None,
+    as_json: bool,
+    limit: int,
+) -> None:
+    """Anchor browse commands (UAT-16).
+
+    Today only ``scry anchors list`` is implemented — print every
+    indexed anchor's primary ID with optional path-glob and type
+    filters.  Solves UAT6's "no anchor browser" complaint that made
+    cross-language link authoring painful.
+    """
+    if subcommand != "list":  # pragma: no cover — Click already restricts
+        raise click.UsageError(f"unknown subcommand: {subcommand}")
+
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(1) from None
+
+    anchor_type = AnchorType(anchor_type_filter) if anchor_type_filter else None
+
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            all_anchors = db.list_anchors(anchor_type=anchor_type)
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    if scope:
+        from scry.config import matches_globs as _matches
+
+        all_anchors = [a for a in all_anchors if _matches(a.path, [scope])]
+
+    truncated = len(all_anchors) > limit
+    all_anchors = all_anchors[:limit]
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "anchors": [
+                        {"id": a.id, "type": a.type, "path": a.path, "symbol_name": a.symbol_name}
+                        for a in all_anchors
+                    ],
+                    "truncated": truncated,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    for anchor in all_anchors:
+        click.echo(f"{anchor.id}\t{anchor.type}\t{anchor.symbol_name or ''}")
+    if truncated:
+        click.echo(
+            f"\n... truncated at --limit {limit}.  Re-run with a higher limit to see more.",
+            err=True,
+        )
 
 
 # ─── scry get-anchor / scry get-link / scry get-links / scry show ────────────
