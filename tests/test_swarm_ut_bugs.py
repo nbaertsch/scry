@@ -711,6 +711,21 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_19_link_warns_on_inverted_direction() -> None:
+    """UAT-19: scry link warns when implements/tests/examples direction
+    looks inverted vs DESIGN.md §3.6 canonical orientation.
+    """
+    import inspect
+
+    from scry.cli import link
+
+    src = inspect.getsource(link.callback)  # type: ignore[arg-type]
+    assert "_CANONICAL_DIRECTION" in src, (
+        "UAT-19: scry link must check direction against DESIGN.md §3.6"
+    )
+    assert "looks inverted" in src or "canonical" in src
+
+
 def test_uat_11_mcp_descriptions_no_dev_notes() -> None:
     """UAT-11: MCP tool descriptions must not leak internal dev notes."""
     import inspect

@@ -1709,6 +1709,39 @@ def link(
         lnk_id = existing_id
     else:
         lnk_id = new_link_id()
+
+    # UAT-19: advisory direction-normalization warning.  DESIGN.md §3.6
+    # documents canonical directions (e.g. ``implements`` is code→spec,
+    # ``tests`` is test→target).  We don't auto-flip — UAT2 noted that
+    # the dogfooded baseline already contains spec→code links and the
+    # spec is locked — but we DO surface the inconsistency at write
+    # time so users can author in the canonical direction going forward.
+    _CANONICAL_DIRECTION: dict[str, tuple[set[str], set[str]]] = {
+        "implements": (
+            {AnchorType.CODE.value},
+            {AnchorType.SECTION.value, AnchorType.CODE_IN_DOC.value},
+        ),
+        "tests": (
+            {AnchorType.CODE.value},
+            {AnchorType.CODE.value, AnchorType.SECTION.value},
+        ),
+        "examples": (
+            {AnchorType.CODE.value, AnchorType.CODE_IN_DOC.value},
+            {AnchorType.SECTION.value, AnchorType.CODE.value},
+        ),
+    }
+    expected = _CANONICAL_DIRECTION.get(link_type)
+    if expected is not None:
+        from_canonical, to_canonical = expected
+        if str(from_type) not in from_canonical or str(to_type) not in to_canonical:
+            click.echo(
+                f"warning: {link_type!r} link direction looks inverted: "
+                f"{from_type} -> {to_type} (canonical per DESIGN.md §3.6: "
+                f"{sorted(from_canonical)[0]} -> {sorted(to_canonical)[0]}). "
+                f"Link still written; consider authoring in canonical direction.",
+                err=True,
+            )
+
     evt_id = new_event_id()
     record_payload: dict[str, object] = {
         "op": LinkOp.UPSERT,
