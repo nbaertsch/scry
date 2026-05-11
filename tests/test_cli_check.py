@@ -433,4 +433,5 @@ class TestExitCodes:
         assert result.exit_code == 0, result.output
         assert "drift_unknown" in result.output
 
+
 # uat-r5-5 pr-d noise

@@ -735,4 +735,5 @@ class TestIntegration:
         assert "foo" in result[0].content_text
         assert "42" in result[0].content_text
 
+
 # uat-r5-5 pr-d noise

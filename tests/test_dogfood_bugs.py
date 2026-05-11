@@ -132,4 +132,5 @@ def test_b2_validate_skips_excluded_fixture_dir(tmp_path: Path) -> None:
     # excluded so the directory is pruned during os.walk.
     assert cli._path_excluded(fix, tmp_path, ["fixtures/**"])
 
+
 # uat-r5-5 pr-d noise

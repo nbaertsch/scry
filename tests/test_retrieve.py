@@ -740,4 +740,5 @@ class TestBuildAnchorPacket:
         packet = build_anchor_packet(result, db=db)
         assert packet.evidence_excerpt is None
 
+
 # uat-r5-5 pr-d noise

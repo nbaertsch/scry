@@ -676,4 +676,5 @@ async def test_full_mode_imported_constant_via_document_symbol(tmp_path: Path) -
     assert result.callees[0].name == "BAR"
     assert result.diagnostic.get("full_mode_extra") == 1
 
+
 # uat-r5-5 pr-d noise

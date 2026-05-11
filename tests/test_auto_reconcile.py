@@ -784,4 +784,5 @@ async def test_mark_fresh_awaits_task_cleanup(tmp_path: Path) -> None:
     assert bg_task.done()
     assert cleanup_ran  # finally block ran because we awaited cancellation
 
+
 # uat-r5-5 pr-d noise

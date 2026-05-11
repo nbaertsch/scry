@@ -640,4 +640,5 @@ class TestLLMConfig:
         with pytest.raises(ValidationError):
             LLMConfig(**{"unknown_field": "value"})  # type: ignore[arg-type]
 
+
 # uat-r5-5 pr-d noise

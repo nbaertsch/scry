@@ -945,4 +945,5 @@ def test_scrydb_context_manager(tmp_repo: Path) -> None:
     with pytest.raises(sqlite3.ProgrammingError):
         d.get_anchor("any::id")
 
+
 # uat-r5-5 pr-d noise

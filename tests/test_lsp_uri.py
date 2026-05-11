@@ -42,4 +42,5 @@ def test_local_file_uris_accepted(uri: str) -> None:
 def test_non_local_uris_rejected(uri: str) -> None:
     assert not is_local_file_uri(uri)
 
+
 # uat-r5-5 pr-d noise

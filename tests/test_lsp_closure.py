@@ -711,4 +711,5 @@ def test_callee_ref_equality() -> None:
     assert a == b
     assert hash(a) == hash(b)
 
+
 # uat-r5-5 pr-d noise

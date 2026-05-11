@@ -515,4 +515,5 @@ def test_manager_fallback_uses_textdocument_callhierarchy_capability() -> None:
         "regression: fallback put callHierarchy at the wrong (top-level) capability path"
     )
 
+
 # uat-r5-5 pr-d noise

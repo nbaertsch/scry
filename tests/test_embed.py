@@ -489,4 +489,5 @@ class TestIntegration:
         emb._dimensions = 99999
         emb.encode(["second"])  # must not raise
 
+
 # uat-r5-5 pr-d noise

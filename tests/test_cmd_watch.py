@@ -557,4 +557,5 @@ class TestWatchCLI:
 
         assert result.exit_code != 0
 
+
 # uat-r5-5 pr-d noise

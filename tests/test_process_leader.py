@@ -469,4 +469,5 @@ def test_leader_metadata_is_frozen() -> None:
     with pytest.raises((AttributeError, TypeError)):
         meta.pid = 2  # type: ignore[misc]
 
+
 # uat-r5-5 pr-d noise

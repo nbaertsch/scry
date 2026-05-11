@@ -51,7 +51,6 @@ from scry.embed import StubEmbedder, make_embedder
 from scry.git_context import GitContextError, GitContextProvider
 from scry.index import Indexer, IndexerError, IndexResult
 from scry.mcp.handlers import MCPServerError
-from scry.mcp.server import MCPServer
 from scry.models import (
     AnchorType,
     DriftStatus,
@@ -2608,6 +2607,12 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
     """
     repo = _resolve_repo_root(ctx)
     allow_untrusted = ctx.obj.get("allow_untrusted_lsp_config", False)
+    # UAT-R5-1: lazy import to avoid the ~3.3s fastmcp+mcp import tax on
+    # every other CLI invocation.  scry mcp is the only command that
+    # actually needs MCPServer; importing it here keeps `scry --version`,
+    # `scry search`, etc. snappy.
+    from scry.mcp.server import MCPServer
+
     server = MCPServer(repo, allow_untrusted_lsp_config=allow_untrusted)
 
     async def _serve_daemon() -> None:

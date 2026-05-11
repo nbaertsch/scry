@@ -734,4 +734,5 @@ async def test_lifecycle_recover_pending_called(tmp_path: Path) -> None:
     assert hasattr(server._ctx.overlay_mgr, "recover_pending")
     await server.stop()
 
+
 # uat-r5-5 pr-d noise

@@ -502,4 +502,5 @@ def test_windows_path_str_conversion(tmp_path: Path) -> None:
     ctx = provider.get()
     assert ctx.head_sha  # Non-empty means git invocation succeeded.
 
+
 # uat-r5-5 pr-d noise

@@ -414,4 +414,5 @@ def test_lsp_message_fields() -> None:
     assert msg.method == "initialized"
     assert msg.error is None
 
+
 # uat-r5-5 pr-d noise

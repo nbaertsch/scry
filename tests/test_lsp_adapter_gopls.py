@@ -243,4 +243,5 @@ async def test_gopls_adapter_params_reach_fake_lsp(tmp_path: Path) -> None:
 
     await session.shutdown()
 
+
 # uat-r5-5 pr-d noise

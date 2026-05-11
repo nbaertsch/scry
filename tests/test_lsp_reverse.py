@@ -454,4 +454,5 @@ async def test_get_subclasses_name_from_uri_stem() -> None:
     assert len(result) == 1
     assert result[0].name == "my_subclass"
 
+
 # uat-r5-5 pr-d noise

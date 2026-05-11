@@ -1097,4 +1097,5 @@ class TestSuggestLinksCLI:
         """DEFAULT_MIN_CONFIDENCE is between 0 and 1 (sanity check)."""
         assert 0.0 < DEFAULT_MIN_CONFIDENCE < 1.0
 
+
 # uat-r5-5 pr-d noise

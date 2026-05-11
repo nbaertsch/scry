@@ -526,4 +526,5 @@ class TestCanonicalize:
 
         assert canonicalize(text) == canonicalize_content(text)
 
+
 # uat-r5-5 pr-d noise
