@@ -506,6 +506,28 @@ class LinkStore:
                     f"Delete supersedes references unknown event_id"
                     f" {record.supersedes!r} (§3.5.2 rule 5)."
                 )
+            # UAT-9 review-u14a HIGH: compare-and-swap — supersedes must
+            # reference the CURRENT latest event for this link_id, AND
+            # the current latest must NOT itself be a DELETE.  Without
+            # this, two concurrent CLI/MCP writers can both tombstone
+            # the same link with stale supersedes pointers, or one
+            # process can tombstone a link that another process has
+            # since refreshed (silent re-deletion of the new state).
+            current_latest = file_last.get(link_id) or cross_last.get(link_id)
+            if current_latest is not None:
+                if current_latest.op == LinkOp.DELETE:
+                    raise LinkValidationError(
+                        f"Delete for link_id {link_id!r} but link is "
+                        f"already tombstoned (current event_id="
+                        f"{current_latest.event_id!r})."
+                    )
+                if record.supersedes != current_latest.event_id:
+                    raise LinkValidationError(
+                        f"Delete for link_id {link_id!r} has stale "
+                        f"supersedes={record.supersedes!r}; current latest "
+                        f"event is {current_latest.event_id!r}.  "
+                        f"Re-read the active table and retry."
+                    )
 
     def _find_merge_conflicts(self, all_records: list[LinkRecord]) -> list[LinkId]:
         """Detect broken supersedes chains per §3.5.2 rule 6.

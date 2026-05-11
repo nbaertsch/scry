@@ -1739,6 +1739,77 @@ def link(
     click.echo(f"  {from_id} --[{link_type}]--> {to_id}")
 
 
+# ─── scry unlink ──────────────────────────────────────────────────────────────
+
+
+@main.command("unlink")
+@click.argument("link_id")
+@click.option("--reason", default=None, help="Optional reason / rationale for the deletion.")
+@click.pass_context
+def unlink_cmd(ctx: click.Context, link_id: str, reason: str | None) -> None:
+    """Tombstone a link by its link_id (UAT-9).
+
+    Appends a DELETE record to the current branch overlay.  The link
+    will no longer appear in `scry check` / `scry get-link` output.
+    Links promoted to baseline can also be tombstoned this way; on
+    `scry commit-links` the DELETE is promoted alongside the original
+    UPSERT.
+
+    Per DESIGN.md §3.5: a tombstoned link's link_id may NOT be re-used.
+    To re-create a logically equivalent link, use `scry link` which
+    mints a fresh link_id.
+    """
+    from scry.models import LinkOp, LinkRecord, new_event_id
+    from scry.store.links import LinkStore as _LinkStore
+
+    repo = _resolve_repo_root(ctx)
+    try:
+        load_config(repo)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    try:
+        link_store = _LinkStore(repo)
+        git_ctx_prov = GitContextProvider(repo)
+        overlay_mgr = OverlayManager(repo, git_context=git_ctx_prov, link_store=link_store)
+        replay = link_store.replay(overlay_path=overlay_mgr.current_overlay_path())
+    except (GitContextError, LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+    active = replay.active_links.get(link_id)
+    if active is None:
+        click.echo(
+            f"error: link_id {link_id!r} not found in active table "
+            "(may already be tombstoned, or never existed).",
+            err=True,
+        )
+        raise SystemExit(1) from None
+
+    evt_id = new_event_id()
+    record = LinkRecord.model_validate(
+        {
+            "op": LinkOp.DELETE,
+            "link_id": link_id,
+            "event_id": evt_id,
+            # supersedes is required on DELETE per §3.5 rule 5.
+            "supersedes": active.last_event_id,
+            "reason": reason or "scry unlink (CLI)",
+        }
+    )
+    try:
+        overlay_mgr.append_to_current_branch_overlay(record)
+    except (LinkValidationError, GitContextError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    click.echo(f"Tombstoned link: {link_id}")
+    click.echo(f"  event_id: {evt_id}")
+    if reason:
+        click.echo(f"  reason:   {reason}")
+
+
 # ─── scry suggest-links ───────────────────────────────────────────────────────
 
 

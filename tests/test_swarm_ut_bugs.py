@@ -711,6 +711,18 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_9_unlink_command_exists() -> None:
+    """UAT-9: scry unlink <link_id> tombstones a link via DELETE op."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["unlink", "--help"])
+    assert result.exit_code == 0
+    assert "tombstone" in result.output.lower(), "scry unlink --help must explain tombstone semantics"
+
+
 def test_uat_8_check_supports_since_flag() -> None:
     """UAT-8: scry check --since <ref> diff-aware drift filtering."""
     from click.testing import CliRunner
