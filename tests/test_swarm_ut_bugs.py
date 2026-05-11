@@ -1566,3 +1566,199 @@ async def test_sr4_3_find_drift_rejects_unknown_status_filter() -> None:
 
 
 # uat-r5-5 pr-d noise
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# UAT Round 6 (MCP-focused) regression tests — U-fix-1 through U-fix-9
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_uat_m_2_reindex_force_strict_bool_only() -> None:
+    """UAT-M-2 / U-fix-1: ``reindex.force`` must reject coerced bools.
+
+    FastMCP's Pydantic v2 layer otherwise turns ``"yes"``, ``"true"``,
+    ``"1"``, or any non-empty string into ``True`` BEFORE the
+    handler-level ``isinstance(force, bool)`` guard runs.  The fix is
+    ``Annotated[bool, Field(strict=True)]`` at the @mcp.tool
+    registration so Pydantic rejects non-bool inputs server-side.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "force: Annotated[bool, Field(strict=True)]" in src, (
+        "reindex.force must be Annotated[bool, Field(strict=True)] (UAT-M-2 / U-fix-1)"
+    )
+
+
+def test_uat_m_2_apply_link_suggestions_apply_strict_bool_only() -> None:
+    """UAT-M-2 / U-fix-1: ``apply_link_suggestions.apply`` must reject coerced bools.
+
+    Same Pydantic-coercion bug class as ``reindex.force`` — a string
+    ``"yes"`` would silently turn into a write op.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "apply: Annotated[bool, Field(strict=True)]" in src, (
+        "apply_link_suggestions.apply must be Annotated[bool, Field(strict=True)] "
+        "(UAT-M-2 / U-fix-1)"
+    )
+
+
+def test_uat_m_4_find_drift_accepts_since_param() -> None:
+    """UAT-M-4 / U-fix-3: find_drift exposes a ``since`` param for git-diff scoping."""
+    import inspect
+
+    from scry.mcp.handlers import find_drift
+    from scry.mcp.server import MCPServer
+
+    sig = inspect.signature(find_drift)
+    assert "since" in sig.parameters, "find_drift handler must accept 'since' (UAT-M-4)"
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert '"since": since' in src, (
+        "find_drift @mcp.tool must forward 'since' through _dispatch (UAT-M-4)"
+    )
+
+
+def test_uat_m_5_unlink_mcp_tool_exists() -> None:
+    """UAT-M-5 / U-fix-4: unlink is exposed as an MCP tool, not just a CLI command."""
+    from scry.mcp.handlers import HANDLERS, unlink
+    from scry.process.ipc import WRITE_OPS
+
+    assert callable(unlink), "scry.mcp.handlers.unlink must be a callable"
+    assert "unlink" in HANDLERS, "HANDLERS dict must include 'unlink' (UAT-M-5)"
+    assert "unlink" in WRITE_OPS, "unlink must be in WRITE_OPS (idempotency-token-required)"
+
+
+def test_uat_m_6_commit_links_promoted_includes_link_id() -> None:
+    """UAT-M-6 / U-fix-5: commit_links returns ``promoted: [{event_id, link_id}, ...]``.
+
+    Old shape was ``list[event_id]`` — agents had to round-trip via
+    get_links to recover the link_id (the user-facing handle).  New
+    shape includes both, plus a ``promoted_event_ids`` back-compat alias.
+    """
+    import inspect
+
+    from scry.mcp.handlers import commit_links
+
+    src = inspect.getsource(commit_links)
+    assert '"event_id": eid' in src and '"link_id":' in src, (
+        "commit_links must return promoted records with both event_id and link_id (UAT-M-6)"
+    )
+    assert '"promoted_event_ids":' in src, (
+        "commit_links must keep 'promoted_event_ids' as a back-compat alias (UAT-M-6)"
+    )
+
+
+def test_uat_m_8_reindex_response_includes_scope_ignored_flag() -> None:
+    """UAT-M-8: reindex must surface ``scope_ignored: true`` when scope is supplied.
+
+    Wave 2 doesn't implement path-prefix scoping, but agents need a
+    machine-detectable signal that their ``scope=`` arg was ignored
+    instead of silently running a full re-index.
+    """
+    import inspect
+
+    from scry.mcp.handlers import reindex
+
+    src = inspect.getsource(reindex)
+    assert '"scope_ignored": scope is not None' in src, (
+        "reindex must include 'scope_ignored' in its response (UAT-M-8)"
+    )
+
+
+def test_uat_m_9_get_links_validates_link_types() -> None:
+    """UAT-M-9 / U-fix-6: get_links must reject typo'd link_type values.
+
+    Mirrors find_drift status_filter validation — silent empty result
+    on a typo is worse than an explicit error.
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_links
+
+    src = inspect.getsource(get_links)
+    assert "Unknown link_type values" in src, (
+        "get_links must reject unknown link_type values with a clear error (UAT-M-9)"
+    )
+
+
+def test_uat_m_10_search_rejects_empty_query() -> None:
+    """UAT-M-10 / U-fix-7: search() must reject empty / whitespace-only queries.
+
+    Pre-fix: silently returned [] (looked like a relevance bug).
+    Post-fix: explicit MCPServerError mirrors the SR4-2 top_k validation.
+    """
+    import inspect
+
+    from scry.mcp.handlers import search
+
+    src = inspect.getsource(search)
+    assert "must be a non-empty string" in src, (
+        "search() must reject empty/whitespace queries with a clear error (UAT-M-10)"
+    )
+
+
+def test_uat_m_12_apply_link_suggestions_exposes_rejection_reasons() -> None:
+    """UAT-M-12 / U-fix-8: apply_link_suggestions returns ``rejected_reasons``.
+
+    Pre-fix: ``rejected: int`` was opaque — caller couldn't tell if
+    suggestions were dropped because of a bad pair_id, low confidence,
+    invalid link_type, etc.  Post-fix: ``rejected_reasons: dict[str, int]``
+    breaks down the count by reason.
+    """
+    import inspect
+
+    from scry.mcp.handlers import apply_link_suggestions
+
+    src = inspect.getsource(apply_link_suggestions)
+    assert '"rejected_reasons": rejected_reasons' in src, (
+        "apply_link_suggestions must return 'rejected_reasons' breakdown (UAT-M-12)"
+    )
+    assert '"unknown_pair_id"' in src, (
+        "apply_link_suggestions must classify mismatched pair_id explicitly (UAT-M-12)"
+    )
+
+
+def test_uat_r5_15_propose_link_rejects_self_link() -> None:
+    """UAT-R5-15 / U-fix-9: propose_link must reject from_id == to_id."""
+    import inspect
+
+    from scry.mcp.handlers import propose_link
+
+    src = inspect.getsource(propose_link)
+    assert "from_id == to_id" in src, "propose_link must reject self-links (UAT-R5-15)"
+
+
+def test_uat_m_4_find_drift_since_rejects_option_injection() -> None:
+    """review-r6-1 BLOCKING: find_drift(since=...) must reject option-flag refs.
+
+    Without ``--end-of-options`` and an explicit option-flag guard,
+    ``git diff`` interprets ``--output=<path>`` as an option BEFORE
+    treating it as a revision — turning this read-only MCP tool into
+    a filesystem-write primitive.  The fix rejects refs starting with
+    ``-`` and resolves via ``git rev-parse --verify --end-of-options``
+    before the diff call.
+    """
+    import inspect
+
+    from scry.mcp.handlers import find_drift
+
+    src = inspect.getsource(find_drift)
+    # Refs that begin with "-" must be rejected up-front.
+    assert "since.startswith" in src and "option flag" in src, (
+        "find_drift must reject 'since' values that begin with '-' (review-r6-1)"
+    )
+    # Both git calls must use --end-of-options.
+    assert src.count("--end-of-options") >= 2, (
+        "find_drift must pass --end-of-options to BOTH git rev-parse and git diff (review-r6-1)"
+    )
+    # Both git calls must set stdin=DEVNULL and a timeout.
+    assert "stdin=_subprocess.DEVNULL" in src and "timeout=" in src, (
+        "find_drift git subprocess calls must set stdin=DEVNULL and a timeout (review-r6-1)"
+    )

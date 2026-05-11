@@ -50,9 +50,10 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 import scry
 from scry.config import load_config
@@ -224,6 +225,7 @@ class MCPServer:
         async def find_drift(
             scope: str | None = None,
             status_filter: list[str] | None = None,
+            since: str | None = None,
         ) -> dict[str, Any]:
             """Evaluate section-level drift for active links.
 
@@ -231,11 +233,19 @@ class MCPServer:
             ``scope`` accepts a path-prefix glob; ``status_filter`` is
             an allow-list of drift status values
             (``"fresh"``, ``"code-changed"``, ``"spec-changed"``, etc.).
+            ``since`` is a git ref (commit / branch / tag) — only links
+            whose endpoints touch files changed in
+            ``git diff --name-only <since>..HEAD`` are returned.
             """
             return cast(
                 dict[str, Any],
                 await self._dispatch(
-                    "find_drift", {"scope": scope, "status_filter": status_filter}
+                    "find_drift",
+                    {
+                        "scope": scope,
+                        "status_filter": status_filter,
+                        "since": since,
+                    },
                 ),
             )
 
@@ -305,6 +315,33 @@ class MCPServer:
                 ),
             )
 
+        @mcp.tool(annotations=_idem_write)
+        async def unlink(
+            link_id: str,
+            reason: str | None = None,
+            idempotency_token: str | None = None,
+        ) -> dict[str, Any]:
+            """Tombstone a link by its ``link_id`` (UAT-M-5 / U-fix-4).
+
+            Appends a DELETE record to the current branch overlay; the
+            link no longer appears in ``get_links`` / ``find_drift``.
+            Use ``reason`` to record the rationale for the deletion.
+            Per DESIGN.md §3.5, a tombstoned ``link_id`` is permanently
+            reserved — call ``propose_link`` to re-create a logically
+            equivalent link with a fresh ``link_id``.
+            """
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "unlink",
+                    {
+                        "link_id": link_id,
+                        "reason": reason,
+                        "idempotency_token": idempotency_token,
+                    },
+                ),
+            )
+
         @mcp.tool(annotations=_read)
         async def status() -> dict[str, Any]:
             """Return current server + overlay status (branch, HEAD, pending records)."""
@@ -318,13 +355,15 @@ class MCPServer:
         @mcp.tool(annotations=_idem_write)
         async def reindex(
             scope: str | None = None,
-            force: bool = False,
+            force: Annotated[bool, Field(strict=True)] = False,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
             """Trigger an incremental (or forced) re-index of the repository.
 
             ``force=True`` drops and rebuilds the entire index; use
-            sparingly.  ``scope`` is accepted but currently ignored.
+            sparingly.  ``scope`` is accepted but currently ignored —
+            the server logs a warning and surfaces ``scope_ignored: true``
+            in the response so callers can detect the limitation.
             """
             return cast(
                 dict[str, Any],
@@ -394,7 +433,7 @@ class MCPServer:
             suggestions: list[dict[str, Any]],
             pair_payloads: list[dict[str, Any]],
             min_confidence: float = 0.7,
-            apply: bool = False,
+            apply: Annotated[bool, Field(strict=True)] = False,
             idempotency_token: str | None = None,
         ) -> dict[str, Any]:
             """Apply (or preview) agent-classified link suggestions.

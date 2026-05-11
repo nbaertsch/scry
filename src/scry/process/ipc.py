@@ -78,6 +78,9 @@ WRITE_OPS: frozenset[str] = frozenset(
         "propose_link",
         "accept_link",
         "commit_links",
+        # UAT-M-5 / U-fix-4: unlink appends a DELETE record to the
+        # current branch overlay — must hit the leader.
+        "unlink",
         "reindex",
         # UAT-R5-2: agent-driven suggest-links — apply_link_suggestions is
         # the write half of the two-phase API (suggest_links_candidates is

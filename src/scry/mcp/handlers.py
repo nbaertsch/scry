@@ -47,6 +47,7 @@ from scry.models import (
     LinkOp,
     LinkRecord,
     LinkType,
+    new_event_id,
     new_link_id,
 )
 from scry.process.ipc import IPCClient
@@ -61,6 +62,7 @@ __all__ = [
     "MCPContext",
     "MCPServerError",
     "accept_link",
+    "apply_link_suggestions",
     "commit_links",
     "find_drift",
     "get_anchor",
@@ -72,6 +74,8 @@ __all__ = [
     "repo_summary",
     "search",
     "status",
+    "suggest_links_candidates",
+    "unlink",
 ]
 
 logger = logging.getLogger(__name__)
@@ -248,6 +252,12 @@ async def search(
         relevance score.  Each dict includes a populated ``links`` field sourced
         from the active overlay (Wave 2 section-level drift only).
     """
+    # UAT-M-10 / U-fix-7: reject empty/whitespace-only queries early.
+    # Was silently reaching the DB and returning unranked results,
+    # inconsistent with the top_k<1 guard in the same handler.
+    if not query or not query.strip():
+        raise MCPServerError("'query' must be a non-empty string (got empty or whitespace-only)")
+
     anchor_types: list[AnchorType] | None = None
     if types is not None:
         try:
@@ -271,6 +281,20 @@ async def search(
         repo_root=ctx.repo_root,
     )
 
+    # UAT-M-3 / U-fix-2: hybrid_search is synchronous and shares the
+    # process-local SQLite connection.  We previously wrapped it in
+    # ``asyncio.to_thread`` to keep the event loop responsive — but
+    # that violates SQLite's "connection used in a single thread"
+    # constraint and crashes with ``ProgrammingError``.
+    #
+    # The original "20s hang" reported by UAT-M-3 was first-time
+    # fastembed model load on cold disk + Windows Defender scanning,
+    # NOT a search-time bug.  Once the model is warm, hybrid_search
+    # returns in ~10ms.  Embedder warm-up should happen at server
+    # startup (handled in MCPServer._start_embedder); this handler
+    # therefore calls hybrid_search directly.  If you re-introduce
+    # backgrounding, switch the SQLite layer to a connection pool
+    # first (see DESIGN.md §10.4 future work).
     results = hybrid_search(
         query,
         db=ctx.db,
@@ -409,6 +433,22 @@ async def get_links(
             f"Invalid direction {direction!r}; expected 'outgoing', 'incoming', or 'both'"
         )
 
+    # UAT-M-9 / U-fix-6: validate link_types against the LinkType enum
+    # so callers don't silently get an empty result list (previously
+    # a typo'd link_type just returned no matches).  Mirrors the
+    # find_drift status_filter validation pattern.
+    if link_types is not None:
+        try:
+            valid_link_types = {lt.value for lt in LinkType}
+        except Exception:
+            valid_link_types = set()
+        unknown = set(link_types) - valid_link_types
+        if unknown and valid_link_types:
+            raise MCPServerError(
+                f"Unknown link_type values: {sorted(unknown)!r}. "
+                f"Valid values: {sorted(valid_link_types)!r}"
+            )
+
     git_ctx = ctx.git_context.get()
     index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
         git_ctx,
@@ -466,6 +506,7 @@ async def find_drift(
     *,
     scope: str | None = None,
     status_filter: list[str] | None = None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate section-level drift for active links (DESIGN.md §5.1).
 
@@ -479,6 +520,11 @@ async def find_drift(
                        included.
         status_filter: Optional allow-list of :class:`~scry.models.DriftStatus`
                        strings.  When supplied only matching rows are returned.
+        since:         UAT-M-4 / U-fix-3: optional git ref (e.g. ``"main"``,
+                       ``"HEAD~1"``).  When supplied only links whose endpoint
+                       files appear in ``git diff --name-only <since>..HEAD``
+                       are returned — the diff-aware drift gate the CLI
+                       exposes as ``scry check --since`` (UAT-8).
 
     Returns:
         Dict with top-level keys ``entries`` (list of drift dicts) and
@@ -526,6 +572,88 @@ async def find_drift(
 
     allowed_statuses: set[str] | None = set(status_filter) if status_filter is not None else None
 
+    # UAT-M-4 / U-fix-3: --since diff-aware drift.  Resolve the git diff
+    # ONCE up-front (rather than per-link) and filter evaluations to
+    # links whose endpoint files appear in the touched set.
+    touched_paths: set[str] | None = None
+    if since is not None:
+        import subprocess as _subprocess
+
+        # SECURITY (review-r6-1 BLOCKING): refuse anything that looks
+        # like a git option *before* shelling out.  ``git diff`` would
+        # otherwise interpret ``--output=<path>`` as an option and
+        # write to that path, turning this read-only MCP tool into a
+        # filesystem-write primitive.  We additionally resolve the
+        # ref to a SHA via ``rev-parse --verify --end-of-options``
+        # so any remaining ambiguity (refs starting with ``-``,
+        # whitespace, glob chars) is caught before the diff call.
+        if not isinstance(since, str) or not since.strip():
+            raise MCPServerError("'since' must be a non-empty string")
+        if since.startswith("-"):
+            raise MCPServerError(
+                f"'since' must be a git ref or commit SHA, not an option flag: {since!r}"
+            )
+        if any(c in since for c in ("\n", "\r", "\0")):
+            raise MCPServerError(f"'since' contains illegal whitespace/NUL: {since!r}")
+
+        try:
+            resolved = _subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ctx.repo_root),
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    f"{since}^{{commit}}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=_subprocess.DEVNULL,
+                timeout=10,
+            )
+        except _subprocess.CalledProcessError as exc:
+            raise MCPServerError(
+                f"--since {since!r} could not be resolved to a commit (git: {exc.stderr.strip()})"
+            ) from None
+        except _subprocess.TimeoutExpired as exc:
+            raise MCPServerError(f"--since {since!r} resolution timed out after 10s") from exc
+        except FileNotFoundError as exc:
+            raise MCPServerError("--since requires git on PATH") from exc
+
+        resolved_sha = resolved.stdout.strip()
+        # Belt + suspenders: ensure the resolved SHA is a hex string.
+        if not resolved_sha or any(c not in "0123456789abcdef" for c in resolved_sha.lower()):
+            raise MCPServerError(f"--since {since!r} resolved to non-SHA value: {resolved_sha!r}")
+
+        try:
+            diff_out = _subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ctx.repo_root),
+                    "diff",
+                    "--name-only",
+                    "--end-of-options",
+                    resolved_sha,
+                    "HEAD",
+                    "--",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                stdin=_subprocess.DEVNULL,
+                timeout=30,
+            )
+        except _subprocess.CalledProcessError as exc:
+            raise MCPServerError(
+                f"--since {since!r} diff failed (git: {exc.stderr.strip()})"
+            ) from None
+        except _subprocess.TimeoutExpired as exc:
+            raise MCPServerError(f"--since {since!r} diff timed out after 30s") from exc
+        touched_paths = {ln.strip() for ln in diff_out.stdout.splitlines() if ln.strip()}
+
     rows: list[dict[str, Any]] = []
     for ev in evaluations:
         link = ev.link
@@ -535,6 +663,15 @@ async def find_drift(
 
         if allowed_statuses is not None and ev.drift_status not in allowed_statuses:
             continue
+
+        # UAT-M-4 / U-fix-3: --since restricts to links touching files
+        # in the diff range.  Anchor IDs encode the path before the first
+        # ``:``; we match on either endpoint's path.
+        if touched_paths is not None:
+            from_path = link.from_id.split(":", 1)[0]
+            to_path = link.to_id.split(":", 1)[0]
+            if from_path not in touched_paths and to_path not in touched_paths:
+                continue
 
         rows.append(
             {
@@ -586,6 +723,12 @@ async def propose_link(
         lt = LinkType(link_type)
     except ValueError as exc:
         raise MCPServerError(f"Invalid link_type {link_type!r}: {exc}") from exc
+
+    # UAT-R5-15 / U-fix-9: reject self-links.  X→X is semantically
+    # nonsensical (would always be both-changed if X changes) and was
+    # silently allowed before.
+    if from_id == to_id:
+        raise MCPServerError(f"Self-links are not allowed: from_id == to_id == {from_id!r}")
 
     from_anchor = ctx.db.get_anchor(from_id)
     if from_anchor is None:
@@ -710,7 +853,102 @@ async def commit_links(
 
     promoted_event_ids = ctx.overlay_mgr.promote_pending()
     ctx.git_context.invalidate()
-    return {"promoted": list(promoted_event_ids), "index_state": index_state}
+
+    # UAT-M-6 / U-fix-5: enrich the promoted list so callers can verify
+    # by link_id (the stable user-facing handle) instead of event_id
+    # (an implementation-internal identifier).  Cross-reference the
+    # promoted event IDs against the active link table to recover
+    # link_ids.
+    replay_after = ctx.overlay_mgr.replay_active()
+    event_to_link: dict[str, str] = {}
+    for lk in replay_after.active_links.values():
+        event_to_link[lk.last_event_id] = lk.link_id
+    promoted_records = [
+        {"event_id": eid, "link_id": event_to_link.get(eid)} for eid in promoted_event_ids
+    ]
+    return {
+        "promoted": promoted_records,
+        # Backwards-compatible alias for callers using the old shape.
+        "promoted_event_ids": list(promoted_event_ids),
+        "index_state": index_state,
+    }
+
+
+async def unlink(
+    ctx: MCPContext,
+    link_id: str,
+    *,
+    reason: str | None = None,
+    idempotency_token: str | None = None,
+) -> dict[str, Any]:
+    """Tombstone a link by appending a DELETE record (UAT-M-5 / U-fix-4).
+
+    Mirrors the ``scry unlink`` CLI command.  Appends a DELETE record
+    to the current branch overlay; the link no longer appears in
+    ``get_links`` / ``find_drift`` output.  If the link is in baseline,
+    the DELETE is promoted on next ``commit_links``.
+
+    Per DESIGN.md §3.5: a tombstoned link's ``link_id`` is reserved
+    permanently.  To re-create a logically equivalent link, call
+    :func:`propose_link` (which mints a fresh ``link_id``).
+
+    Args:
+        ctx:               Injected :class:`MCPContext`.
+        link_id:           The ``link_id`` of the link to tombstone.
+        reason:            Optional rationale stored with the DELETE record.
+        idempotency_token: Carried through IPC for leader-side dedup.
+
+    Returns:
+        Dict with ``link_id``, ``event_id`` (the DELETE event), ``reason``,
+        and ``index_state``.
+
+    Raises:
+        :class:`MCPServerError`: If *link_id* is not in the active link
+            table (already tombstoned or never existed).
+    """
+    if not isinstance(link_id, str) or not link_id.strip():
+        raise MCPServerError("unlink: link_id must be a non-empty string.")
+
+    git_ctx = ctx.git_context.get()
+    index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
+        git_ctx,
+        ctx.db,
+        ctx.config,
+        indexer=ctx.indexer,
+        ipc_client=ctx.ipc_client,
+        repo_root=ctx.repo_root,
+    )
+
+    replay = _replay_active(ctx.overlay_mgr)
+    active = replay.active_links.get(link_id)
+    if active is None:
+        raise MCPServerError(
+            f"link_id {link_id!r} not found in active table "
+            "(may already be tombstoned, or never existed)."
+        )
+
+    evt_id = new_event_id()
+    record = LinkRecord.model_validate(
+        {
+            "op": LinkOp.DELETE,
+            "link_id": link_id,
+            "event_id": evt_id,
+            # supersedes is required on DELETE per §3.5 rule 5.
+            "supersedes": active.last_event_id,
+            "reason": reason or "scry unlink (MCP)",
+        }
+    )
+    try:
+        ctx.overlay_mgr.append_to_current_branch_overlay(record)
+    except Exception as exc:
+        raise MCPServerError(f"unlink: failed to append DELETE record: {exc}") from exc
+
+    return {
+        "link_id": link_id,
+        "event_id": evt_id,
+        "reason": record.reason,
+        "index_state": index_state,
+    }
 
 
 async def status(ctx: MCPContext) -> dict[str, Any]:
@@ -855,7 +1093,15 @@ async def reindex(
         raise MCPServerError(f"'force' must be a boolean, got {type(force).__name__}: {force!r}")
 
     if scope is not None:
-        logger.debug("reindex: scope=%r is accepted but ignored in Wave 2", scope)
+        # UAT-M-8: surface the limitation in the response (used to be
+        # debug-logged only — agents had no way to detect that their
+        # ``scope=`` arg was silently ignored).
+        logger.warning(
+            "reindex: scope=%r is accepted but currently ignored — "
+            "running a full repository re-index. Set scope_ignored=true "
+            "in the response so callers can detect the limitation.",
+            scope,
+        )
 
     result = await ctx.index_state_tracker.run_leader_reindex(ctx.indexer, force=force)
     await ctx.index_state_tracker.mark_fresh()
@@ -867,6 +1113,7 @@ async def reindex(
         "files_pruned": result.files_pruned,
         "force": force,
         "scope": scope,
+        "scope_ignored": scope is not None,
         "index_state": IndexState.FRESH,
     }
 
@@ -1281,28 +1528,43 @@ async def apply_link_suggestions(
     # Validate + filter using the same parser the LLM-provider path uses.
     validated: list[LinkSuggestion] = []
     rejected = 0
+    # UAT-M-12 / U-fix-8: track WHY each suggestion was rejected so the
+    # caller can distinguish "agent sent garbage" from "model below
+    # threshold".  Previously a mismatched pair_id was silently
+    # dropped — the count went into ``rejected`` but with no signal
+    # that anything was wrong with the input.
+    rejected_reasons: dict[str, int] = {}
+
+    def _reject(reason: str) -> None:
+        nonlocal rejected
+        rejected += 1
+        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+
     for item in suggestions:
         if not isinstance(item, dict):
-            rejected += 1
+            _reject("not_a_dict")
             continue
         pid = str(item.get("pair_id", ""))
         if pid not in pair_id_to_anchors:
-            rejected += 1
+            _reject("unknown_pair_id")
             continue
         if not bool(item.get("should_link", False)):
-            rejected += 1
+            _reject("should_link_false")
             continue
         link_type = str(item.get("link_type", ""))
         if link_type not in ("mirrors", "implements", "references"):
-            rejected += 1
+            _reject("invalid_link_type")
             continue
         try:
             confidence = float(item.get("confidence", 0.0))
         except (TypeError, ValueError):
-            rejected += 1
+            _reject("invalid_confidence")
             continue
-        if not (0.0 <= confidence <= 1.0) or confidence < min_confidence:
-            rejected += 1
+        if not (0.0 <= confidence <= 1.0):
+            _reject("confidence_out_of_range")
+            continue
+        if confidence < min_confidence:
+            _reject("below_min_confidence")
             continue
         from_id, to_id = pair_id_to_anchors[pid]
         validated.append(
@@ -1330,6 +1592,7 @@ async def apply_link_suggestions(
         ],
         "applied": 0,
         "rejected": rejected,
+        "rejected_reasons": rejected_reasons,
     }
 
     if not apply:
@@ -1393,6 +1656,7 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     "propose_link": propose_link,
     "accept_link": accept_link,
     "commit_links": commit_links,
+    "unlink": unlink,
     "status": status,
     "repo_summary": repo_summary,
     "reindex": reindex,

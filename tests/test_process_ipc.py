@@ -509,7 +509,14 @@ async def test_write_op_missing_token_rejected(tmp_repo: Path, unix_only: None) 
 @pytest.mark.unix_only
 async def test_write_ops_frozenset_contents() -> None:
     """WRITE_OPS contains exactly the expected operations."""
-    assert {"propose_link", "accept_link", "commit_links", "reindex"} == WRITE_OPS
+    assert {
+        "propose_link",
+        "accept_link",
+        "commit_links",
+        "unlink",
+        "reindex",
+        "apply_link_suggestions",
+    } == WRITE_OPS
 
 
 # ─── Validation (unix_only) ───────────────────────────────────────────

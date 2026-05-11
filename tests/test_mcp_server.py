@@ -254,10 +254,16 @@ async def test_search_invalid_type_raises(git_repo: Path) -> None:
 
 
 async def test_search_empty_query_returns_empty(git_repo: Path) -> None:
-    """search() returns [] for a whitespace-only query."""
+    """search() rejects whitespace-only queries (UAT-M-10 / U-fix-7).
+
+    Pre-fix: silently returned ``[]`` (looked like a hit-rate bug to agents).
+    Post-fix: raises MCPServerError to mirror the SR4-2 top_k validation
+    pattern.  Both behaviors return no results — only the diagnostic
+    signal differs.
+    """
     ctx = _make_ctx(git_repo)
-    results = await search(ctx, "   ")
-    assert results == []
+    with pytest.raises(MCPServerError, match="non-empty"):
+        await search(ctx, "   ")
 
 
 # ─── Tests: get_anchor ────────────────────────────────────────────────────────
@@ -461,17 +467,29 @@ async def test_accept_link_missing_raises(git_repo: Path) -> None:
 
 
 async def test_commit_links_promotes_and_returns_event_ids(git_repo: Path) -> None:
-    """commit_links() returns dict with promoted event_ids + index_state (UT3-5)."""
+    """commit_links() returns dict with promoted records (event_id+link_id) + index_state.
+
+    UAT-M-6 / U-fix-5 update: ``promoted`` is now a list of
+    ``{event_id, link_id}`` records (was bare event_id strings).
+    A backwards-compat alias ``promoted_event_ids`` preserves the
+    old shape for downstream callers that haven't migrated.
+    """
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
     result = await commit_links(ctx)
     assert isinstance(result, dict)
     assert "promoted" in result
+    assert "promoted_event_ids" in result
     assert "index_state" in result  # UT3-5: §7.3 requirement
     promoted = result["promoted"]
     assert isinstance(promoted, list)
     assert len(promoted) == 1
-    assert promoted[0].startswith("evt_")
+    # New shape: {event_id, link_id}
+    assert isinstance(promoted[0], dict)
+    assert promoted[0]["event_id"].startswith("evt_")
+    assert promoted[0]["link_id"] is None or promoted[0]["link_id"].startswith("lnk_")
+    # Back-compat alias still works
+    assert result["promoted_event_ids"][0].startswith("evt_")
 
 
 async def test_commit_links_clears_pending(git_repo: Path) -> None:
@@ -571,7 +589,7 @@ async def test_reindex_follower_raises(git_repo: Path) -> None:
 
 
 def test_handlers_dict_covers_all_tools() -> None:
-    """HANDLERS covers all 14 MCP tool names (12 base + 2 UAT-R5-2 agent-driven)."""
+    """HANDLERS covers all 15 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven)."""
     expected = {
         "search",
         "get_anchor",
@@ -580,6 +598,8 @@ def test_handlers_dict_covers_all_tools() -> None:
         "propose_link",
         "accept_link",
         "commit_links",
+        # UAT-M-5 / U-fix-4: tombstone a link by link_id
+        "unlink",
         "status",
         "repo_summary",
         "reindex",
