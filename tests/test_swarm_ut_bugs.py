@@ -711,6 +711,50 @@ def test_uat_7_check_warns_when_fs_is_newer_than_index(tmp_path: Path) -> None:
         _os.chdir(cwd0)
 
 
+def test_uat_4_init_auto_detects_languages(tmp_path: Path) -> None:
+    """UAT-4: scry init walks the repo and adds Go/Rust/JS to include
+    when those files exist, instead of hard-coding md/py/ts only.
+    """
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    repo = tmp_path / "polyglot"
+    repo.mkdir()
+    (repo / "main.go").write_text("package main\nfunc main() {}\n")
+    (repo / "lib.rs").write_text("pub fn x() {}\n")
+    (repo / "app.js").write_text("function f() {}\n")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    import os as _os
+
+    cwd0 = _os.getcwd()
+    try:
+        _os.chdir(repo)
+        result = runner.invoke(main, ["init"])
+        assert result.exit_code == 0, result.output
+        config_text = (repo / ".scry" / "config.yaml").read_text(encoding="utf-8")
+        for needed in ("**/*.go", "**/*.rs", "**/*.js"):
+            assert needed in config_text, (
+                f"UAT-4: {needed} should be auto-detected and included; config:\n{config_text}"
+            )
+    finally:
+        _os.chdir(cwd0)
+
+
+def test_uat_18_check_supports_uncovered_flag() -> None:
+    """UAT-18: scry check --uncovered must list unlinked spec sections."""
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["check", "--help"])
+    assert result.exit_code == 0
+    assert "--uncovered" in result.output, "scry check --help must advertise --uncovered (UAT-18)"
+
+
 def test_uat_15_search_supports_scope_glob() -> None:
     """UAT-15: scry search --scope <glob> filters results to matching paths."""
     from click.testing import CliRunner
