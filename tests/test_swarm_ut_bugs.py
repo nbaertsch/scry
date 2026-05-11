@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 # ─── UT3-1 BLOCKING: git_context must close stdin to avoid pipe-inheritance hang
 
 
@@ -630,3 +632,132 @@ def test_sr2_4_ipc_client_docstring_no_longer_claims_not_implemented() -> None:
         "IPCClient docstring is stale — Windows IPC is fully implemented "
         "via _WinPipeIO (Wave 6b).  Remove the NotImplementedError claim."
     )
+
+
+# ─── SR3 edge-case regression tests ───────────────────────────────────────────
+
+
+def test_sr3_3_index_command_catches_sqlite_operationalerror() -> None:
+    """SR3-3: scry index must handle sqlite3.OperationalError without traceback."""
+    import inspect
+
+    from scry.cli import index as _index_cmd
+
+    src = inspect.getsource(_index_cmd.callback)  # type: ignore[arg-type]
+    assert "sqlite3.OperationalError" in src, (
+        "scry index must catch sqlite3.OperationalError to avoid stack "
+        "traces on read-only DB scenarios (SR3-3)"
+    )
+
+
+def test_sr3_1_2_check_callers_subclasses_catch_git_context_error() -> None:
+    """SR3-1/2: check, callers, subclasses must catch GitContextError cleanly."""
+    import inspect
+
+    from scry.cli import callers, check, subclasses
+
+    for name, cmd in (("check", check), ("callers", callers), ("subclasses", subclasses)):
+        src = inspect.getsource(cmd.callback)  # type: ignore[arg-type]
+        assert "GitContextError" in src, (
+            f"scry {name} must catch GitContextError to avoid stack traces on "
+            f"no-commits repos (SR3-1/2)"
+        )
+
+
+def test_sr3_4_code_extractor_skips_utf16_bom(tmp_path: Path) -> None:
+    """SR3-4: extract_code_symbols must detect UTF-16 BOM and return [] cleanly."""
+    from scry.extract.code import extract_code_symbols
+
+    f = tmp_path / "u.py"
+    # Write a UTF-16 LE encoded Python source.  The BOM (\xff\xfe)
+    # is included automatically by .write_text(encoding="utf-16").
+    f.write_text("def hello(): pass\n", encoding="utf-16")
+    raw = f.read_bytes()
+    assert raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"), "fixture sanity"
+    anchors = extract_code_symbols(f, tmp_path, language="python")
+    assert anchors == [], (
+        f"UTF-16 BOM Python source must be skipped (SR3-4 / §15.4); got {anchors!r}"
+    )
+
+
+def test_sr3_7_code_extractor_warns_on_parse_errors(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SR3-7: parse errors in source files must produce a warning log."""
+    import logging
+
+    from scry.extract.code import extract_code_symbols
+
+    f = tmp_path / "broken.py"
+    f.write_bytes(b"def good(): pass\nx = (1 + 2\ndef after(): return 99\n")
+    with caplog.at_level(logging.WARNING, logger="scry.extract.code"):
+        extract_code_symbols(f, tmp_path, language="python")
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "syntax errors" in text, (
+        "extract_code_symbols must warn when tree-sitter detects parse errors "
+        f"(SR3-7); records=\n{text}"
+    )
+
+
+# ─── SR4 MCP fuzzer regression tests ──────────────────────────────────────────
+
+
+async def test_sr4_1_reindex_rejects_non_bool_force() -> None:
+    """SR4-1: reindex MUST reject string ``force`` instead of coercing to True."""
+    from scry.mcp.handlers import MCPServerError, reindex
+
+    class _DummyIndexer:
+        pass
+
+    class _DummyCtx:
+        indexer = _DummyIndexer()
+        index_state_tracker = None  # type: ignore[assignment]
+
+    try:
+        await reindex(_DummyCtx(), force="yes")  # type: ignore[arg-type]
+    except MCPServerError as exc:
+        assert "force" in str(exc).lower() and "bool" in str(exc).lower(), (
+            f"reindex must reject non-bool force; error message was: {exc}"
+        )
+    else:
+        raise AssertionError("reindex must reject non-bool force value (SR4-1); no error raised")
+
+
+async def test_sr4_2_search_rejects_non_positive_top_k() -> None:
+    """SR4-2: search MUST reject top_k < 1 with a clear error."""
+    from scry.mcp.handlers import MCPServerError, search
+
+    for bad in (0, -1, -100):
+        try:
+            await search(None, "anything", top_k=bad)  # type: ignore[arg-type]
+        except MCPServerError as exc:
+            assert "top_k" in str(exc), f"expected top_k in error, got {exc}"
+        except AttributeError:
+            # Implementation reaches ctx.git_context before raising — also acceptable
+            # AS LONG AS the validation runs first.  If we got past validation,
+            # AttributeError on None means the assertion did NOT happen first.
+            raise AssertionError(
+                f"search must reject top_k={bad} BEFORE accessing ctx (SR4-2)"
+            ) from None
+        else:
+            raise AssertionError(f"search must reject top_k={bad} (SR4-2)")
+
+
+async def test_sr4_3_find_drift_rejects_unknown_status_filter() -> None:
+    """SR4-3: find_drift MUST reject unknown status_filter values."""
+    from scry.mcp.handlers import MCPServerError, find_drift
+
+    try:
+        await find_drift(None, status_filter=["typo_status"])  # type: ignore[arg-type]
+    except MCPServerError as exc:
+        msg = str(exc)
+        assert "status" in msg.lower() and "typo_status" in msg, (
+            f"find_drift error must mention the unknown value; got: {exc}"
+        )
+    except AttributeError:
+        # Validation didn't run before ctx access — fail.
+        raise AssertionError(
+            "find_drift must validate status_filter BEFORE accessing ctx (SR4-3)"
+        ) from None
+    else:
+        raise AssertionError("find_drift must reject unknown status_filter values (SR4-3)")

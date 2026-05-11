@@ -941,6 +941,17 @@ def extract_code_symbols(
     if not src_bytes:
         return []
 
+    # SR3-4 / §15.4: detect UTF-16 BOM and skip with a clear warning,
+    # mirroring extract_markdown's behaviour.  Tree-sitter would
+    # otherwise treat the entire byte stream as a single ERROR node
+    # and silently produce zero anchors with no diagnostic.
+    if src_bytes.startswith(b"\xff\xfe") or src_bytes.startswith(b"\xfe\xff"):
+        logger.warning(
+            "extract_code_symbols: skipping %s — UTF-16 encoded; transcode to UTF-8 to index",
+            path,
+        )
+        return []
+
     # Resolve symbol kinds (config override or language default).
     config_kinds = config.symbol_kinds.get(lang_key) or config.symbol_kinds.get(grammar_name)
     if config_kinds is not None:
@@ -962,6 +973,17 @@ def extract_code_symbols(
         return []
 
     root = tree.root_node
+
+    # SR3-7: tree-sitter recovers from many syntax errors but its
+    # ERROR-node insertion can swallow trailing top-level declarations
+    # without any signal to the operator.  Emit a single warning when
+    # the parse contains errors so users can correlate "missing
+    # symbols" with "unparseable file".
+    if root.has_error:
+        logger.warning(
+            "extract_code_symbols: %s has syntax errors; some symbols may be missing",
+            path,
+        )
 
     # Dispatch to language-specific walker.
     if grammar_name == "python":

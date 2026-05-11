@@ -819,4 +819,14 @@ def extract_markdown(
             )
         )
 
+    # SR3-5: surface frontmatter-only / empty-body files via a debug log
+    # so an operator can correlate "files_processed counted this but 0
+    # anchors emitted" with a clear cause.  Stays at debug level to
+    # avoid noise in normal indexing.
+    if not anchors:
+        logger.debug(
+            "extract_markdown: %s produced no anchors (empty body or frontmatter-only)",
+            path,
+        )
+
     return anchors

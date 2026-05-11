@@ -374,7 +374,13 @@ async def test_find_drift_scope_filter(git_repo: Path) -> None:
 
 
 async def test_find_drift_status_filter(git_repo: Path) -> None:
-    """find_drift() status_filter restricts by drift status."""
+    """find_drift() status_filter restricts by drift status.
+
+    SR4-3 update: bogus status values now raise MCPServerError instead
+    of silently returning [].
+    """
+    from scry.mcp.handlers import MCPServerError
+
     ctx = _make_ctx(git_repo)
     await propose_link(ctx, _SPEC_ID, _CODE_ID, "implements")
     result_all = await find_drift(ctx)
@@ -384,9 +390,10 @@ async def test_find_drift_status_filter(git_repo: Path) -> None:
     # Filtering for this status should return the entry.
     result_filtered = await find_drift(ctx, status_filter=[first_status])
     assert len(result_filtered["entries"]) == 1
-    # Filtering for a bogus status should return nothing.
-    result_none = await find_drift(ctx, status_filter=["bogus-status"])
-    assert result_none["entries"] == []
+    # SR4-3: bogus status values must now be rejected loudly so callers
+    # don't confuse "no drift" with "your filter was a typo".
+    with pytest.raises(MCPServerError, match="bogus-status"):
+        await find_drift(ctx, status_filter=["bogus-status"])
 
 
 # ─── Tests: propose_link ─────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import platform
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -434,6 +435,11 @@ def index(ctx: click.Context, force: bool, reembed: bool) -> None:
     except (IndexerError, LockTimeout) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(1) from None
+    except sqlite3.OperationalError as exc:
+        # SR3-3: previously surfaced as a Python traceback when
+        # vectors.db was read-only or otherwise un-writable.
+        click.echo(f"error: cannot write to index: {exc}", err=True)
+        raise SystemExit(1) from None
 
     click.echo(
         f"Indexed: files_processed={result.files_processed} "
@@ -662,7 +668,10 @@ def check(
                 coverage_total_code_anchors=coverage_total,
                 coverage_linked_code_anchors=linked_code,
             )
-    except (LockTimeout, OSError) as exc:
+    except (GitContextError, LockTimeout, OSError) as exc:
+        # SR3-1: GitContextError previously propagated as a stack trace
+        # in repos with no commits.  Catch it here so users get a clean
+        # ``error: git unavailable: ...`` message and exit 2.
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from None
 
@@ -1458,7 +1467,9 @@ def callers(ctx: click.Context, anchor_id: str, max_depth: int, as_json: bool) -
     except MCPServerError as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from None
-    except (LockTimeout, OSError) as exc:
+    except (GitContextError, LockTimeout, OSError) as exc:
+        # SR3-2: include GitContextError so callers on a no-commits
+        # repo gets a clean error message instead of a stack trace.
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from None
 
@@ -1543,7 +1554,8 @@ def subclasses(ctx: click.Context, anchor_id: str, as_json: bool) -> None:
     except MCPServerError as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from None
-    except (LockTimeout, OSError) as exc:
+    except (GitContextError, LockTimeout, OSError) as exc:
+        # SR3-2: same GitContextError handling as `scry callers`.
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(2) from None
 

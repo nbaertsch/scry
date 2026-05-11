@@ -42,6 +42,7 @@ from scry.models import (
     AnchorType,
     Config,
     DriftConfig,
+    DriftStatus,
     IndexState,
     LinkOp,
     LinkRecord,
@@ -254,6 +255,12 @@ async def search(
         except ValueError as exc:
             raise MCPServerError(f"Invalid anchor type in 'types': {exc}") from exc
 
+    # SR4-2: reject non-positive top_k explicitly.  Negative values
+    # otherwise leak Python list-slicing semantics; zero silently
+    # returns an empty result set without indicating a caller error.
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise MCPServerError(f"'top_k' must be a positive integer, got {top_k!r}")
+
     git_ctx = ctx.git_context.get()
     index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
         git_ctx,
@@ -433,6 +440,21 @@ async def find_drift(
         ``to_id``, ``link_type``, ``drift_status``, ``semantic_drift``,
         ``drift_coverage`` (always ``"section-only"`` in Wave 2).
     """
+    # SR4-3: validate status_filter EARLY so callers don't silently get
+    # an empty entries list (which is indistinguishable from "no drift").
+    # Mirrors the search() contract for `types`.
+    if status_filter is not None:
+        try:
+            valid_statuses = {s.value for s in DriftStatus}
+        except Exception:
+            valid_statuses = set()
+        unknown = set(status_filter) - valid_statuses
+        if unknown and valid_statuses:
+            raise MCPServerError(
+                f"Unknown drift status values: {sorted(unknown)!r}. "
+                f"Valid values: {sorted(valid_statuses)!r}"
+            )
+
     git_ctx = ctx.git_context.get()
     index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
         git_ctx,
@@ -778,6 +800,13 @@ async def reindex(
             "reindex is a write operation — this process is a follower and "
             "has no Indexer. The request should be forwarded to the leader via IPC."
         )
+
+    # SR4-1: reject non-bool ``force`` values explicitly.  FastMCP's
+    # Pydantic layer otherwise coerces strings like "yes" / "true" /
+    # any non-empty string to True, leading to silent surprise full
+    # re-indexes.
+    if not isinstance(force, bool):
+        raise MCPServerError(f"'force' must be a boolean, got {type(force).__name__}: {force!r}")
 
     if scope is not None:
         logger.debug("reindex: scope=%r is accepted but ignored in Wave 2", scope)
