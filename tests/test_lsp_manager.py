@@ -554,3 +554,5 @@ async def test_supports_false_for_missing_capability(
         assert not session.supports("completionProvider")
         assert not session.supports("hoverProvider")
         assert session.supports("callHierarchyProvider")
+
+# uat-r5-5 pr-d noise

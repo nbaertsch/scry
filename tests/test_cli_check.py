@@ -432,3 +432,5 @@ class TestExitCodes:
         result = _run(runner, ["check"], repo=repo_with_drift_unknown)
         assert result.exit_code == 0, result.output
         assert "drift_unknown" in result.output
+
+# uat-r5-5 pr-d noise

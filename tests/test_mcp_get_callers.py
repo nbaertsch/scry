@@ -476,3 +476,5 @@ async def test_get_subclasses_anchor_lookup_enriches_anchor_id(git_repo: Path) -
     assert isinstance(subs, list)
     if subs:
         assert "symbol_name" in subs[0] or "path" in subs[0]
+
+# uat-r5-5 pr-d noise

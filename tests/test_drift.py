@@ -1349,3 +1349,5 @@ class TestRegressionClosureSuppressionExpandedW4a:
         assert ev.drift_status == DriftStatus.CODE_CHANGED, (
             "complete status MUST allow closure comparison to fire"
         )
+
+# uat-r5-5 pr-d noise

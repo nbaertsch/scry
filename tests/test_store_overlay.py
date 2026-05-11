@@ -749,3 +749,5 @@ def test_pending_promotion_fields() -> None:
     assert pp.overlay_path == Path("/repo/.scry/overlays/main.jsonl")
     assert pp.promoted_event_ids == eids
     assert pp.ts == now
+
+# uat-r5-5 pr-d noise

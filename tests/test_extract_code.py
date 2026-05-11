@@ -525,3 +525,5 @@ class TestCanonicalize:
         from scry.anchor_id import canonicalize_content
 
         assert canonicalize(text) == canonicalize_content(text)
+
+# uat-r5-5 pr-d noise

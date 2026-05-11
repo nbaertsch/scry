@@ -957,3 +957,5 @@ class TestGlobalFlags:
         assert result.exit_code == 0
         assert "scry" in result.output
         assert "0.0.1" in result.output
+
+# uat-r5-5 pr-d noise

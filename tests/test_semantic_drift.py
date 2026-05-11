@@ -684,3 +684,5 @@ class TestRegressionZigLanguageInferenceW4b:
             assert _infer_language(f"src/x.{ext}") == "javascript", (
                 f".{ext} should resolve to javascript"
             )
+
+# uat-r5-5 pr-d noise

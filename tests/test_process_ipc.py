@@ -831,3 +831,5 @@ async def test_malformed_json_closes_connection(tmp_repo: Path, unix_only: None)
         assert srv._server is not None
     finally:
         await srv.stop()
+
+# uat-r5-5 pr-d noise

@@ -859,3 +859,5 @@ class TestDynamicFixtures:
     def test_symlink_outside_is_symlink(self, symlink_outside: Path) -> None:
         """Outside-repo symlink is a symlink (target may or may not exist)."""
         assert symlink_outside.is_symlink()
+
+# uat-r5-5 pr-d noise

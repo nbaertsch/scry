@@ -501,3 +501,5 @@ def test_windows_path_str_conversion(tmp_path: Path) -> None:
     provider = GitContextProvider(tmp_path, head_poll_interval_seconds=0)
     ctx = provider.get()
     assert ctx.head_sha  # Non-empty means git invocation succeeded.
+
+# uat-r5-5 pr-d noise
