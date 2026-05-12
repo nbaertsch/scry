@@ -36,6 +36,7 @@ Windows IPC (DESIGN.md §10.5, §10.7):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -65,6 +66,54 @@ MAX_MESSAGE_BYTES: int = 1_048_576  # 1 MiB
 RECV_BUFFER_SIZE: int = 65_536
 
 _IS_WINDOWS: bool = sys.platform == "win32"
+
+
+# ─── Windows pipe concurrency limits (SR2-2) ─────────────────────────
+#
+# The Windows IPC path wraps every blocking ReadFile/WriteFile in
+# ``loop.run_in_executor(_win_pipe_executor, ...)`` so the asyncio
+# event loop stays responsive.  Each connected follower holds at
+# minimum one executor thread blocked in ``readline()``.
+#
+# Without a cap this starves the executor — the leader stops accepting
+# both new connections AND new request bytes from existing followers
+# once concurrent connections exceed pool size.  Originally observed
+# at ~12 concurrent followers with the default ThreadPoolExecutor.
+#
+# Mitigation (pragmatic, not a full IOCP refactor):
+#   1. Use a DEDICATED executor sized to ``MAX_WIN_PIPE_IO_WORKERS`` so
+#      Windows pipe I/O cannot starve unrelated ``asyncio.to_thread``
+#      callers (git diff, file hashing, model load, etc.).
+#   2. Cap concurrent connections at ``MAX_WIN_CONNECTIONS``.  When at
+#      cap the leader sends a ``connection_rejected`` connection-level
+#      frame (see :func:`IPCClient._recv_response`) and closes the
+#      pipe, so clients see a clean ``too_many_connections`` error
+#      instead of hanging or seeing OSError.
+#
+# A proper IOCP/FILE_FLAG_OVERLAPPED rewrite remains future work.
+def _win_default_cpu_count() -> int:
+    # Python 3.13+ exposes process_cpu_count which honors CPU affinity;
+    # fall back to os.cpu_count for 3.11/3.12.
+    proc_count = getattr(os, "process_cpu_count", None)
+    n = proc_count() if proc_count is not None else os.cpu_count()
+    return n or 4
+
+
+_WIN_CPUS: int = _win_default_cpu_count()
+
+#: Hard cap on concurrent followers on Windows.  Bounded to a safe
+#: range (4..28) so small machines aren't penalized and very large
+#: machines don't keep an absurd number of pipe threads alive.
+MAX_WIN_CONNECTIONS: int = max(4, min(28, _WIN_CPUS * 2))
+
+#: Slack threads reserved for the accept loop's ConnectNamedPipe call,
+#: per-connection write/SID-check tasks, and the rejection-frame writes
+#: themselves.  Without slack a fully-loaded connection set could still
+#: starve writes.
+WIN_PIPE_RESERVED_THREADS: int = 4
+
+#: Worker count for the dedicated Windows pipe executor.
+MAX_WIN_PIPE_IO_WORKERS: int = MAX_WIN_CONNECTIONS + WIN_PIPE_RESERVED_THREADS
 
 # Compiled pattern matching the tok_<...> idempotency token format (models.py).
 _TOKEN_RE: re.Pattern[str] = re.compile(r"^tok_[A-Za-z0-9_-]+$")
@@ -210,6 +259,21 @@ class IPCResponse:
 IPCHandler: TypeAlias = Callable[[IPCRequest], Awaitable[IPCResponse]]
 
 # ─── Idempotency LRU cache ────────────────────────────────────────────
+
+
+class IPCConnectionRejected(RuntimeError):
+    """Raised by :class:`IPCClient` when the leader sends a
+    ``connection_rejected`` connection-level frame.
+
+    Surfaces the leader's machine-readable ``error_type`` (e.g.
+    ``"too_many_connections"``) and a hint for how long to wait
+    before retrying.  See SR2-2 in the issue tracker for context.
+    """
+
+    def __init__(self, message: str, *, error_type: str, retry_after_ms: int) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.retry_after_ms = retry_after_ms
 
 
 class _IdempotencyCache:
@@ -624,16 +688,31 @@ def _win_build_pipe_sa() -> Any:
 class _WinPipeIO:
     """Async-compatible I/O wrapper around a blocking Windows named-pipe HANDLE.
 
-    All blocking calls (ReadFile, WriteFile) are dispatched to the default
-    thread-pool executor via :func:`asyncio.to_thread`.  A :class:`threading.Lock`
-    serialises concurrent writes so heartbeat and response bytes never interleave
-    in the pipe's write buffer.
+    All blocking calls (ReadFile, WriteFile) are dispatched to the
+    *executor* passed at construction time, or to the default thread
+    pool via :func:`asyncio.to_thread` when *executor* is ``None``.
+    Server-side connections receive the leader's dedicated pipe
+    executor (see :data:`MAX_WIN_PIPE_IO_WORKERS`) so a stuck pipe
+    cannot starve unrelated ``asyncio.to_thread`` callers (SR2-2).
+
+    A :class:`threading.Lock` serialises concurrent writes so heartbeat
+    and response bytes never interleave in the pipe's write buffer.
     """
 
-    def __init__(self, handle: Any) -> None:
+    def __init__(
+        self,
+        handle: Any,
+        executor: concurrent.futures.Executor | None = None,
+    ) -> None:
         self._handle = handle
         self._read_buf = b""
         self._write_lock = threading.Lock()
+        self._executor = executor
+
+    async def _run_in_executor(self, fn: Callable[..., Any], *args: Any) -> Any:
+        if self._executor is None:
+            return await asyncio.to_thread(fn, *args)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
 
     def _readline_sync(self) -> bytes:
         """Read bytes from the pipe until a newline is found (blocking).
@@ -673,8 +752,9 @@ class _WinPipeIO:
                 raise OSError(exc.args[0], exc.args[2]) from exc
 
     async def readline(self) -> bytes:
-        """Async readline: delegates to the thread pool."""
-        return await asyncio.to_thread(self._readline_sync)
+        """Async readline: delegates to the configured executor."""
+        result: bytes = await self._run_in_executor(self._readline_sync)
+        return result
 
     def _write_sync(self, data: bytes) -> None:
         """Write *data* to the pipe (blocking, serialised by write lock)."""
@@ -690,8 +770,8 @@ class _WinPipeIO:
                 raise OSError(exc.args[0], exc.args[2]) from exc
 
     async def write_all(self, data: bytes) -> None:
-        """Async write: delegates to the thread pool."""
-        await asyncio.to_thread(self._write_sync, data)
+        """Async write: delegates to the configured executor."""
+        await self._run_in_executor(self._write_sync, data)
 
     def close(self) -> None:
         """Close the underlying pipe handle (idempotent).
@@ -766,7 +846,8 @@ class _WinConnectionHandler:
                     win32security.RevertToSelf()
                 return str(client_sid) == str(self._our_sid)
 
-            return await asyncio.to_thread(_check_sync)
+            result: bool = await self._io._run_in_executor(_check_sync)
+            return result
         except pywintypes.error:
             log.warning("IPC(win): SID check failed; rejecting connection", exc_info=True)
             return False
@@ -891,6 +972,10 @@ class IPCServer:
         self._win_accept_task: asyncio.Task[None] | None = None
         self._win_stop_event: threading.Event = threading.Event()
         self._win_pipe_name: str = ""
+        # SR2-2: dedicated executor for Windows blocking pipe I/O.
+        # Lazily created in _start_win so non-Windows / never-started
+        # servers don't pay for thread creation.
+        self._win_pipe_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     @property
     def endpoint_uri(self) -> str:
@@ -945,6 +1030,17 @@ class IPCServer:
         self._win_pipe_name = spec.address
         self._win_stop_event.clear()
 
+        # SR2-2: dedicated executor for Windows blocking pipe I/O so a
+        # stuck pipe cannot starve unrelated ``asyncio.to_thread`` callers
+        # (git diff, file hashing, model load, etc.).  Sized to
+        # MAX_WIN_PIPE_IO_WORKERS = MAX_WIN_CONNECTIONS + reserved slack.
+        if self._win_pipe_executor is None:
+            self._win_pipe_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_WIN_PIPE_IO_WORKERS,
+                thread_name_prefix="scry-ipc-win-pipe",
+            )
+        win_executor = self._win_pipe_executor
+
         sa = _win_build_pipe_sa()
         our_sid = _win_get_current_user_sid()
 
@@ -962,12 +1058,16 @@ class IPCServer:
         # pipe causes a clean failure that the caller surfaces, instead of
         # silently advertising an endpoint we don't actually own
         # (review-w6b BLOCKING fix).
+        # SR2-2: cap concurrent pipe instances at MAX_WIN_CONNECTIONS+1
+        # so Windows itself applies backpressure once we hit the limit
+        # (extra +1 is the always-present "currently being created" slot).
+        max_pipe_instances = MAX_WIN_CONNECTIONS + 1
         try:
             first_handle = win32pipe.CreateNamedPipe(
                 pipe_name,
                 win32pipe.PIPE_ACCESS_DUPLEX | first_instance_flag,
                 win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                max_pipe_instances,
                 RECV_BUFFER_SIZE,
                 RECV_BUFFER_SIZE,
                 0,
@@ -995,7 +1095,7 @@ class IPCServer:
                             win32pipe.PIPE_TYPE_BYTE
                             | win32pipe.PIPE_READMODE_BYTE
                             | win32pipe.PIPE_WAIT,
-                            win32pipe.PIPE_UNLIMITED_INSTANCES,
+                            max_pipe_instances,
                             RECV_BUFFER_SIZE,
                             RECV_BUFFER_SIZE,
                             0,
@@ -1005,10 +1105,13 @@ class IPCServer:
                         log.error("IPC(win): CreateNamedPipe failed: %s", exc)
                         break
 
-                # ConnectNamedPipe blocks until a client connects.  We run it in
-                # a thread so the event loop stays responsive.
+                # ConnectNamedPipe blocks until a client connects.  We run it
+                # in the dedicated pipe executor so the event loop stays
+                # responsive AND pipe accepts cannot starve the default pool.
                 try:
-                    await asyncio.to_thread(win32pipe.ConnectNamedPipe, handle, None)
+                    await asyncio.get_running_loop().run_in_executor(
+                        win_executor, win32pipe.ConnectNamedPipe, handle, None
+                    )
                 except asyncio.CancelledError:
                     win32file.CloseHandle(handle)
                     return
@@ -1038,7 +1141,47 @@ class IPCServer:
                     win32file.CloseHandle(handle)
                     return
 
-                io = _WinPipeIO(handle)
+                # SR2-2: prune done tasks BEFORE counting so the
+                # add_done_callback lag (one event-loop turn) doesn't
+                # cause false rejections.
+                for done_task in tuple(connection_tasks):
+                    if done_task.done():
+                        connection_tasks.discard(done_task)
+
+                if len(connection_tasks) >= MAX_WIN_CONNECTIONS:
+                    # SR2-2: at cap — send a connection-level rejection
+                    # frame and close.  Clients see a clean
+                    # ``too_many_connections`` error instead of hanging.
+                    log.warning(
+                        "IPC(win): rejecting connection — at MAX_WIN_CONNECTIONS=%d",
+                        MAX_WIN_CONNECTIONS,
+                    )
+                    rejected_io = _WinPipeIO(handle, executor=win_executor)
+                    try:
+                        reject_frame = (
+                            json.dumps(
+                                {
+                                    "type": "connection_rejected",
+                                    "ok": False,
+                                    "error": (
+                                        f"IPC server is at MAX_WIN_CONNECTIONS"
+                                        f"={MAX_WIN_CONNECTIONS}; retry shortly."
+                                    ),
+                                    "error_type": "too_many_connections",
+                                    "retry_after_ms": 100,
+                                },
+                                separators=(",", ":"),
+                            ).encode()
+                            + b"\n"
+                        )
+                        with contextlib.suppress(OSError):
+                            await rejected_io.write_all(reject_frame)
+                    finally:
+                        rejected_io.close()
+                    handle = None
+                    continue
+
+                io = _WinPipeIO(handle, executor=win_executor)
                 conn = _WinConnectionHandler(io, handler, cache, overlay_locks, config, our_sid)
 
                 async def _conn_task(c: _WinConnectionHandler = conn) -> None:
@@ -1149,6 +1292,13 @@ class IPCServer:
             spec = parse_endpoint_uri(self._uri, self._repo_root)
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(spec.address)
+
+        # SR2-2: shut down the dedicated Windows pipe executor AFTER all
+        # connection tasks/handles are closed so we don't strand workers.
+        if self._win_pipe_executor is not None:
+            with contextlib.suppress(Exception):
+                self._win_pipe_executor.shutdown(wait=False, cancel_futures=True)
+            self._win_pipe_executor = None
 
         log.info("IPC: server stopped")
 
@@ -1285,6 +1435,23 @@ class IPCClient:
             if resp_d.get("type") == "heartbeat":
                 continue
 
+            # SR2-2: ``connection_rejected`` is a connection-level
+            # frame sent by the leader when at MAX_WIN_CONNECTIONS.
+            # It has no ``id`` field; surface it as a clean
+            # too_many_connections error before the response-id check
+            # so callers don't see a confusing "stream state is corrupt".
+            if resp_d.get("type") == "connection_rejected":
+                await self.close()
+                error_msg = (
+                    str(resp_d.get("error"))
+                    or "IPC server is busy (too_many_connections); retry shortly"
+                )
+                raise IPCConnectionRejected(
+                    error_msg,
+                    error_type=str(resp_d.get("error_type") or "too_many_connections"),
+                    retry_after_ms=int(resp_d.get("retry_after_ms") or 100),
+                )
+
             # Wire-protocol invariant: the leader echoes our request id.
             resp_id = resp_d.get("id")
             if resp_id != req_id:
@@ -1387,10 +1554,14 @@ class IPCClient:
 
 __all__ = [
     "MAX_MESSAGE_BYTES",
+    "MAX_WIN_CONNECTIONS",
+    "MAX_WIN_PIPE_IO_WORKERS",
     "RECV_BUFFER_SIZE",
+    "WIN_PIPE_RESERVED_THREADS",
     "WRITE_OPS",
     "EndpointSpec",
     "IPCClient",
+    "IPCConnectionRejected",
     "IPCHandler",
     "IPCRequest",
     "IPCResponse",

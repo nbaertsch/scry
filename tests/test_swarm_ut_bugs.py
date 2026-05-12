@@ -1973,3 +1973,148 @@ def test_review_r6abc_3_match_offset_none_when_not_substring() -> None:
         "build_anchor_packet must return match_offset=None when excerpt is "
         "not a substring of content_text (review-r6abc-3)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR2-2: Windows pipe thread-pool starvation (cap + dedicated executor)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr2_2_max_win_connections_within_safe_range() -> None:
+    """SR2-2: MAX_WIN_CONNECTIONS must stay in the safe range [4, 28].
+
+    Below 4 = false rejects on tiny machines.  Above 28 = doesn't
+    actually fix the pool starvation (default ThreadPoolExecutor caps
+    at 32 workers and we reserve 4 slack threads for accept/writes).
+    """
+    from scry.process.ipc import MAX_WIN_CONNECTIONS
+
+    assert 4 <= MAX_WIN_CONNECTIONS <= 28, (
+        f"MAX_WIN_CONNECTIONS={MAX_WIN_CONNECTIONS} outside the safe [4, 28] range (SR2-2)"
+    )
+
+
+def test_sr2_2_max_win_pipe_io_workers_has_reserved_slack() -> None:
+    """SR2-2: MAX_WIN_PIPE_IO_WORKERS = MAX_WIN_CONNECTIONS + reserved slack.
+
+    Without slack a fully-loaded connection set could starve writes
+    (rejection frames, heartbeats) and accept-loop ConnectNamedPipe.
+    """
+    from scry.process.ipc import (
+        MAX_WIN_CONNECTIONS,
+        MAX_WIN_PIPE_IO_WORKERS,
+        WIN_PIPE_RESERVED_THREADS,
+    )
+
+    assert WIN_PIPE_RESERVED_THREADS >= 4, (
+        f"WIN_PIPE_RESERVED_THREADS={WIN_PIPE_RESERVED_THREADS} too small; "
+        "need slack for accept + write + SID checks (SR2-2)"
+    )
+    assert MAX_WIN_PIPE_IO_WORKERS == MAX_WIN_CONNECTIONS + WIN_PIPE_RESERVED_THREADS
+
+
+def test_sr2_2_ipc_connection_rejected_exception_exposed() -> None:
+    """SR2-2: ``IPCConnectionRejected`` must be importable + carry ``error_type``
+    and ``retry_after_ms`` so callers can implement backoff.
+    """
+    from scry.process.ipc import IPCConnectionRejected
+
+    exc = IPCConnectionRejected("busy", error_type="too_many_connections", retry_after_ms=250)
+    assert isinstance(exc, RuntimeError)  # back-compat with existing handlers
+    assert exc.error_type == "too_many_connections"
+    assert exc.retry_after_ms == 250
+
+
+def test_sr2_2_win_pipe_io_accepts_executor_kwarg() -> None:
+    """SR2-2: ``_WinPipeIO`` must accept an ``executor`` kwarg so the
+    server can pass a dedicated pool (and clients can omit it to fall
+    back to ``asyncio.to_thread``).
+    """
+    import inspect
+
+    from scry.process.ipc import _WinPipeIO
+
+    sig = inspect.signature(_WinPipeIO.__init__)
+    assert "executor" in sig.parameters, (
+        "_WinPipeIO.__init__ must accept an 'executor' kwarg (SR2-2)"
+    )
+    # Default must be None so client-side construction stays unchanged.
+    assert sig.parameters["executor"].default is None
+
+
+def test_sr2_2_recv_response_handles_connection_rejected() -> None:
+    """SR2-2: ``IPCClient._recv_response`` must check for the
+    ``connection_rejected`` connection-level frame BEFORE the
+    response-id check.  Otherwise clients see a confusing "stream
+    state is corrupt" error instead of the documented overload signal.
+    """
+    import inspect
+
+    from scry.process.ipc import IPCClient
+
+    src = inspect.getsource(IPCClient._recv_response)
+    assert '"connection_rejected"' in src, (
+        "_recv_response must handle the connection_rejected frame (SR2-2)"
+    )
+    # The check must come before the id-mismatch error message.
+    rej_idx = src.index("connection_rejected")
+    id_check_idx = src.index("response id mismatch")
+    assert rej_idx < id_check_idx, (
+        "_recv_response must check connection_rejected BEFORE the response-id validation (SR2-2)"
+    )
+
+
+def test_sr2_2_accept_loop_caps_connections_and_prunes() -> None:
+    """SR2-2: ``_start_windows`` accept loop must:
+    1. prune done connection_tasks BEFORE counting (avoids one-loop-turn
+       lag from add_done_callback)
+    2. send a connection_rejected frame when at MAX_WIN_CONNECTIONS
+    3. CreateNamedPipe with a finite max_pipe_instances (NOT
+       PIPE_UNLIMITED_INSTANCES) so Windows applies backpressure
+    """
+    import inspect
+
+    from scry.process.ipc import IPCServer
+
+    src = inspect.getsource(IPCServer._start_windows)
+    assert "MAX_WIN_CONNECTIONS" in src, "accept loop must reference MAX_WIN_CONNECTIONS (SR2-2)"
+    assert "max_pipe_instances" in src and "MAX_WIN_CONNECTIONS + 1" in src, (
+        "CreateNamedPipe must use a finite instance count, not PIPE_UNLIMITED (SR2-2)"
+    )
+    assert "PIPE_UNLIMITED_INSTANCES" not in src, (
+        "accept loop must NOT use PIPE_UNLIMITED_INSTANCES (SR2-2)"
+    )
+    assert "connection_rejected" in src, (
+        "accept loop must send a connection_rejected frame when at cap (SR2-2)"
+    )
+    # Pruning loop: must filter done tasks from connection_tasks BEFORE
+    # the cap check, otherwise stale tasks cause false rejections.
+    assert "if done_task.done()" in src or "task.done()" in src, (
+        "accept loop must prune done connection_tasks before the cap check (SR2-2)"
+    )
+
+
+def test_sr2_2_ipc_server_owns_dedicated_pipe_executor() -> None:
+    """SR2-2: ``IPCServer`` must own a dedicated ``_win_pipe_executor``
+    so Windows pipe I/O cannot starve unrelated ``asyncio.to_thread``
+    callers (git diff, file hashing, etc.).
+    """
+    import inspect
+
+    from scry.process.ipc import IPCServer
+
+    init_src = inspect.getsource(IPCServer.__init__)
+    assert "_win_pipe_executor" in init_src, (
+        "IPCServer must declare _win_pipe_executor in __init__ (SR2-2)"
+    )
+
+    start_src = inspect.getsource(IPCServer._start_windows)
+    assert "ThreadPoolExecutor" in start_src and "MAX_WIN_PIPE_IO_WORKERS" in start_src, (
+        "_start_windows must construct the dedicated executor with "
+        "max_workers=MAX_WIN_PIPE_IO_WORKERS (SR2-2)"
+    )
+
+    stop_src = inspect.getsource(IPCServer.stop)
+    assert "_win_pipe_executor" in stop_src and "shutdown" in stop_src, (
+        "IPCServer.stop must shutdown the dedicated executor (SR2-2)"
+    )
