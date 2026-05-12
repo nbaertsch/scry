@@ -498,7 +498,25 @@ async def get_links(
             }
         )
 
-    return {"links": rows, "index_state": index_state}
+    # UAT-M-7: Wave 2 allows multiple link_ids for the same (from, to, type)
+    # triple.  Deduplicate to one logical link per triple, keeping the LAST
+    # row encountered — replay processes records in append order, so the
+    # last row for a triple corresponds to the most recently created/updated
+    # logical link.  (review-r6abc-2: the previous tie-breaker was
+    # ``max(link_id)`` which is random for uuid4-shaped IDs.)
+    # Report ``historical_count`` so callers can see history existed.
+    deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    counts: dict[tuple[str, str, str], int] = {}
+    for row in rows:
+        key = (row["from_id"], row["to_id"], row["type"])
+        deduped[key] = row  # last write wins (replay-order = creation-order)
+        counts[key] = counts.get(key, 0) + 1
+    final_rows: list[dict[str, Any]] = []
+    for key, best in deduped.items():
+        best["historical_count"] = counts[key]
+        final_rows.append(best)
+
+    return {"links": final_rows, "index_state": index_state}
 
 
 async def find_drift(
@@ -765,7 +783,7 @@ async def propose_link(
     ctx.overlay_mgr.append_to_current_branch_overlay(record)
     ctx.git_context.invalidate()
 
-    return {
+    result: dict[str, Any] = {
         "link_id": lid,
         "from_id": from_id,
         "to_id": to_id,
@@ -773,6 +791,14 @@ async def propose_link(
         "status": "staged",
         "index_state": ctx.index_state_tracker.current_state,
     }
+    # UAT-R5-14: warn when no idempotency_token supplied — retries will
+    # mint a new link_id each time, silently creating duplicates.
+    if idempotency_token is None:
+        logger.warning(
+            "propose_link called without idempotency_token; retries will create duplicate links"
+        )
+        result["warning"] = "called without idempotency_token; retries will create duplicates"
+    return result
 
 
 async def accept_link(
@@ -806,7 +832,7 @@ async def accept_link(
     if link is None:
         raise MCPServerError(f"Proposed link not found in active overlay: {proposed_id!r}")
 
-    return {
+    result: dict[str, Any] = {
         "link_id": link.link_id,
         "from_id": link.from_id,
         "to_id": link.to_id,
@@ -814,6 +840,15 @@ async def accept_link(
         "status": "accepted",
         "index_state": ctx.index_state_tracker.current_state,
     }
+    # UAT-R5-14: warn when no idempotency_token — retries are safe (Wave 2
+    # accept is a read-confirm), but callers should supply a token for
+    # consistency with the idempotency contract.
+    if idempotency_token is None:
+        logger.warning(
+            "accept_link called without idempotency_token; retries will create duplicates"
+        )
+        result["warning"] = "called without idempotency_token; retries will create duplicates"
+    return result
 
 
 async def commit_links(
@@ -943,12 +978,19 @@ async def unlink(
     except Exception as exc:
         raise MCPServerError(f"unlink: failed to append DELETE record: {exc}") from exc
 
-    return {
+    result: dict[str, Any] = {
         "link_id": link_id,
         "event_id": evt_id,
         "reason": record.reason,
         "index_state": index_state,
     }
+    # UAT-R5-14: warn when no idempotency_token — a retry without a token
+    # will fail gracefully (link already tombstoned), but token-aware
+    # callers should supply one for correct IPC idempotency semantics.
+    if idempotency_token is None:
+        logger.warning("unlink called without idempotency_token; retries will create duplicates")
+        result["warning"] = "called without idempotency_token; retries will create duplicates"
+    return result
 
 
 async def status(ctx: MCPContext) -> dict[str, Any]:
@@ -1197,10 +1239,14 @@ async def get_callers(
     suffix = _Path(anchor.path).suffix.lower()
     lang = _EXT_TO_LANG.get(suffix)
     if lang is None:
-        raise MCPServerError(
-            f"Cannot infer LSP language from path {anchor.path!r} "
-            f"(unsupported extension {suffix!r})"
-        )
+        # UAT-R5-8: extension has no LSP integration in scry — return with
+        # lsp_status instead of raising so callers can distinguish "leaf
+        # function" from "no LSP for this file type".
+        return {
+            "callers": [],
+            "lsp_status": "unsupported",
+            "index_state": index_state,
+        }
 
     file_uri = (ctx.repo_root / anchor.path).as_uri()
     def_line: int = anchor.def_line
@@ -1216,15 +1262,32 @@ async def get_callers(
     async with _LSPManager(ctx.repo_root, ctx.config.code_anchors) as mgr:
         session = await mgr.session_for(lang)
         if session is None:
-            return {"callers": [], "index_state": index_state}
+            # UAT-R5-8: report why the list is empty so callers can
+            # distinguish "leaf function" from "LSP unavailable".
+            mgr_status = mgr.status_for(lang)
+            lsp_status_val: str = "unsupported" if mgr_status == "skip" else "unavailable"
+            return {
+                "callers": [],
+                "lsp_status": lsp_status_val,
+                "index_state": index_state,
+            }
 
-        caller_refs = await _get_callers(
-            session,
-            file_uri,
-            def_line,
-            def_char,
-            max_depth=max_depth,
-        )
+        try:
+            caller_refs = await _get_callers(
+                session,
+                file_uri,
+                def_line,
+                def_char,
+                max_depth=max_depth,
+            )
+        except Exception as exc:
+            logger.warning("get_callers LSP error for %r: %s", anchor_id, exc)
+            return {
+                "callers": [],
+                "lsp_status": "error",
+                "lsp_error": str(exc),
+                "index_state": index_state,
+            }
 
     def _uri_to_path(uri: str) -> str:
         """Convert file:// URI to a repo-relative path best-effort."""
@@ -1263,7 +1326,7 @@ async def get_callers(
             }
         )
 
-    return {"callers": callers_out, "index_state": index_state}
+    return {"callers": callers_out, "lsp_status": "available", "index_state": index_state}
 
 
 async def get_subclasses(
@@ -1327,10 +1390,13 @@ async def get_subclasses(
     suffix = _Path(anchor.path).suffix.lower()
     lang = _EXT_TO_LANG.get(suffix)
     if lang is None:
-        raise MCPServerError(
-            f"Cannot infer LSP language from path {anchor.path!r} "
-            f"(unsupported extension {suffix!r})"
-        )
+        # UAT-R5-8: unsupported extension — return with lsp_status rather than
+        # raising so callers can distinguish "no subclasses" from "no LSP here".
+        return {
+            "subclasses": [],
+            "lsp_status": "unsupported",
+            "index_state": index_state,
+        }
 
     file_uri = (ctx.repo_root / anchor.path).as_uri()
     def_line_s: int = anchor.def_line
@@ -1346,14 +1412,30 @@ async def get_subclasses(
     async with _LSPManager(ctx.repo_root, ctx.config.code_anchors) as mgr:
         session = await mgr.session_for(lang)
         if session is None:
-            return {"subclasses": [], "index_state": index_state}
+            # UAT-R5-8: report why the list is empty.
+            mgr_status = mgr.status_for(lang)
+            lsp_status_val: str = "unsupported" if mgr_status == "skip" else "unavailable"
+            return {
+                "subclasses": [],
+                "lsp_status": lsp_status_val,
+                "index_state": index_state,
+            }
 
-        subclass_refs = await _get_subclasses(
-            session,
-            file_uri,
-            def_line_s,
-            def_char_s,
-        )
+        try:
+            subclass_refs = await _get_subclasses(
+                session,
+                file_uri,
+                def_line_s,
+                def_char_s,
+            )
+        except Exception as exc:
+            logger.warning("get_subclasses LSP error for %r: %s", anchor_id, exc)
+            return {
+                "subclasses": [],
+                "lsp_status": "error",
+                "lsp_error": str(exc),
+                "index_state": index_state,
+            }
 
     def _uri_to_path(uri: str) -> str:
         try:
@@ -1401,7 +1483,7 @@ async def get_subclasses(
             }
         )
 
-    return {"subclasses": subclasses_out, "index_state": index_state}
+    return {"subclasses": subclasses_out, "lsp_status": "available", "index_state": index_state}
 
 
 # ─── Agent-driven suggest-links (UAT-R5-2) ───────────────────────────────────

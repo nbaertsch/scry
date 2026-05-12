@@ -21,6 +21,9 @@ code drift apart, scry surfaces it.
 
 ## Install
 
+> All commands below use `uv run scry`. If you'd prefer bare `scry` invocations,
+> install with `pip install -e .` instead (adds the `scry` binary to your PATH).
+
 ```bash
 git clone https://github.com/nbaertsch/scry
 cd scry
@@ -32,11 +35,29 @@ uv run scry --help
 
 ```bash
 # In the repo you want to track:
-scry init          # writes .scry/config.yaml + .gitignore + .gitattributes
-scry index         # builds vectors.db (incremental on subsequent runs)
-scry search "your query"
-scry doctor        # health check
+uv run scry init          # writes .scry/config.yaml + .gitignore + .gitattributes
+uv run scry index         # builds vectors.db (incremental on subsequent runs)
+uv run scry search "your query"
+uv run scry doctor        # health check
 ```
+
+## Core workflow
+
+```bash
+# 1. Build (or refresh) the local index
+uv run scry index
+
+# 2. Link a spec section to its implementing code
+uv run scry link "docs/auth.md::## Authentication" "src/auth.py:login" --type implements
+
+# 3. Check for drift between linked spec and code
+uv run scry check
+
+# 4. Promote overlay links to the shared baseline
+uv run scry commit-links
+```
+
+Run `uv run scry COMMAND --help` for full options on each command.
 
 To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
 
@@ -51,7 +72,7 @@ To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
 }
 ```
 
-(`scry init` prints this snippet for you.)
+(`uv run scry init` prints this snippet for you.)
 
 ## Capabilities
 

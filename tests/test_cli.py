@@ -960,3 +960,326 @@ class TestGlobalFlags:
 
 
 # uat-r5-5 pr-d noise
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-5 — scry check --ci alone must not be a no-op
+# ---------------------------------------------------------------------------
+
+
+class TestUATR55CIImpliesStrict:
+    """UAT-R5-5: --ci without threshold flags now implies --strict."""
+
+    def test_ci_alone_exits_1_on_non_fresh_link(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """--ci with no thresholds implies --strict; exits 1 when non-fresh links exist."""
+        from scry.models import AnchorType, LinkRecord, new_event_id, new_link_id
+        from scry.store.db import ScryDB
+        from scry.store.links import LinkStore
+
+        repo = indexed_and_built_repo
+        _HA = "sha256:" + "a" * 64
+        _HB = "sha256:" + "b" * 64
+
+        with ScryDB(repo) as db:
+            from scry.models import Anchor
+
+            db.upsert_anchor(
+                Anchor(
+                    id="docs/spec.md::r55-from",
+                    type=AnchorType.SECTION,
+                    path="docs/spec.md",
+                    content_text="changed spec text",
+                    content_hash=_HB,
+                    fingerprint_simhash=0,
+                )
+            )
+            db.upsert_anchor(
+                Anchor(
+                    id="src/app.py::r55_to_fn",
+                    type=AnchorType.CODE,
+                    path="src/app.py",
+                    content_text="def r55_to_fn(): pass",
+                    content_hash=_HA,
+                    fingerprint_simhash=0,
+                )
+            )
+
+        store = LinkStore(repo)
+        record = LinkRecord.model_validate(
+            {
+                "op": "upsert",
+                "link_id": new_link_id(),
+                "event_id": new_event_id(),
+                "from": "docs/spec.md::r55-from",
+                "from_type": "section",
+                "to": "src/app.py::r55_to_fn",
+                "to_type": "code",
+                "type": "implements",
+                "from_content_hash": _HA,  # stored ≠ current _HB → spec_changed
+                "to_content_hash": _HA,
+            }
+        )
+        store.append_baseline(record)
+
+        result = _run(runner, ["check", "--ci"], repo=repo)
+        assert result.exit_code == 1, (
+            "--ci without thresholds must imply --strict and exit 1 on non-fresh links"
+        )
+
+    def test_ci_alone_emits_warning(self, runner: CliRunner, indexed_and_built_repo: Path) -> None:
+        """--ci without thresholds emits a one-line warning explaining the implicit --strict."""
+        result = _run(runner, ["check", "--ci"], repo=indexed_and_built_repo)
+        # Fresh repo → exit 0, but warning must appear.
+        assert result.exit_code == 0, result.output
+        assert "implies --strict" in result.output or "implies --strict" in result.output
+
+    def test_ci_with_drift_min_no_implicit_strict(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """--ci --drift-min does NOT emit the implicit-strict warning."""
+        result = _run(runner, ["check", "--ci", "--drift-min", "90"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        assert "implies --strict" not in result.output
+
+    def test_ci_with_strict_no_duplicate_warning(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """--ci --strict does NOT emit the implicit-strict warning (user was explicit)."""
+        result = _run(runner, ["check", "--ci", "--strict"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        assert "implies --strict" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-3 — anchors list tab-separated and --json (already fixed; regression)
+# ---------------------------------------------------------------------------
+
+
+class TestUATR53AnchorsListFormat:
+    """UAT-R5-3: anchors list uses tab separators and supports --json."""
+
+    def test_anchors_list_tab_separated(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """anchors list output uses tab characters between id, type, symbol_name."""
+        result = _run(runner, ["anchors", "list"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        lines = [ln for ln in result.output.splitlines() if ln and not ln.startswith("...")]
+        if lines:
+            # Each non-truncation line must be tab-separated (at least 1 tab per line).
+            for line in lines[:5]:
+                assert "\t" in line, f"Expected tab separator in: {line!r}"
+
+    def test_anchors_list_json_flag(self, runner: CliRunner, indexed_and_built_repo: Path) -> None:
+        """anchors list --json emits valid JSON with 'anchors' list and 'truncated' bool."""
+        result = _run(runner, ["anchors", "list", "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "anchors" in data
+        assert "truncated" in data
+        if data["anchors"]:
+            first = data["anchors"][0]
+            assert "id" in first
+            assert "type" in first
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-16 — Windows UTF-8 reconfigure (already fixed; regression)
+# ---------------------------------------------------------------------------
+
+
+class TestUATR516WindowsUTF8:
+    """UAT-R5-16: cli.py reconfigures stdout/stderr to UTF-8 on Windows at import."""
+
+    def test_cli_reconfigures_utf8_on_win32(self) -> None:
+        """cli.py module-level code reconfigures stdio to UTF-8 on Windows."""
+        import inspect
+
+        import scry.cli as _cli_mod
+
+        src = inspect.getsource(_cli_mod)
+        assert 'sys.platform == "win32"' in src, (
+            "UAT-R5-16: cli.py must have a win32 UTF-8 reconfigure block"
+        )
+        assert "utf-8" in src, "UAT-R5-16: cli.py must set encoding='utf-8'"
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-17 — search --json and show --json
+# ---------------------------------------------------------------------------
+
+
+class TestUATR517SearchShowJson:
+    """UAT-R5-17: search and show support --json flag."""
+
+    def test_search_json_flag_produces_valid_json(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """search --json emits a JSON array of results with expected keys."""
+        result = _run(runner, ["search", "policy", "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        if data:
+            first = data[0]
+            assert "anchor_id" in first
+            assert "score" in first
+            assert "type" in first
+            assert "path" in first
+
+    def test_search_json_empty_query_returns_empty_list(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """search --json with empty query emits [] (JSON empty array)."""
+        result = _run(runner, ["search", "   ", "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data == []
+
+    def test_show_json_flag_produces_valid_json(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """show --json emits {id, content_text} JSON object."""
+        # Get an anchor id first.
+        from scry.store.db import ScryDB
+
+        with ScryDB(indexed_and_built_repo, read_only=True) as db:
+            anchors = db.list_anchors()
+        assert anchors, "Need at least one anchor for this test"
+        anchor_id = anchors[0].id
+
+        result = _run(runner, ["show", anchor_id, "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "id" in data
+        assert "content_text" in data
+        assert data["id"] == anchor_id
+
+    def test_show_without_json_still_writes_plain_text(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """show without --json still writes raw content_text (no regression)."""
+        from scry.store.db import ScryDB
+
+        with ScryDB(indexed_and_built_repo, read_only=True) as db:
+            anchors = db.list_anchors()
+        assert anchors
+        anchor = anchors[0]
+
+        result = _run(runner, ["show", anchor.id], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        # Plain text mode: output is the content_text verbatim (no JSON wrapping).
+        assert result.output.startswith("{") is False or '"id"' not in result.output
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-18 — check --json must have counts.total (already fixed; regression)
+# ---------------------------------------------------------------------------
+
+
+class TestUATR518CheckJsonTotal:
+    """UAT-R5-18: check --json output includes counts.total."""
+
+    def test_check_json_has_counts_total(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """check --json output has counts.total as an integer."""
+        result = _run(runner, ["check", "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "counts" in data
+        assert "total" in data["counts"], "counts.total must be present in JSON output"
+        assert isinstance(data["counts"]["total"], int), "counts.total must be an integer"
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-19 — get-link --json uses link_type (primary) + type (back-compat alias)
+# ---------------------------------------------------------------------------
+
+
+class TestUATR519GetLinkJson:
+    """UAT-R5-19: get-link --json outputs link_type and keeps type as alias."""
+
+    def test_get_link_json_has_link_type_field(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """get-link --json output has link_type field."""
+        repo = indexed_and_built_repo
+        from scry.models import AnchorType, LinkRecord, new_event_id, new_link_id
+        from scry.store.db import ScryDB
+        from scry.store.links import LinkStore
+
+        _H = "sha256:" + "a" * 64
+
+        with ScryDB(repo) as db:
+            from scry.models import Anchor
+
+            db.upsert_anchor(
+                Anchor(
+                    id="docs/spec.md::r519-from",
+                    type=AnchorType.SECTION,
+                    path="docs/spec.md",
+                    content_text="section",
+                    content_hash=_H,
+                    fingerprint_simhash=0,
+                )
+            )
+            db.upsert_anchor(
+                Anchor(
+                    id="src/app.py::r519_fn",
+                    type=AnchorType.CODE,
+                    path="src/app.py",
+                    content_text="def r519_fn(): pass",
+                    content_hash=_H,
+                    fingerprint_simhash=0,
+                )
+            )
+
+        store = LinkStore(repo)
+        link_id = new_link_id()
+        record = LinkRecord.model_validate(
+            {
+                "op": "upsert",
+                "link_id": link_id,
+                "event_id": new_event_id(),
+                "from": "docs/spec.md::r519-from",
+                "from_type": "section",
+                "to": "src/app.py::r519_fn",
+                "to_type": "code",
+                "type": "implements",
+                "from_content_hash": _H,
+                "to_content_hash": _H,
+            }
+        )
+        store.append_baseline(record)
+
+        result = _run(runner, ["get-link", link_id, "--json"], repo=repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "link_type" in data, "get-link --json must have 'link_type' field (UAT-R5-19)"
+        assert "type" in data, "get-link --json must keep deprecated 'type' field (UAT-R5-19)"
+        assert data["link_type"] == data["type"], "link_type and type must have the same value"
+        assert data["link_type"] == "implements"
+
+
+# ---------------------------------------------------------------------------
+# UAT-R5-20 — check --json includes scry_version
+# ---------------------------------------------------------------------------
+
+
+class TestUATR520CheckJsonVersion:
+    """UAT-R5-20: check --json output includes scry_version."""
+
+    def test_check_json_has_scry_version(
+        self, runner: CliRunner, indexed_and_built_repo: Path
+    ) -> None:
+        """check --json output has scry_version field matching scry.__version__."""
+        import scry
+
+        result = _run(runner, ["check", "--json"], repo=indexed_and_built_repo)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "scry_version" in data, "check --json must include scry_version (UAT-R5-20)"
+        assert data["scry_version"] == scry.__version__

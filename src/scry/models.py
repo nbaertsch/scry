@@ -434,6 +434,20 @@ class AnchorPacket(BaseModel):
     anchor: Anchor
     score: float
     evidence_excerpt: str | None = None
+    match_offset: int | None = None
+    """Character offset of ``evidence_excerpt`` within the anchor's ``content_text``.
+
+    Only present when ``evidence_excerpt`` is a TRUE sub-string of the anchor
+    content (i.e. was NOT dropped because it was identical to the displayed
+    ``content_text``).  ``None`` when ``evidence_excerpt`` is absent, when
+    it is not a substring of ``content_text`` (e.g. generated chunks,
+    overlap windows), or when the offset could not be determined.  Allows
+    callers to reconstruct the surrounding context window (UAT-R5-9).
+
+    Note: this is a Python ``str`` character offset, NOT a UTF-8 byte
+    offset.  Consistent with other character-based positions in
+    AnchorPacket.  (Clarified in review-r6abc-3.)
+    """
     links: list[AnchorLinkProjection] = Field(default_factory=list)
     index_state: IndexState = IndexState.FRESH
     content_truncated: bool = False

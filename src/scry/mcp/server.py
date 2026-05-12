@@ -249,7 +249,7 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool(annotations=_write)
+        @mcp.tool(annotations=_idem_write)
         async def propose_link(
             from_id: str,
             to_id: str,
@@ -278,7 +278,7 @@ class MCPServer:
                 ),
             )
 
-        @mcp.tool(annotations=_write)
+        @mcp.tool(annotations=_idem_write)
         async def accept_link(
             proposed_id: str,
             idempotency_token: str | None = None,
@@ -377,8 +377,15 @@ class MCPServer:
         async def get_callers(anchor_id: str, max_depth: int = 1) -> dict[str, Any]:
             """Return symbols that CALL the given code anchor.
 
-            Requires an LSP for the anchor's language; without one
-            the response will indicate ``lsp_unavailable``.
+            Always returns a ``lsp_status`` field:
+
+            * ``"available"``   — LSP responded successfully.
+            * ``"unavailable"`` — LSP not configured / binary not on PATH.
+            * ``"unsupported"`` — file's language has no LSP integration in scry.
+            * ``"error"``       — LSP responded with an error (see ``lsp_error``).
+
+            An empty ``callers`` list with ``lsp_status != "available"`` means
+            the LSP is absent, NOT that the function has no callers.
             """
             return cast(
                 dict[str, Any],
@@ -392,8 +399,15 @@ class MCPServer:
         async def get_subclasses(anchor_id: str) -> dict[str, Any]:
             """Return classes that EXTEND the given class anchor.
 
-            Requires an LSP for the anchor's language; without one
-            the response will indicate ``lsp_unavailable``.
+            Always returns a ``lsp_status`` field:
+
+            * ``"available"``   — LSP responded successfully.
+            * ``"unavailable"`` — LSP not configured / binary not on PATH.
+            * ``"unsupported"`` — file's language has no LSP integration in scry.
+            * ``"error"``       — LSP responded with an error (see ``lsp_error``).
+
+            An empty ``subclasses`` list with ``lsp_status != "available"``
+            means the LSP is absent, NOT that the class has no subclasses.
             """
             return cast(
                 dict[str, Any],

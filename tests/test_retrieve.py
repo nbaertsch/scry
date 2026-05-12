@@ -741,4 +741,44 @@ class TestBuildAnchorPacket:
         assert packet.evidence_excerpt is None
 
 
+# ---------------------------------------------------------------------------
+# UAT-M-11 — top_k error message must use user-facing top_k, not candidate_k
+# ---------------------------------------------------------------------------
+
+
+class TestUATM11TopKErrorMessage:
+    """UAT-M-11: error from sqlite-vec with large top_k shows user-facing top_k."""
+
+    def test_oversized_top_k_error_uses_user_value(self, db: ScryDB) -> None:
+        """When sqlite-vec rejects the candidate_k, error mentions top_k not top_k*20."""
+        from unittest.mock import patch
+
+        from scry.embed import StubEmbedder
+        from scry.retrieve import hybrid_search
+
+        embedder = StubEmbedder(dimensions=DIMS)
+        # Simulate sqlite-vec raising an OperationalError with "k value <internal>"
+        fake_exc = Exception("k value 2000000 is too large")
+
+        with (
+            patch.object(db, "query_vector", side_effect=fake_exc),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            hybrid_search(
+                "test query",
+                db=db,
+                embedder=embedder,
+                top_k=100000,
+            )
+        err_msg = str(exc_info.value)
+        # Must mention the user-facing top_k (100000), NOT the internal candidate_k (2000000).
+        assert "100000" in err_msg, (
+            f"UAT-M-11: error message must show user-facing top_k=100000, not candidate_k. "
+            f"Got: {err_msg!r}"
+        )
+        assert "2000000" not in err_msg, (
+            f"UAT-M-11: error message must NOT leak internal candidate_k=2000000. Got: {err_msg!r}"
+        )
+
+
 # uat-r5-5 pr-d noise

@@ -219,11 +219,21 @@ class LinkStore:
 
         # Rules 1 + 2: process in document order; last record for each
         # link_id wins (baseline first, overlay second → overlay wins ties).
+        # review-r6abc-2 follow-up: pop+reassign on existing keys so that
+        # ``link_last`` iteration order tracks LAST-EVENT order.  Python's
+        # default ``dict[k] = v`` on an existing key preserves the original
+        # insertion position, which would silently break consumers that
+        # iterate ``active_links.values()`` expecting the most-recently
+        # touched link to come last (e.g. ``get_links`` MCP dedup).
         link_last: dict[LinkId, LinkRecord] = {}
         for record in all_records:
+            if record.link_id in link_last:
+                del link_last[record.link_id]
             link_last[record.link_id] = record
 
         # Build the active link table from the winning record per link_id.
+        # ``active_links`` inherits ``link_last``'s last-event iteration
+        # order (DELETEs are skipped but their absence preserves order).
         active_links: dict[LinkId, Link] = {}
         for link_id, last_record in link_last.items():
             if last_record.op == LinkOp.UPSERT:

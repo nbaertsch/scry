@@ -356,7 +356,19 @@ def hybrid_search(
     # Step 2: Retrieve a large candidate set from both indices so that
     # promotion always yields ≥ top_k unique parents after dedup.
     candidate_k = max(top_k * 20, 200)
-    vec_raw: list[tuple[int, float]] = db.query_vector(query_embedding, top_k=candidate_k)
+    try:
+        vec_raw: list[tuple[int, float]] = db.query_vector(query_embedding, top_k=candidate_k)
+    except Exception as exc:
+        # UAT-M-11: sqlite-vec raises an error that includes the internal
+        # oversampled candidate_k (top_k * 20) rather than the user-supplied
+        # top_k.  Re-raise with the user-facing value so the error message is
+        # actionable ("k value 100000" not "k value 2000000").
+        msg = str(exc)
+        if "k value" in msg:
+            raise ValueError(
+                f"top_k {top_k} is too large for the vector index. Use a smaller value."
+            ) from exc
+        raise
     # Sanitize the query for FTS5 (review-w2d HIGH fix): natural-language
     # queries with punctuation crash MATCH otherwise.  An empty sanitized
     # query short-circuits BM25 (vector retrieval still runs).
@@ -514,6 +526,33 @@ def build_anchor_packet(
     # Create a new (frozen) Anchor copy with the (possibly truncated) content.
     display_anchor: Anchor = anchor.model_copy(update={"content_text": truncated_text})
 
+    # UAT-R5-9: deduplicate evidence_excerpt vs displayed content.
+    # When the excerpt is byte-identical to the truncated content, it adds 0
+    # information and roughly doubles the token payload.  Drop it.
+    # When it IS a true substring (long anchor, specific chunk), cap at 200
+    # chars and record the match offset so callers can reconstruct context.
+    #
+    # NOTE (review-r6abc-3): ``match_offset`` is a CHARACTER offset (Python
+    # ``str.find``), not a byte offset.  This is consistent with the rest
+    # of the AnchorPacket which exposes character-based positions.  We
+    # explicitly return ``None`` when the excerpt is NOT a substring of
+    # ``content_text`` (e.g. generated chunks, overlap windows) — falling
+    # back to ``0`` would silently misdirect callers to the start of the
+    # anchor.
+    match_offset: int | None = None
+    if evidence_excerpt is not None:
+        if evidence_excerpt == truncated_text:
+            # Exact match — omit the duplicate.
+            evidence_excerpt = None
+        else:
+            # True substring — record offset into the ORIGINAL content, then
+            # cap to 200 chars to avoid per-result token waste.  Offset is
+            # a CHARACTER offset; ``None`` if the excerpt is not a substring.
+            raw_offset = anchor.content_text.find(evidence_excerpt)
+            match_offset = raw_offset if raw_offset >= 0 else None
+            if len(evidence_excerpt) > 200:
+                evidence_excerpt = evidence_excerpt[:200]
+
     # Steps 4 & 5: Links — deferred to W2i / W2e.
     # TODO(W2i): populate outgoing/incoming links from the link store once
     # W2b/W2c link-store workstreams are stable.
@@ -523,6 +562,7 @@ def build_anchor_packet(
         anchor=display_anchor,
         score=result.score,
         evidence_excerpt=evidence_excerpt,
+        match_offset=match_offset,
         links=links,
         index_state=index_state,
         content_truncated=content_truncated,

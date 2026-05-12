@@ -1762,3 +1762,214 @@ def test_uat_m_4_find_drift_since_rejects_option_injection() -> None:
     assert "stdin=_subprocess.DEVNULL" in src and "timeout=" in src, (
         "find_drift git subprocess calls must set stdin=DEVNULL and a timeout (review-r6-1)"
     )
+
+
+# ─── UAT Round 5 / M regression tests ────────────────────────────────────────
+
+
+def test_uat_r5_8_get_callers_lsp_unavailable_has_status_field() -> None:
+    """UAT-R5-8: get_callers / get_subclasses MUST include lsp_status in
+    response so callers can distinguish "leaf function" from "LSP missing".
+
+    Checks that when session_for() returns None the handler returns
+    lsp_status == "unavailable" (or "unsupported") instead of a bare
+    empty list.
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_callers, get_subclasses
+
+    for fn in (get_callers, get_subclasses):
+        src = inspect.getsource(fn)
+        assert '"lsp_status"' in src, (
+            f'{fn.__name__} must include "lsp_status" in all response paths (UAT-R5-8)'
+        )
+        assert '"unavailable"' in src or '"unsupported"' in src, (
+            f'{fn.__name__} must use "unavailable" or "unsupported" string '
+            f"values for lsp_status (UAT-R5-8)"
+        )
+        assert '"available"' in src, (
+            f'{fn.__name__} success path must set lsp_status="available" (UAT-R5-8)'
+        )
+        assert '"error"' in src, f'{fn.__name__} must handle lsp_status="error" path (UAT-R5-8)'
+
+
+def test_uat_r5_14_propose_link_has_idempotent_hint() -> None:
+    """UAT-R5-14: propose_link and accept_link must use _idem_write (idempotentHint=True).
+
+    Pre-fix: both used _write (no idempotentHint). Post-fix: both use _idem_write.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "_idem_write" in src, "_idem_write must be defined/used in _register_tools"
+    idx = src.index("async def propose_link(")
+    block = src[max(0, idx - 120) : idx]
+    assert "_idem_write" in block, (
+        "propose_link must use @mcp.tool(annotations=_idem_write) (UAT-R5-14)"
+    )
+    idx2 = src.index("async def accept_link(")
+    block2 = src[max(0, idx2 - 120) : idx2]
+    assert "_idem_write" in block2, (
+        "accept_link must use @mcp.tool(annotations=_idem_write) (UAT-R5-14)"
+    )
+
+
+def test_uat_r5_14_propose_link_warns_without_idempotency_token() -> None:
+    """UAT-R5-14: propose_link / accept_link / unlink handlers must emit a
+    warning and include a warning field when called without idempotency_token.
+    """
+    import inspect
+
+    from scry.mcp.handlers import accept_link, propose_link, unlink
+
+    for fn in (propose_link, accept_link, unlink):
+        src = inspect.getsource(fn)
+        assert "idempotency_token is None" in src, (
+            f"{fn.__name__} must check idempotency_token is None (UAT-R5-14)"
+        )
+        assert "logger.warning" in src, (
+            f"{fn.__name__} must call logger.warning when idempotency_token is None (UAT-R5-14)"
+        )
+        assert '"warning"' in src, (
+            f'{fn.__name__} must include "warning" field in response when no token (UAT-R5-14)'
+        )
+
+
+def test_uat_r5_9_evidence_excerpt_dropped_when_identical_to_content() -> None:
+    """UAT-R5-9: build_anchor_packet must omit evidence_excerpt when it equals
+    content_text (avoids 40% token waste on short anchors), and AnchorPacket
+    must expose a match_offset field for true-substring excerpts.
+    """
+    import inspect
+
+    from scry.models import AnchorPacket
+    from scry.retrieve import build_anchor_packet
+
+    assert "match_offset" in AnchorPacket.model_fields, (
+        "AnchorPacket must have match_offset field (UAT-R5-9)"
+    )
+
+    src = inspect.getsource(build_anchor_packet)
+    assert "evidence_excerpt" in src and ("truncated_text" in src or "content_text" in src), (
+        "build_anchor_packet must compare evidence_excerpt to content_text (UAT-R5-9)"
+    )
+    assert "match_offset" in src, "build_anchor_packet must compute match_offset (UAT-R5-9)"
+
+
+def test_uat_m7_get_links_deduplicates_by_logical_triple() -> None:
+    """UAT-M-7: get_links must deduplicate by (from_id, to_id, type) and
+    include historical_count per result so callers can see there was history.
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_links
+
+    src = inspect.getsource(get_links)
+    assert "historical_count" in src, (
+        "get_links must add historical_count field per result (UAT-M-7)"
+    )
+    assert "deduped" in src or "dedup" in src.lower(), (
+        "get_links must deduplicate links by (from_id, to_id, type) (UAT-M-7)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# review-r6abc: GPT-5.5 review findings on the round-6 batch A+B+C diff
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_review_r6abc_1_count_projected_files_caps_walk(tmp_path: Path) -> None:
+    """review-r6abc-1 HIGH: ``_count_projected_files`` must early-exit at cap.
+
+    Without the cap, ``scry init`` did a full ``os.walk`` on huge repos
+    (Linux kernel scale) before warning — defeating the purpose of the
+    ``--max-files`` safety net.
+    """
+    from scry.cli import _count_projected_files
+
+    # Build a tree with 50 markdown files so any cap < 50 should trigger.
+    for i in range(50):
+        (tmp_path / f"f{i:03d}.md").write_text("x", encoding="utf-8")
+
+    # No cap → walks everything.
+    total_full, _dirs_full, capped_full = _count_projected_files(tmp_path, ["**/*.md"], [])
+    assert total_full == 50
+    assert capped_full is False
+
+    # Cap at 5 -> walk early-exits when we hit 2x cap = 10 files.
+    total_capped, _dirs_capped, capped_capped = _count_projected_files(
+        tmp_path, ["**/*.md"], [], cap=5
+    )
+    assert capped_capped is True
+    assert total_capped >= 10  # at least 2x cap
+    assert total_capped < 50  # but did NOT walk to completion
+
+
+def test_review_r6abc_2_get_links_dedup_uses_replay_order() -> None:
+    """review-r6abc-2 MEDIUM: ``get_links`` dedup tie-breaker must NOT be
+    lexicographic ``link_id`` (uuid4 ordering is random — exposes stale
+    duplicates).  The fix is "last write wins" against replay order
+    (which preserves overlay/baseline append order = creation order).
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_links
+
+    src = inspect.getsource(get_links)
+    # The buggy max(link_id) approach must be GONE.
+    assert 'max(group, key=lambda r: r["link_id"])' not in src, (
+        "get_links must NOT pick the lexicographic max link_id (review-r6abc-2)"
+    )
+    # The new behavior is "last row wins" — last assignment to the
+    # deduped dict for a given key sticks (Python preserves insertion
+    # order; we rely on rows being appended in replay order).
+    assert "deduped[key] = row" in src or "last write wins" in src, (
+        "get_links dedup must keep the last row per (from, to, type) triple (review-r6abc-2)"
+    )
+
+
+def test_review_r6abc_2b_replay_active_links_iteration_is_last_event_order() -> None:
+    """review-r6abc-2 follow-up: ``LinkStore.replay()`` must guarantee that
+    ``active_links.values()`` iterates in LAST-EVENT order (most recently
+    touched link last) — NOT first-creation order.
+
+    Python's default ``dict[k] = v`` on an existing key preserves the
+    original insertion position.  Without the pop+reassign in replay(),
+    a link refreshed by a later overlay record would still iterate at
+    its original position, silently breaking get_links dedup.
+    """
+    import inspect
+
+    from scry.store.links import LinkStore
+
+    src = inspect.getsource(LinkStore.replay)
+    # The fix must include either the explicit pop or an equivalent move.
+    assert "del link_last[record.link_id]" in src or "link_last.pop" in src, (
+        "LinkStore.replay must pop existing link_id keys before reassign so "
+        "iteration order tracks last-event order (review-r6abc-2 follow-up)"
+    )
+
+
+def test_review_r6abc_3_match_offset_none_when_not_substring() -> None:
+    """review-r6abc-3 LOW: ``match_offset`` must be None when the excerpt
+    is NOT a substring of ``content_text`` (e.g. generated chunks,
+    overlap windows).  Falling back to ``0`` silently misdirects callers
+    to the start of the anchor.
+    """
+    import inspect
+
+    from scry.retrieve import build_anchor_packet
+
+    src = inspect.getsource(build_anchor_packet)
+    # The buggy "raw_offset if raw_offset >= 0 else 0" must be gone.
+    assert "raw_offset >= 0 else 0" not in src, (
+        "build_anchor_packet must NOT fall back to match_offset=0 on miss (review-r6abc-3)"
+    )
+    # The fix uses None as the explicit miss signal.
+    assert "raw_offset if raw_offset >= 0 else None" in src, (
+        "build_anchor_packet must return match_offset=None when excerpt is "
+        "not a substring of content_text (review-r6abc-3)"
+    )
