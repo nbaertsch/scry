@@ -2560,9 +2560,7 @@ def test_sr3_8_markdown_diagnostics_carries_skip_reason(tmp_path: Path) -> None:
 
     # frontmatter_skip
     md_skip = tmp_path / "skip.md"
-    md_skip.write_text(
-        "---\nscry:\n  skip: true\n---\n# heading\n", encoding="utf-8"
-    )
+    md_skip.write_text("---\nscry:\n  skip: true\n---\n# heading\n", encoding="utf-8")
     _a2, diag2 = extract_markdown_with_diagnostics(md_skip, tmp_path)
     assert diag2.skip_reason == "frontmatter_skip"
 
@@ -2695,3 +2693,204 @@ def test_sr3_8_mcp_reindex_response_includes_skip_fields() -> None:
     assert '"files_skipped_reasons": result.files_skipped_reasons' in src, (
         "reindex MCP response must include files_skipped_reasons (SR3-8)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR4-4: strip noisy tracebacks for expected validation errors
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr4_4_filter_strips_exc_info_for_mcp_server_error() -> None:
+    """SR4-4: ``_ExpectedErrorTracebackFilter`` must strip ``exc_info``
+    + ``exc_text`` when the record's exception is :class:`MCPServerError`.
+    """
+    import logging
+
+    from scry.mcp.handlers import MCPServerError
+    from scry.mcp.server import _ExpectedErrorTracebackFilter
+
+    filt = _ExpectedErrorTracebackFilter()
+    try:
+        raise MCPServerError("boom")
+    except MCPServerError:
+        import sys as _sys
+
+        record = logging.LogRecord(
+            name="scry.mcp.server",
+            level=logging.ERROR,
+            pathname="x.py",
+            lineno=1,
+            msg="boom",
+            args=None,
+            exc_info=_sys.exc_info(),
+        )
+        record.exc_text = "TRACEBACK CACHED EARLIER"
+        assert filt.filter(record) is True
+        assert record.exc_info is None, "Filter must strip exc_info for MCPServerError (SR4-4)"
+        assert record.exc_text is None, "Filter must strip exc_text for MCPServerError (SR4-4)"
+
+
+def test_sr4_4_filter_passes_through_unrelated_exception_types() -> None:
+    """SR4-4: the filter must NOT suppress tracebacks for unrelated
+    exception types (e.g. ValueError) — those are real bugs and should
+    keep their stack so operators can debug them.
+    """
+    import logging
+
+    from scry.mcp.server import _ExpectedErrorTracebackFilter
+
+    filt = _ExpectedErrorTracebackFilter()
+    try:
+        raise ValueError("real bug")
+    except ValueError:
+        import sys as _sys
+
+        record = logging.LogRecord(
+            name="scry.mcp.server",
+            level=logging.ERROR,
+            pathname="x.py",
+            lineno=1,
+            msg="real bug",
+            args=None,
+            exc_info=_sys.exc_info(),
+        )
+        assert filt.filter(record) is True
+        assert record.exc_info is not None, (
+            "Filter must NOT strip exc_info for unrelated exception types (SR4-4)"
+        )
+
+
+def test_sr4_4_filter_passes_through_non_scry_logger_names() -> None:
+    """SR4-4: the filter must only fire for records whose logger name
+    is in the scry / mcp / fastmcp namespaces — unrelated apps that
+    happen to log MCPServerError-shaped exceptions are untouched.
+    """
+    import logging
+
+    from scry.mcp.handlers import MCPServerError
+    from scry.mcp.server import _ExpectedErrorTracebackFilter
+
+    filt = _ExpectedErrorTracebackFilter()
+    try:
+        raise MCPServerError("boom")
+    except MCPServerError:
+        import sys as _sys
+
+        record = logging.LogRecord(
+            name="some.unrelated.module",
+            level=logging.ERROR,
+            pathname="x.py",
+            lineno=1,
+            msg="boom",
+            args=None,
+            exc_info=_sys.exc_info(),
+        )
+        assert filt.filter(record) is True
+        assert record.exc_info is not None, (
+            "Filter must NOT strip exc_info for non-scry logger names (SR4-4)"
+        )
+
+
+def test_sr4_4_filter_handler_emission_excludes_traceback() -> None:
+    """SR4-4: end-to-end — when the filter is attached to a handler and
+    a record with MCPServerError is emitted, the handler's formatted
+    output must NOT contain a Python traceback.
+    """
+    import io
+    import logging
+
+    from scry.mcp.handlers import MCPServerError
+    from scry.mcp.server import _ExpectedErrorTracebackFilter
+
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.addFilter(_ExpectedErrorTracebackFilter())
+
+    test_logger = logging.getLogger("scry.test.sr4_4_emission")
+    test_logger.handlers = [handler]
+    test_logger.propagate = False
+    test_logger.setLevel(logging.DEBUG)
+
+    try:
+        try:
+            raise MCPServerError("expected validation: bad input")
+        except MCPServerError:
+            test_logger.exception("Handler raised")
+    finally:
+        test_logger.handlers = []
+        test_logger.propagate = True
+
+    output = buf.getvalue()
+    # Message survives.
+    assert "Handler raised" in output
+    # Traceback does NOT appear.
+    assert "Traceback" not in output, (
+        f"Filter must suppress traceback in handler output (SR4-4); got:\n{output}"
+    )
+    assert "MCPServerError" not in output, (
+        f"Stripped traceback must not include exception class name (SR4-4); got:\n{output}"
+    )
+
+
+def test_sr4_4_install_filter_is_idempotent() -> None:
+    """SR4-4: ``_install_traceback_filter`` may be called multiple
+    times (e.g. multiple MCPServer.start cycles) without stacking
+    duplicate filters on root handlers.
+    """
+    import logging
+
+    from scry.mcp.server import _install_traceback_filter
+
+    root = logging.getLogger()
+    # Save and restore handlers so we don't mutate other tests.
+    saved_handlers = list(root.handlers)
+    saved_filters_per_handler = [list(h.filters) for h in root.handlers]
+    try:
+        _install_traceback_filter()
+        first_filter_counts = [len(h.filters) for h in root.handlers]
+        _install_traceback_filter()
+        _install_traceback_filter()
+        second_filter_counts = [len(h.filters) for h in root.handlers]
+        assert first_filter_counts == second_filter_counts, (
+            "_install_traceback_filter must be idempotent across handlers (SR4-4)"
+        )
+    finally:
+        root.handlers = saved_handlers
+        for h, fs in zip(saved_handlers, saved_filters_per_handler, strict=False):
+            h.filters = fs
+
+
+def test_sr4_4_install_filter_does_not_add_root_handler_when_empty() -> None:
+    """SR4-4 (review-r6sr4-4): when root has no handlers,
+    ``_install_traceback_filter`` must NOT add one — that would
+    silently no-op the embedding app's later ``logging.basicConfig``
+    call (basicConfig only configures root when handlers is empty).
+    The filter goes on ``logging.lastResort`` instead.
+    """
+    import logging
+
+    from scry.mcp.server import _install_traceback_filter
+
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_last_resort_filters = (
+        list(logging.lastResort.filters) if logging.lastResort is not None else []
+    )
+    try:
+        # Simulate a fresh process — no root handlers.
+        root.handlers = []
+        _install_traceback_filter()
+        assert root.handlers == [], (
+            "Root must remain handlerless after install when it started empty "
+            "(SR4-4 review-r6sr4-4)"
+        )
+        # Filter must have landed on lastResort instead.
+        assert logging.lastResort is not None
+        assert any(
+            type(f).__name__ == "_ExpectedErrorTracebackFilter" for f in logging.lastResort.filters
+        ), "Filter must be attached to logging.lastResort when root is empty (SR4-4)"
+    finally:
+        root.handlers = saved_handlers
+        if logging.lastResort is not None:
+            logging.lastResort.filters = saved_last_resort_filters

@@ -88,6 +88,108 @@ logger = logging.getLogger(__name__)
 _SCRY_VERSION = "0.2.0"
 
 
+# ─── SR4-4: strip noisy tracebacks for expected validation errors ────────
+#
+# Background: the MCP host (Claude Desktop / Copilot CLI) renders the
+# scry stdio process's stderr verbatim.  Any ``logger.exception(...)``
+# call that fires for an EXPECTED validation error (MCPServerError,
+# pydantic.ValidationError) emits a multi-line Python traceback that
+# looks alarming to users even though the protocol response is clean.
+#
+# Fix: install a logging.Filter on the root handlers that strips
+# ``exc_info`` AND ``exc_text`` from records whose exception is a
+# known-expected type AND whose logger name lives in the scry / mcp /
+# fastmcp namespaces.  The MESSAGE survives (operators still see e.g.
+# "validation: ..."); only the noisy stack is suppressed.
+#
+# Per code-review feedback (sr4-4-plan):
+#   * handler-level filter (not named-logger filter) — Python logging
+#     does NOT apply ancestor filters to descendant emissions, so
+#     hooking the named loggers wouldn't catch fastmcp.server.server.
+#   * narrow scope by both exception type AND logger name prefix.
+#   * strip both exc_info and exc_text (the latter can be cached).
+def _expected_validation_exception_types() -> tuple[type[BaseException], ...]:
+    """Resolve the expected-error exception classes.
+
+    Lazy import + best-effort fallback so the filter still installs even
+    when ``pydantic_core`` is unavailable in some odd environment.
+    """
+    types_: list[type[BaseException]] = [MCPServerError]
+    try:
+        import pydantic
+
+        types_.append(pydantic.ValidationError)
+    except Exception:
+        pass
+    try:
+        import pydantic_core
+
+        types_.append(pydantic_core.ValidationError)
+    except Exception:
+        pass
+    return tuple(types_)
+
+
+_SCRY_LOGGER_NAME_PREFIXES: tuple[str, ...] = ("scry", "mcp", "fastmcp")
+
+
+class _ExpectedErrorTracebackFilter(logging.Filter):
+    """SR4-4: strip exc_info / exc_text for expected validation errors.
+
+    Only fires when BOTH conditions hold:
+      1. The record's logger name starts with ``scry``, ``mcp`` or
+         ``fastmcp`` (so non-MCP code paths are untouched).
+      2. The exception type is in
+         :func:`_expected_validation_exception_types`.
+
+    Returns True (don't drop the record) — only the stack is removed,
+    so operators still see the message text.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._expected_types = _expected_validation_exception_types()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.name.startswith(_SCRY_LOGGER_NAME_PREFIXES):
+            return True
+        exc_info = record.exc_info
+        if exc_info is None:
+            return True
+        exc_type, _exc, _tb = exc_info
+        if exc_type is None or not issubclass(exc_type, self._expected_types):
+            return True
+        # Strip both — exc_text is sometimes cached from a prior format()
+        # call on the same record (rare but real).
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+def _install_traceback_filter() -> None:
+    """Attach :class:`_ExpectedErrorTracebackFilter` to every root
+    handler exactly once.  Idempotent so repeated MCPServer starts
+    don't stack duplicate filters.
+
+    Per code-review (sr4-4-code-review): when the root logger has NO
+    handlers we attach the filter to ``logging.lastResort`` instead of
+    creating a fresh ``StreamHandler``.  The latter would silently
+    no-op the embedding app's later ``logging.basicConfig(...)``
+    (basicConfig only configures root when it has no handlers).
+    """
+    sentinel_attr = "_scry_sr4_4_filter_installed"
+    root_logger = logging.getLogger()
+    filt = _ExpectedErrorTracebackFilter()
+    for handler in root_logger.handlers:
+        if not getattr(handler, sentinel_attr, False):
+            handler.addFilter(filt)
+            setattr(handler, sentinel_attr, True)
+    last_resort = logging.lastResort
+    if last_resort is not None and not getattr(last_resort, sentinel_attr, False):
+        last_resort.addFilter(filt)
+        setattr(last_resort, sentinel_attr, True)
+
+
 class MCPServer:
     """FastMCP server with leader-follower coordination.
 
@@ -135,6 +237,9 @@ class MCPServer:
         self._leader_idem_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._mcp: FastMCP = FastMCP(name="scry", version=scry.__version__)
         self._started = False
+        # SR4-4: install the expected-error traceback filter so MCP host
+        # stderr stays clean for routine validation errors.
+        _install_traceback_filter()
         self._register_tools()
 
     # ─── Tool registration ────────────────────────────────────────────────────
