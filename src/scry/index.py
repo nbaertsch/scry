@@ -65,7 +65,10 @@ from scry.config import (
 )
 from scry.embed import Embedder, chunk_anchor, make_embedder
 from scry.extract.code import extract_code_symbols
-from scry.extract.markdown import extract_markdown
+from scry.extract.markdown import (
+    extract_markdown_with_diagnostics,
+    validate_markdown_file,
+)
 from scry.git_context import GitContextError, GitContextProvider
 from scry.lsp.closure import CalleeRef, compute_closure
 from scry.lsp.full_resolution import compute_closure_full, supports_full_mode
@@ -178,6 +181,11 @@ class IndexResult:
         files_pruned:      Distinct source files deleted since the last index whose
                            anchors were removed from vectors.db.
         elapsed_seconds:   Wall-clock time for the full pass.
+        validation_errors: SR3-6 — count of §15.3 validation problems
+                           detected across all indexed markdown files
+                           (currently: duplicate ``scry-id`` occurrences).
+                           CLI exits non-zero when this is > 0 unless the
+                           caller passes ``--allow-duplicate-scry-ids``.
     """
 
     files_processed: int
@@ -186,6 +194,7 @@ class IndexResult:
     chunks_written: int
     files_pruned: int
     elapsed_seconds: float
+    validation_errors: int = 0
 
 
 # ─── Exception ────────────────────────────────────────────────────────────────
@@ -466,6 +475,10 @@ class Indexer:
         anchors_embedded = 0
         chunks_written = 0
         files_pruned = 0
+        # SR3-6: §15.3 duplicate scry-id count, accumulated across all
+        # markdown files (both freshly extracted AND unchanged-on-disk
+        # ones, which we re-validate so re-runs surface the violation).
+        validation_errors = 0
 
         with db.acquire_write_lock():
             try:
@@ -534,12 +547,32 @@ class Indexer:
                 for old_anchor in db.list_anchors(path=rel):
                     db.delete_anchor(old_anchor.id)
 
-                extracted = _extract_file_anchors(path, target, config, self._repo_root)
+                extracted, file_validation_errors = _extract_file_anchors(
+                    path, target, config, self._repo_root
+                )
                 all_anchors.extend(extracted)
                 files_processed += 1
                 anchors_extracted += len(extracted)
+                validation_errors += file_validation_errors
                 if progress_callback is not None:
                     progress_callback("extract", file_idx, total_files, path.name)
+
+            # SR3-6: re-validate UNCHANGED markdown files so a duplicate
+            # scry-id introduced in a previous run still surfaces in the
+            # current run's validation_errors total.  Without this, the
+            # CLI would exit non-zero only on the run that introduced the
+            # violation; subsequent re-runs would drop to 0 and silently
+            # mask the §15.3 problem.
+            unchanged_md_files = [
+                p
+                for p in all_files
+                if p not in files_to_process and self.classify_for_extraction(p).kind == "markdown"
+            ]
+            for unchanged in unchanged_md_files:
+                validation_errors += validate_markdown_file(
+                    unchanged,
+                    max_file_size_bytes=config.index.max_file_size_bytes,
+                )
 
             # Track which anchor IDs are newly extracted (vs. loaded from DB).
             newly_extracted_ids: set[str] = {a.id for a in all_anchors}
@@ -638,6 +671,7 @@ class Indexer:
             chunks_written=chunks_written,
             files_pruned=files_pruned,
             elapsed_seconds=elapsed,
+            validation_errors=validation_errors,
         )
 
     async def index_async(self, *, force: bool = False) -> IndexResult:
@@ -683,6 +717,10 @@ class Indexer:
         anchors_embedded = 0
         chunks_written = 0
         files_pruned = 0
+        # SR3-6: §15.3 duplicate scry-id count, accumulated across all
+        # markdown files (both freshly extracted AND unchanged-on-disk
+        # ones, which we re-validate so re-runs surface the violation).
+        validation_errors = 0
 
         with db.acquire_write_lock():
             try:
@@ -738,10 +776,25 @@ class Indexer:
                 rel = path.relative_to(self._repo_root).as_posix()
                 for old_anchor in db.list_anchors(path=rel):
                     db.delete_anchor(old_anchor.id)
-                extracted = _extract_file_anchors(path, target, config, self._repo_root)
+                extracted, file_validation_errors = _extract_file_anchors(
+                    path, target, config, self._repo_root
+                )
                 all_anchors.extend(extracted)
                 files_processed += 1
                 anchors_extracted += len(extracted)
+                validation_errors += file_validation_errors
+
+            # SR3-6: re-validate UNCHANGED markdown files (see sync index()).
+            unchanged_md_files = [
+                p
+                for p in all_files
+                if p not in files_to_process and self.classify_for_extraction(p).kind == "markdown"
+            ]
+            for unchanged in unchanged_md_files:
+                validation_errors += validate_markdown_file(
+                    unchanged,
+                    max_file_size_bytes=config.index.max_file_size_bytes,
+                )
 
             newly_extracted_ids: set[str] = {a.id for a in all_anchors}
 
@@ -813,6 +866,7 @@ class Indexer:
             chunks_written=chunks_written,
             files_pruned=files_pruned,
             elapsed_seconds=elapsed,
+            validation_errors=validation_errors,
         )
 
     def reembed(
@@ -1030,46 +1084,47 @@ def _extract_file_anchors(
     target: ExtractionTarget,
     config: Config,
     repo_root: Path,
-) -> list[Anchor]:
-    """Dispatch to the appropriate extractor and return anchors.
+) -> tuple[list[Anchor], int]:
+    """Dispatch to the appropriate extractor.
 
     Logs a warning and returns an empty list on I/O errors so a single bad
     file does not abort the entire index run.
 
-    Args:
-        path:      Absolute path to the file.
-        target:    Classification from :meth:`~Indexer.classify_for_extraction`.
-        config:    Validated repo config.
-        repo_root: Repository root used for repo-relative path computation.
-
     Returns:
-        List of extracted :class:`~scry.models.Anchor` objects.
+        ``(anchors, validation_errors)`` — ``validation_errors`` is the
+        SR3-6 §15.3 duplicate-scry-id count for the file (0 for non-
+        markdown files).  Caller accumulates the count into
+        :class:`IndexResult`.
     """
     if target.kind == "markdown":
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             logger.warning("Skipping %s (read error): %s", path, exc)
-            return []
+            return [], 0
         frontmatter, _ = parse_frontmatter(text)
-        return extract_markdown(
+        anchors, diag = extract_markdown_with_diagnostics(
             path,
             repo_root,
             frontmatter=frontmatter,
             config=config.sections,
             max_file_size_bytes=config.index.max_file_size_bytes,
         )
+        return anchors, diag.validation_errors
 
     if target.kind == "code" and target.language is not None:
-        return extract_code_symbols(
-            path,
-            repo_root,
-            language=target.language,
-            config=config.code_anchors,
-            max_file_size_bytes=config.index.max_file_size_bytes,
+        return (
+            extract_code_symbols(
+                path,
+                repo_root,
+                language=target.language,
+                config=config.code_anchors,
+                max_file_size_bytes=config.index.max_file_size_bytes,
+            ),
+            0,
         )
 
-    return []  # kind == 'skip'
+    return [], 0  # kind == 'skip'
 
 
 def _process_anchor(

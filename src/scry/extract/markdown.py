@@ -42,8 +42,11 @@ from scry.models import Anchor, AnchorType, Frontmatter, SectionsConfig
 
 __all__ = [
     "DEFAULT_MAX_FILE_SIZE_BYTES",
+    "MarkdownDiagnostics",
     "extract_markdown",
+    "extract_markdown_with_diagnostics",
     "split_section_text",
+    "validate_markdown_file",
 ]
 
 logger = logging.getLogger(__name__)
@@ -98,6 +101,21 @@ _MD = MarkdownIt()
 
 
 # ── Internal data classes ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class MarkdownDiagnostics:
+    """SR3-6: extractor-side diagnostics surfaced by
+    :func:`extract_markdown_with_diagnostics`.
+
+    Attributes:
+        validation_errors: Count of §15.3 validation problems detected
+            in the file (currently: duplicate ``scry-id`` occurrences
+            after the first).  Indexers / CLI use this to decide
+            whether to exit non-zero.
+    """
+
+    validation_errors: int = 0
 
 
 @dataclass
@@ -255,8 +273,8 @@ def _collect_tokens(
     return headings, fences
 
 
-def _check_duplicate_scry_ids(tokens: list[Token], path: Path) -> None:
-    """Emit a warning for duplicate scry-id slugs in one document (§15.3).
+def _check_duplicate_scry_ids(tokens: list[Token], path: Path) -> int:
+    """Count duplicate scry-id occurrences in one document (§15.3).
 
     Duplicate ``scry-id`` values within a single document are a validation
     error per DESIGN.md §15.3.  We warn but continue indexing.
@@ -264,8 +282,15 @@ def _check_duplicate_scry_ids(tokens: list[Token], path: Path) -> None:
     Args:
         tokens: Token list from ``MarkdownIt.parse()``.
         path:   Source file path (for the warning message).
+
+    Returns:
+        SR3-6: total count of OFFENDING occurrences (duplicates after the
+        first occurrence of each slug).  E.g. a doc with three ``scry-id:
+        foo`` headings counts as 2 validation errors.  Callers can treat
+        a non-zero count as a §15.3 violation and exit non-zero.
     """
     seen: dict[str, int] = {}
+    duplicate_count = 0
     n = len(tokens)
     for i, tok in enumerate(tokens):
         if tok.type != "heading_open":
@@ -279,13 +304,19 @@ def _check_duplicate_scry_ids(tokens: list[Token], path: Path) -> None:
             slug = slugify(pinned)
             count = seen.get(slug, 0) + 1
             seen[slug] = count
-            if count == 2:
-                logger.warning(
-                    "extract_markdown: duplicate scry-id %r in %s "
-                    "(§15.3 index-time validation error)",
-                    slug,
-                    path,
-                )
+            if count >= 2:
+                # SR3-6: every occurrence after the first counts.
+                duplicate_count += 1
+                if count == 2:
+                    # Emit the warning once per duplicated slug to keep
+                    # log noise bounded.
+                    logger.warning(
+                        "extract_markdown: duplicate scry-id %r in %s "
+                        "(§15.3 index-time validation error)",
+                        slug,
+                        path,
+                    )
+    return duplicate_count
 
 
 def _build_section_records(
@@ -623,6 +654,39 @@ def extract_markdown(
 ) -> list[Anchor]:
     """Extract ``SECTION`` and ``CODE_IN_DOC`` anchors from a markdown file.
 
+    Convenience wrapper around :func:`extract_markdown_with_diagnostics`
+    that returns only the anchor list — preserves the historical signature
+    so existing callers (tests, MCP write helpers) don't need updates.
+
+    Use :func:`extract_markdown_with_diagnostics` when you need access to
+    extractor-side validation diagnostics (e.g. to surface §15.3 duplicate
+    ``scry-id`` violations to the CLI / MCP response).
+    """
+    anchors, _diag = extract_markdown_with_diagnostics(
+        path,
+        repo_root,
+        frontmatter=frontmatter,
+        config=config,
+        max_file_size_bytes=max_file_size_bytes,
+    )
+    return anchors
+
+
+def extract_markdown_with_diagnostics(
+    path: Path,
+    repo_root: Path,
+    *,
+    frontmatter: Frontmatter | None = None,
+    config: SectionsConfig | None = None,
+    max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+) -> tuple[list[Anchor], MarkdownDiagnostics]:
+    """Extract anchors AND surface §15.3 validation diagnostics (SR3-6).
+
+    Returns a ``(anchors, diagnostics)`` pair.  ``diagnostics.validation_errors``
+    counts duplicate ``scry-id`` occurrences after the first (each duplicate =
+    +1).  Indexers thread this into ``IndexResult.validation_errors`` so the
+    CLI can exit non-zero per DESIGN.md §15.3.
+
     Implements §15.1 (heading extraction), §15.2 (code block extraction),
     and §15.4 (file-level filters) from DESIGN.md.
 
@@ -651,6 +715,7 @@ def extract_markdown(
         or empty-file case defined in §15.4.
     """
     cfg = config or SectionsConfig()
+    _empty_diag = MarkdownDiagnostics()
 
     # ── §15.4: file-level guards ──────────────────────────────────────────────
 
@@ -658,7 +723,7 @@ def extract_markdown(
         raw_bytes = path.read_bytes()
     except OSError as exc:
         logger.warning("extract_markdown: cannot read %s: %s", path, exc)
-        return []
+        return [], _empty_diag
 
     if len(raw_bytes) > max_file_size_bytes:
         logger.warning(
@@ -667,7 +732,7 @@ def extract_markdown(
             len(raw_bytes),
             max_file_size_bytes,
         )
-        return []
+        return [], _empty_diag
 
     # UTF-16 BOM check must precede the UTF-8 decode attempt (§15.4).
     if raw_bytes.startswith(_UTF16_BE_BOM) or raw_bytes.startswith(_UTF16_LE_BOM):
@@ -675,13 +740,13 @@ def extract_markdown(
             "extract_markdown: skipping %s — UTF-16 encoded; transcode to UTF-8 to index",
             path,
         )
-        return []
+        return [], _empty_diag
 
     try:
         raw_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
         logger.warning("extract_markdown: skipping %s — binary file (UTF-8 decode failed)", path)
-        return []
+        return [], _empty_diag
 
     # §5.4 canonicalization (also strips the UTF-8 BOM U+FEFF if present).
     canonical_text = canonicalize_content(raw_text)
@@ -693,11 +758,11 @@ def extract_markdown(
     active_fm: Frontmatter | None = frontmatter if frontmatter is not None else file_fm
 
     if active_fm is not None and active_fm.skip:
-        return []
+        return [], _empty_diag
 
     # §15.4: empty body (or frontmatter-only file).
     if not body.strip():
-        return []
+        return [], _empty_diag
 
     # ── ID base ───────────────────────────────────────────────────────────────
 
@@ -711,8 +776,11 @@ def extract_markdown(
 
     headings, fences = _collect_tokens(tokens)
 
-    # §15.3 duplicate scry-id validation (warn; continue indexing).
-    _check_duplicate_scry_ids(tokens, path)
+    # SR3-6: §15.3 duplicate scry-id validation.  Count is surfaced via
+    # the MarkdownDiagnostics return so the indexer / CLI can exit
+    # non-zero per the spec; the warning is still logged for humans.
+    duplicate_scry_id_count = _check_duplicate_scry_ids(tokens, path)
+    diagnostics = MarkdownDiagnostics(validation_errors=duplicate_scry_id_count)
 
     # ── §15.1: build SECTION anchors ─────────────────────────────────────────
 
@@ -829,4 +897,42 @@ def extract_markdown(
             path,
         )
 
-    return anchors
+    return anchors, diagnostics
+
+
+def validate_markdown_file(
+    path: Path,
+    *,
+    max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+) -> int:
+    """SR3-6: cheap §15.3 validation (duplicate scry-id) without full extraction.
+
+    Used by the indexer to re-validate UNCHANGED markdown files on every
+    incremental run — otherwise an invalid file indexed once would
+    silently drop out of the validation_errors total on subsequent runs
+    (the file's hash is unchanged, so it would be skipped).
+
+    Returns:
+        Count of duplicate scry-id occurrences after the first.  Files
+        that can't be read, exceed the size limit, or fail UTF-8 decode
+        are treated as 0 errors (the extractor will surface those
+        separately).
+    """
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError:
+        return 0
+    if len(raw_bytes) > max_file_size_bytes:
+        return 0
+    if raw_bytes.startswith(_UTF16_BE_BOM) or raw_bytes.startswith(_UTF16_LE_BOM):
+        return 0
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return 0
+    canonical_text = canonicalize_content(raw_text)
+    _file_fm, body = parse_frontmatter(canonical_text)
+    if not body.strip():
+        return 0
+    tokens = _MD.parse(body)
+    return _check_duplicate_scry_ids(tokens, path)

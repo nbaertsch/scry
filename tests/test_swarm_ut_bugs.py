@@ -2279,3 +2279,245 @@ def test_sr2_3_newline_terminated_oversized_also_raises() -> None:
     with pytest.raises(_OversizedMessageError) as excinfo:
         io._readline_sync()
     assert excinfo.value.byte_count == MAX_MESSAGE_BYTES + 101
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR3-6: Duplicate scry-id exits non-zero per §15.3
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr3_6_check_duplicate_returns_count_after_first() -> None:
+    """SR3-6: ``_check_duplicate_scry_ids`` must RETURN the count of
+    duplicate occurrences (each occurrence after the first = +1).
+    Pre-fix it returned None; the indexer/CLI never saw the count.
+    """
+    from scry.extract.markdown import _MD, _check_duplicate_scry_ids
+
+    body = (
+        "# A <!-- scry-id: foo -->\n"
+        "# B <!-- scry-id: foo -->\n"
+        "# C <!-- scry-id: foo -->\n"
+        "# D <!-- scry-id: bar -->\n"
+    )
+    tokens = _MD.parse(body)
+    count = _check_duplicate_scry_ids(tokens, Path("test.md"))
+    # 3x foo = 2 duplicates after first; bar is unique = 0
+    assert count == 2, f"Expected 2 duplicate occurrences, got {count}"
+
+
+def test_sr3_6_check_duplicate_returns_zero_for_clean_doc() -> None:
+    """SR3-6: a doc with no duplicate scry-id must return 0."""
+    from scry.extract.markdown import _MD, _check_duplicate_scry_ids
+
+    body = "# A <!-- scry-id: foo -->\n# B <!-- scry-id: bar -->\n"
+    tokens = _MD.parse(body)
+    assert _check_duplicate_scry_ids(tokens, Path("test.md")) == 0
+
+
+def test_sr3_6_extract_markdown_with_diagnostics_surfaces_count(tmp_path: Path) -> None:
+    """SR3-6: ``extract_markdown_with_diagnostics`` must return both the
+    anchors AND a ``MarkdownDiagnostics`` carrying ``validation_errors``.
+    """
+    from scry.extract.markdown import (
+        MarkdownDiagnostics,
+        extract_markdown_with_diagnostics,
+    )
+
+    md = tmp_path / "doc.md"
+    md.write_text(
+        "# A <!-- scry-id: foo -->\n\nbody\n\n# B <!-- scry-id: foo -->\n\nmore\n",
+        encoding="utf-8",
+    )
+    anchors, diag = extract_markdown_with_diagnostics(md, tmp_path)
+    assert isinstance(diag, MarkdownDiagnostics)
+    assert diag.validation_errors == 1
+    # Anchors still extracted (the spec says warn-and-continue indexing).
+    assert len(anchors) >= 1
+
+
+def test_sr3_6_extract_markdown_legacy_signature_preserved(tmp_path: Path) -> None:
+    """SR3-6: existing callers using ``extract_markdown(...)`` MUST keep
+    receiving ``list[Anchor]`` (back-compat — the signature was widely
+    consumed by tests and helpers before SR3-6).
+    """
+    from scry.extract.markdown import extract_markdown
+    from scry.models import Anchor
+
+    md = tmp_path / "doc.md"
+    md.write_text("# Heading\n\nbody\n", encoding="utf-8")
+    anchors = extract_markdown(md, tmp_path)
+    assert isinstance(anchors, list)
+    assert all(isinstance(a, Anchor) for a in anchors)
+
+
+def test_sr3_6_validate_markdown_file_cheap_revalidation(tmp_path: Path) -> None:
+    """SR3-6: ``validate_markdown_file`` does VALIDATION ONLY (no anchor
+    extraction).  Used by the indexer to re-validate UNCHANGED files on
+    every incremental run so duplicate scry-id violations don't drop to
+    zero on re-runs after the first.
+    """
+    from scry.extract.markdown import validate_markdown_file
+
+    md = tmp_path / "doc.md"
+    md.write_text(
+        "# A <!-- scry-id: foo -->\n\n# B <!-- scry-id: foo -->\n\n# C <!-- scry-id: foo -->\n",
+        encoding="utf-8",
+    )
+    assert validate_markdown_file(md) == 2
+
+    clean = tmp_path / "clean.md"
+    clean.write_text("# A\n\n# B\n", encoding="utf-8")
+    assert validate_markdown_file(clean) == 0
+
+
+def test_sr3_6_index_result_carries_validation_errors_field() -> None:
+    """SR3-6: ``IndexResult`` exposes ``validation_errors`` so the CLI
+    + MCP reindex handler can surface §15.3 violations.
+    """
+    import dataclasses
+
+    from scry.index import IndexResult
+
+    field_names = {f.name for f in dataclasses.fields(IndexResult)}
+    assert "validation_errors" in field_names, "IndexResult must expose validation_errors (SR3-6)"
+
+
+def test_sr3_6_mcp_reindex_response_includes_validation_errors() -> None:
+    """SR3-6: ``mcp.handlers.reindex`` must include ``validation_errors``
+    in its response dict so MCP clients can surface §15.3 violations to
+    the user (parity with the CLI's non-zero exit).
+    """
+    import inspect
+
+    from scry.mcp.handlers import reindex
+
+    src = inspect.getsource(reindex)
+    assert '"validation_errors": result.validation_errors' in src, (
+        "reindex MCP handler must surface validation_errors in its response (SR3-6)"
+    )
+
+
+def test_sr3_6_cli_exits_non_zero_on_duplicate_scry_ids(tmp_path: Path) -> None:
+    """SR3-6: ``scry index`` must exit 1 when duplicate scry-id is detected,
+    so CI / pre-commit hooks fail-fast per §15.3.
+    """
+    import subprocess
+
+    # Set up a minimal scry repo with a markdown file containing a
+    # duplicate scry-id.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "doc.md").write_text(
+        "# A <!-- scry-id: foo -->\n\n# B <!-- scry-id: foo -->\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    import os as _os
+
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    cwd0 = _os.getcwd()
+    try:
+        _os.chdir(tmp_path)
+        init_res = runner.invoke(main, ["init"], catch_exceptions=False)
+        assert init_res.exit_code == 0, init_res.output
+
+        # Without the escape hatch: must exit 1.
+        res = runner.invoke(main, ["index"], catch_exceptions=False)
+        assert res.exit_code == 1, (
+            f"Expected exit 1 on duplicate scry-id, got {res.exit_code}\n{res.output}"
+        )
+        assert "validation error" in res.output.lower() or "duplicate" in res.output.lower()
+
+        # With --allow-duplicate-scry-ids: must exit 0.
+        res2 = runner.invoke(main, ["index", "--allow-duplicate-scry-ids"], catch_exceptions=False)
+        assert res2.exit_code == 0, (
+            f"Expected exit 0 with escape hatch, got {res2.exit_code}\n{res2.output}"
+        )
+    finally:
+        _os.chdir(cwd0)
+
+
+def test_sr3_6_unchanged_files_revalidated_on_rerun(tmp_path: Path) -> None:
+    """SR3-6: an UNCHANGED markdown file that has duplicate scry-ids must
+    STILL contribute to ``validation_errors`` on the second indexer run,
+    so re-runs don't silently mask §15.3 violations introduced earlier.
+    """
+    import subprocess
+
+    from scry.config import load_config
+    from scry.embed import StubEmbedder
+    from scry.index import Indexer
+
+    # Set up minimal git repo + scry config.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    md = tmp_path / "dupe.md"
+    md.write_text("# A <!-- scry-id: foo -->\n\n# B <!-- scry-id: foo -->\n", encoding="utf-8")
+    import os as _os
+
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    cwd0 = _os.getcwd()
+    try:
+        _os.chdir(tmp_path)
+        init_res = runner.invoke(main, ["init"], catch_exceptions=False)
+        assert init_res.exit_code == 0, init_res.output
+    finally:
+        _os.chdir(cwd0)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    config = load_config(tmp_path)
+    indexer = Indexer(tmp_path, config=config, embedder=StubEmbedder())
+
+    res1 = indexer.index(force=True)
+    assert res1.validation_errors >= 1, "first run must surface duplicate scry-id"
+
+    # Re-run incrementally — file unchanged on disk.  Validation should
+    # still surface the violation thanks to the re-validate-unchanged
+    # pass.
+    res2 = indexer.index()
+    assert res2.validation_errors >= 1, (
+        "re-run must STILL surface duplicate scry-id even when file is unchanged "
+        "(SR3-6 — otherwise the violation silently disappears)"
+    )

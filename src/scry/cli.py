@@ -687,11 +687,32 @@ def init(ctx: click.Context, force: bool, register_global: bool, max_files: int)
     is_flag=True,
     help="Suppress per-file progress output (UAT-1).",
 )
+@click.option(
+    "--allow-duplicate-scry-ids",
+    is_flag=True,
+    help=(
+        "SR3-6: don't exit non-zero when duplicate scry-id values are detected "
+        "in a single document.  Use only when running on a corpus you don't own "
+        "(e.g. third-party docs) — duplicate scry-ids are a §15.3 validation error "
+        "in scry's own format."
+    ),
+)
 @click.pass_context
-def index(ctx: click.Context, force: bool, reembed: bool, quiet: bool) -> None:
+def index(
+    ctx: click.Context,
+    force: bool,
+    reembed: bool,
+    quiet: bool,
+    allow_duplicate_scry_ids: bool,
+) -> None:
     """Build or refresh the vector store.
 
     ``--force`` and ``--reembed`` are mutually exclusive.
+
+    Per DESIGN.md §15.3, duplicate ``scry-id`` values within a single
+    document are a validation error.  When detected the CLI exits 1
+    after writing the index; pass ``--allow-duplicate-scry-ids`` to
+    keep the previous behaviour (warn + exit 0).
     """
     if force and reembed:
         raise click.UsageError("--force and --reembed are mutually exclusive")
@@ -794,8 +815,21 @@ def index(ctx: click.Context, force: bool, reembed: bool, quiet: bool) -> None:
         f"anchors_embedded={result.anchors_embedded} "
         f"chunks_written={result.chunks_written} "
         f"files_pruned={result.files_pruned} "
+        f"validation_errors={result.validation_errors} "
         f"elapsed={result.elapsed_seconds:.2f}s"
     )
+
+    # SR3-6: §15.3 duplicate scry-id violations are a validation error.
+    # Exit non-zero so CI / pre-commit hooks can fail-fast.  The escape
+    # hatch is for users running on third-party corpora they don't own.
+    if result.validation_errors > 0 and not allow_duplicate_scry_ids:
+        click.echo(
+            f"error: {result.validation_errors} §15.3 validation error(s) detected "
+            "(duplicate scry-id within a document). "
+            "Pass --allow-duplicate-scry-ids to suppress this exit code.",
+            err=True,
+        )
+        raise SystemExit(1) from None
 
 
 # ─── scry watch ───────────────────────────────────────────────────────────────

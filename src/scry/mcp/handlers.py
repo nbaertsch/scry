@@ -1153,6 +1153,10 @@ async def reindex(
         "anchors_embedded": result.anchors_embedded,
         "files_processed": result.files_processed,
         "files_pruned": result.files_pruned,
+        # SR3-6: surface §15.3 duplicate scry-id violations to MCP
+        # callers so the agent can warn the user (parity with the CLI
+        # which exits non-zero).
+        "validation_errors": result.validation_errors,
         "force": force,
         "scope": scope,
         "scope_ignored": scope is not None,
