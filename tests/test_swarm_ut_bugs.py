@@ -2118,3 +2118,164 @@ def test_sr2_2_ipc_server_owns_dedicated_pipe_executor() -> None:
     assert "_win_pipe_executor" in stop_src and "shutdown" in stop_src, (
         "IPCServer.stop must shutdown the dedicated executor (SR2-2)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR2-3: Windows oversized message protocol error parity
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr2_3_oversized_message_error_subclasses_runtime_error_not_oserror() -> None:
+    """SR2-3: ``_OversizedMessageError`` must subclass ``RuntimeError``,
+    NOT ``OSError`` — otherwise it gets swallowed by ``except OSError``
+    arms that treat broken pipes as EOF (the original SR2-3 bug).
+    """
+    from scry.process import ipc as ipc_mod
+
+    cls = ipc_mod._OversizedMessageError
+    assert issubclass(cls, RuntimeError), (
+        "_OversizedMessageError must subclass RuntimeError (SR2-3)"
+    )
+    assert not issubclass(cls, OSError), (
+        "_OversizedMessageError must NOT subclass OSError — it would be "
+        "swallowed by 'except OSError' branches that treat broken pipes "
+        "as EOF (SR2-3)"
+    )
+    exc = cls(2_000_000)
+    assert exc.byte_count == 2_000_000
+    assert "exceeds" in str(exc)
+
+
+def test_sr2_3_readline_sync_raises_oversized_instead_of_returning_empty() -> None:
+    """SR2-3: ``_WinPipeIO._readline_sync`` must RAISE
+    ``_OversizedMessageError`` when the buffer exceeds
+    ``MAX_MESSAGE_BYTES``.  Pre-fix it returned ``b""`` — same shape as
+    EOF, so callers couldn't tell the difference.
+    """
+    import inspect
+
+    from scry.process.ipc import _WinPipeIO
+
+    src = inspect.getsource(_WinPipeIO._readline_sync)
+    # The buggy silent-empty return must be GONE.
+    assert 'return b""' not in src or "raise _OversizedMessageError" in src, (
+        "_readline_sync must raise _OversizedMessageError on oversized "
+        "buffers, not silently return b'' (SR2-3)"
+    )
+    assert "raise _OversizedMessageError" in src, (
+        "_readline_sync must raise _OversizedMessageError when buffer > MAX_MESSAGE_BYTES (SR2-3)"
+    )
+
+
+def test_sr2_3_win_handler_run_emits_oversized_error_response() -> None:
+    """SR2-3: ``_WinConnectionHandler.run()`` must catch
+    ``_OversizedMessageError`` BEFORE the OSError branch and emit the
+    documented ``error_type="oversized"`` response, parity with the
+    Unix path.
+    """
+    import inspect
+
+    from scry.process.ipc import _WinConnectionHandler
+
+    src = inspect.getsource(_WinConnectionHandler.run)
+    assert "except _OversizedMessageError" in src, (
+        "_WinConnectionHandler.run must catch _OversizedMessageError (SR2-3)"
+    )
+    # The except _OversizedMessageError branch must appear BEFORE
+    # except OSError so it's not shadowed.
+    oversized_idx = src.index("except _OversizedMessageError")
+    oserror_idx = src.index("except OSError")
+    assert oversized_idx < oserror_idx, (
+        "except _OversizedMessageError must appear BEFORE except OSError (SR2-3)"
+    )
+    # And it must call _send_error with error_type='oversized'.
+    assert '"oversized"' in src and "_send_error" in src, (
+        "Oversized branch must call _send_error(_, _, 'oversized') (SR2-3)"
+    )
+
+
+def test_sr2_3_encode_response_caps_oversized_payloads() -> None:
+    """SR2-3 (write-side parity): ``_encode_response`` must replace
+    payloads that exceed ``MAX_MESSAGE_BYTES`` with a small
+    ``error_type="oversized"`` response so a misbehaving handler can't
+    ship oversized result bodies to followers.
+    """
+    import json as _json
+
+    from scry.process.ipc import (
+        MAX_MESSAGE_BYTES,
+        IPCResponse,
+        _encode_response,
+    )
+
+    huge = "x" * (MAX_MESSAGE_BYTES + 1024)
+    resp = IPCResponse(request_id=42, ok=True, result={"payload": huge})
+    encoded = _encode_response(resp)
+    assert len(encoded) <= MAX_MESSAGE_BYTES, (
+        f"_encode_response must cap oversized payloads (got {len(encoded)} bytes)"
+    )
+    decoded = _json.loads(encoded.rstrip(b"\n"))
+    assert decoded["id"] == 42, "request_id must round-trip"
+    assert decoded["ok"] is False
+    assert decoded["error_type"] == "oversized"
+    # Normal-sized payloads pass through unchanged.
+    small_resp = IPCResponse(request_id=7, ok=True, result={"x": 1})
+    small_encoded = _encode_response(small_resp)
+    assert _json.loads(small_encoded.rstrip(b"\n"))["ok"] is True
+
+
+def test_sr2_3_recv_response_handles_oversized_cleanly() -> None:
+    """SR2-3: ``IPCClient._recv_response`` must catch
+    ``_OversizedMessageError`` from the server-side ``readline()`` so a
+    misbehaving leader can't poison the client connection.  Closing the
+    client is required so subsequent .call()s don't reuse the
+    half-read buffer.
+    """
+    import inspect
+
+    from scry.process.ipc import IPCClient
+
+    src = inspect.getsource(IPCClient._recv_response)
+    assert "except _OversizedMessageError" in src, (
+        "_recv_response must catch _OversizedMessageError (SR2-3)"
+    )
+    # Must close the client connection so subsequent calls don't reuse
+    # a poisoned pipe.
+    rng_lines = src.split("\n")
+    in_branch = False
+    saw_close = False
+    for ln in rng_lines:
+        if "except _OversizedMessageError" in ln:
+            in_branch = True
+            continue
+        if in_branch:
+            if "raise" in ln and "RuntimeError" in ln:
+                break
+            if "self.close()" in ln:
+                saw_close = True
+    assert saw_close, (
+        "_recv_response oversized branch must call self.close() before raising (SR2-3)"
+    )
+
+
+@pytest.mark.windows_only
+def test_sr2_3_newline_terminated_oversized_also_raises() -> None:
+    """SR2-3 (review-r6sr2-3 follow-up): a peer that sends a single
+    >1MiB line with a trailing newline must STILL trigger
+    ``_OversizedMessageError``.  Pre-fix the newline branch ran first
+    and returned the oversized line — which sailed past the client-side
+    parser since ``_recv_response`` has no post-read length check.
+    """
+
+    from scry.process.ipc import (
+        MAX_MESSAGE_BYTES,
+        _OversizedMessageError,
+        _WinPipeIO,
+    )
+
+    io = _WinPipeIO(handle=None)
+    # Pre-load the read buffer with a newline-terminated oversized line.
+    io._read_buf = b"x" * (MAX_MESSAGE_BYTES + 100) + b"\n"
+    with pytest.raises(_OversizedMessageError) as excinfo:
+        io._readline_sync()
+    assert excinfo.value.byte_count == MAX_MESSAGE_BYTES + 101

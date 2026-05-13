@@ -341,7 +341,15 @@ class _IdempotencyCache:
 
 
 def _encode_response(resp: IPCResponse) -> bytes:
-    """Serialize *resp* to a compact newline-terminated JSON line."""
+    """Serialize *resp* to a compact newline-terminated JSON line.
+
+    SR2-3: enforces ``MAX_MESSAGE_BYTES`` on the WRITE side so a
+    misbehaving handler cannot ship oversized result payloads to
+    followers (the read side has the same cap).  When the encoded
+    response exceeds the cap, it is replaced with an
+    ``error_type="oversized"`` response that fits cleanly.  Reuses
+    the request_id so the client can correlate.
+    """
     payload: dict[str, Any] = {"id": resp.request_id, "ok": resp.ok}
     if resp.result is not None:
         payload["result"] = resp.result
@@ -349,7 +357,26 @@ def _encode_response(resp: IPCResponse) -> bytes:
         payload["error"] = resp.error
     if resp.error_type is not None:
         payload["error_type"] = resp.error_type
-    return json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+    encoded = json.dumps(payload, separators=(",", ":")).encode() + b"\n"
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        log.warning(
+            "IPC: response for request_id=%s exceeds %d bytes (%d); "
+            "replacing with oversized error response",
+            resp.request_id,
+            MAX_MESSAGE_BYTES,
+            len(encoded),
+        )
+        oversized = {
+            "id": resp.request_id,
+            "ok": False,
+            "error": (
+                f"Response exceeds {MAX_MESSAGE_BYTES} bytes ({len(encoded)} bytes); "
+                "narrow the query or paginate the result."
+            ),
+            "error_type": "oversized",
+        }
+        encoded = json.dumps(oversized, separators=(",", ":")).encode() + b"\n"
+    return encoded
 
 
 def _decode_request(raw: bytes) -> IPCRequest | None:
@@ -685,6 +712,22 @@ def _win_build_pipe_sa() -> Any:
     return sa
 
 
+class _OversizedMessageError(RuntimeError):
+    """Raised when a single line on the IPC wire exceeds ``MAX_MESSAGE_BYTES``.
+
+    Distinct from ``OSError`` so it doesn't get swallowed by the
+    ``except OSError`` arms that treat broken pipes as EOF
+    (the original SR2-3 bug — Windows callers couldn't distinguish
+    "stream ended" from "stream over budget").
+
+    Carries the byte count of the over-budget buffer for diagnostics.
+    """
+
+    def __init__(self, byte_count: int) -> None:
+        super().__init__(f"IPC message exceeds {MAX_MESSAGE_BYTES} bytes (saw {byte_count} bytes)")
+        self.byte_count = byte_count
+
+
 class _WinPipeIO:
     """Async-compatible I/O wrapper around a blocking Windows named-pipe HANDLE.
 
@@ -717,12 +760,13 @@ class _WinPipeIO:
     def _readline_sync(self) -> bytes:
         """Read bytes from the pipe until a newline is found (blocking).
 
-        Enforces ``MAX_MESSAGE_BYTES`` while accumulating chunks
-        (review-w6b MEDIUM): a same-user client could otherwise send an
-        unterminated oversized line and grow memory + thread-pool usage
-        unbounded.  When the buffered length exceeds the cap we drop the
-        connection by returning ``b""`` (the caller already treats empty
-        bytes as EOF and closes the pipe).
+        Enforces ``MAX_MESSAGE_BYTES`` while accumulating chunks: a
+        same-user client could otherwise send an unterminated oversized
+        line and grow memory + thread-pool usage unbounded.  When the
+        buffered length exceeds the cap we raise
+        :class:`_OversizedMessageError` so the caller can emit a
+        protocol-level ``error_type="oversized"`` response instead of
+        treating the truncated stream as a generic EOF (SR2-3).
         """
         import pywintypes
         import win32file
@@ -730,17 +774,37 @@ class _WinPipeIO:
         while True:
             nl = self._read_buf.find(b"\n")
             if nl >= 0:
+                # SR2-3 (review-r6sr2-3): even a newline-terminated frame
+                # must be rejected if it exceeds the cap, so a peer that
+                # sends one giant line with a trailing \n cannot bypass
+                # the size guard.  Pre-fix this branch returned the
+                # oversized line which then sailed past the (Unix-only)
+                # post-read length check on the client side.
+                if nl + 1 > MAX_MESSAGE_BYTES:
+                    line_len = nl + 1
+                    log.warning(
+                        "IPC(win): newline-terminated message exceeded %d bytes "
+                        "(line=%d); raising _OversizedMessageError",
+                        MAX_MESSAGE_BYTES,
+                        line_len,
+                    )
+                    self._read_buf = self._read_buf[nl + 1 :]
+                    raise _OversizedMessageError(line_len)
                 line = self._read_buf[: nl + 1]
                 self._read_buf = self._read_buf[nl + 1 :]
                 return line
             if len(self._read_buf) > MAX_MESSAGE_BYTES:
-                # Oversized unterminated line — abort the connection.
+                # SR2-3: oversized unterminated line.  Raise a typed
+                # exception so the caller can tell this apart from
+                # plain EOF (the original bug — Windows callers got
+                # silent ``b""`` and surfaced it as broken pipe).
+                buf_len = len(self._read_buf)
                 log.warning(
-                    "IPC(win): unterminated message exceeded %d bytes; closing pipe",
+                    "IPC(win): unterminated message exceeded %d bytes; raising _OversizedMessageError",
                     MAX_MESSAGE_BYTES,
                 )
                 self._read_buf = b""
-                return b""
+                raise _OversizedMessageError(buf_len)
             try:
                 _, data = win32file.ReadFile(self._handle, RECV_BUFFER_SIZE)
                 self._read_buf += data
@@ -884,12 +948,25 @@ class _WinConnectionHandler:
             while True:
                 try:
                     line = await self._io.readline()
+                except _OversizedMessageError as exc:
+                    # SR2-3: emit the documented protocol-level error
+                    # (Unix path already does this).  Send-then-close.
+                    log.warning(
+                        "IPC(win): oversized message (%d bytes), sending oversized error",
+                        exc.byte_count,
+                    )
+                    await self._send_error(-1, "Message exceeds 1 MiB limit", "oversized")
+                    break
                 except OSError:
                     break
 
                 if not line:
                     break
 
+                # Defense-in-depth: a line at or below the cap that
+                # nonetheless exceeds it (e.g. via a future framing
+                # change) is still rejected with the same protocol
+                # error so behaviour stays consistent with Unix.
                 if len(line) > MAX_MESSAGE_BYTES:
                     log.warning("IPC(win): oversized message (%d bytes), closing", len(line))
                     await self._send_error(-1, "Message exceeds 1 MiB limit", "oversized")
@@ -1420,6 +1497,17 @@ class IPCClient:
             except TimeoutError:
                 await self.close()
                 raise
+            except _OversizedMessageError as exc:
+                # SR2-3: server sent (or attempted to send) a response
+                # exceeding MAX_MESSAGE_BYTES.  The pipe is poisoned —
+                # close the client connection so subsequent .call()s
+                # don't reuse a half-read buffer.  Surface as a clean
+                # RuntimeError so callers don't see a generic OSError.
+                await self.close()
+                raise RuntimeError(
+                    f"IPC: server response exceeds {MAX_MESSAGE_BYTES} bytes "
+                    f"({exc.byte_count} bytes seen) — connection closed"
+                ) from exc
 
             if not line:
                 await self.close()
