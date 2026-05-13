@@ -105,7 +105,7 @@ _MD = MarkdownIt()
 
 @dataclass(frozen=True)
 class MarkdownDiagnostics:
-    """SR3-6: extractor-side diagnostics surfaced by
+    """SR3-6 + SR3-8: extractor-side diagnostics surfaced by
     :func:`extract_markdown_with_diagnostics`.
 
     Attributes:
@@ -113,9 +113,17 @@ class MarkdownDiagnostics:
             in the file (currently: duplicate ``scry-id`` occurrences
             after the first).  Indexers / CLI use this to decide
             whether to exit non-zero.
+        skip_reason: SR3-8 — when the extractor returns an empty
+            anchor list because the file was rejected (oversized,
+            non-UTF-8, empty body, etc.), this carries a short
+            machine-readable reason.  ``None`` when the file was
+            successfully parsed (anchors may still be empty if the
+            doc has no headings/code, in which case ``skip_reason``
+            is ``"no_anchors"``).
     """
 
     validation_errors: int = 0
+    skip_reason: str | None = None
 
 
 @dataclass
@@ -717,13 +725,18 @@ def extract_markdown_with_diagnostics(
     cfg = config or SectionsConfig()
     _empty_diag = MarkdownDiagnostics()
 
+    def _skip(reason: str) -> tuple[list[Anchor], MarkdownDiagnostics]:
+        # SR3-8: classify why an empty result is empty so the indexer
+        # can split files_processed from files_skipped per reason.
+        return [], MarkdownDiagnostics(skip_reason=reason)
+
     # ── §15.4: file-level guards ──────────────────────────────────────────────
 
     try:
         raw_bytes = path.read_bytes()
     except OSError as exc:
         logger.warning("extract_markdown: cannot read %s: %s", path, exc)
-        return [], _empty_diag
+        return _skip("read_error")
 
     if len(raw_bytes) > max_file_size_bytes:
         logger.warning(
@@ -732,7 +745,7 @@ def extract_markdown_with_diagnostics(
             len(raw_bytes),
             max_file_size_bytes,
         )
-        return [], _empty_diag
+        return _skip("oversized")
 
     # UTF-16 BOM check must precede the UTF-8 decode attempt (§15.4).
     if raw_bytes.startswith(_UTF16_BE_BOM) or raw_bytes.startswith(_UTF16_LE_BOM):
@@ -740,13 +753,13 @@ def extract_markdown_with_diagnostics(
             "extract_markdown: skipping %s — UTF-16 encoded; transcode to UTF-8 to index",
             path,
         )
-        return [], _empty_diag
+        return _skip("utf16")
 
     try:
         raw_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
         logger.warning("extract_markdown: skipping %s — binary file (UTF-8 decode failed)", path)
-        return [], _empty_diag
+        return _skip("binary")
 
     # §5.4 canonicalization (also strips the UTF-8 BOM U+FEFF if present).
     canonical_text = canonicalize_content(raw_text)
@@ -758,11 +771,11 @@ def extract_markdown_with_diagnostics(
     active_fm: Frontmatter | None = frontmatter if frontmatter is not None else file_fm
 
     if active_fm is not None and active_fm.skip:
-        return [], _empty_diag
+        return _skip("frontmatter_skip")
 
     # §15.4: empty body (or frontmatter-only file).
     if not body.strip():
-        return [], _empty_diag
+        return _skip("empty_body")
 
     # ── ID base ───────────────────────────────────────────────────────────────
 
@@ -893,8 +906,14 @@ def extract_markdown_with_diagnostics(
     # avoid noise in normal indexing.
     if not anchors:
         logger.debug(
-            "extract_markdown: %s produced no anchors (empty body or frontmatter-only)",
+            "extract_markdown: %s produced no anchors (no headings or fences)",
             path,
+        )
+        # SR3-8: classify "parsed but produced 0 anchors" as a skip
+        # so operators can split files_processed from files_skipped.
+        diagnostics = MarkdownDiagnostics(
+            validation_errors=diagnostics.validation_errors,
+            skip_reason="no_anchors",
         )
 
     return anchors, diagnostics

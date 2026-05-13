@@ -48,7 +48,7 @@ import logging
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -174,7 +174,10 @@ class IndexResult:
     """Summary of what an index() or reembed() pass produced.
 
     Attributes:
-        files_processed:  Files for which extraction was attempted.
+        files_processed:  Files for which extraction was attempted AND
+                          produced at least one anchor.  SR3-8: this no
+                          longer counts files that were silently skipped
+                          (oversized, UTF-16, binary, no anchors etc.).
         anchors_extracted: Total anchors returned by the extractors.
         anchors_embedded:  Anchors for which embeddings were stored.
         chunks_written:    Total sub-chunk rows written (including overview chunks).
@@ -186,6 +189,14 @@ class IndexResult:
                            (currently: duplicate ``scry-id`` occurrences).
                            CLI exits non-zero when this is > 0 unless the
                            caller passes ``--allow-duplicate-scry-ids``.
+        files_skipped:     SR3-8 — count of files where extraction was
+                           attempted but produced no anchors due to a
+                           known reason (oversized, UTF-16, binary,
+                           empty body, frontmatter skip, etc.).
+        files_skipped_reasons: SR3-8 — per-reason breakdown of
+                           ``files_skipped`` (e.g. ``{"oversized": 2,
+                           "utf16": 1}``).  Helps operators identify
+                           configuration / corpus problems at a glance.
     """
 
     files_processed: int
@@ -195,6 +206,8 @@ class IndexResult:
     files_pruned: int
     elapsed_seconds: float
     validation_errors: int = 0
+    files_skipped: int = 0
+    files_skipped_reasons: dict[str, int] = field(default_factory=dict)
 
 
 # ─── Exception ────────────────────────────────────────────────────────────────
@@ -479,6 +492,11 @@ class Indexer:
         # markdown files (both freshly extracted AND unchanged-on-disk
         # ones, which we re-validate so re-runs surface the violation).
         validation_errors = 0
+        # SR3-8: per-extractor skip accounting so files_processed only
+        # counts files that produced anchors; files_skipped + breakdown
+        # by reason makes silent "where did my files go" puzzles loud.
+        files_skipped = 0
+        files_skipped_reasons: dict[str, int] = {}
 
         with db.acquire_write_lock():
             try:
@@ -547,13 +565,19 @@ class Indexer:
                 for old_anchor in db.list_anchors(path=rel):
                     db.delete_anchor(old_anchor.id)
 
-                extracted, file_validation_errors = _extract_file_anchors(
+                extracted, file_validation_errors, file_skip_reason = _extract_file_anchors(
                     path, target, config, self._repo_root
                 )
                 all_anchors.extend(extracted)
-                files_processed += 1
                 anchors_extracted += len(extracted)
                 validation_errors += file_validation_errors
+                if file_skip_reason is not None:
+                    files_skipped += 1
+                    files_skipped_reasons[file_skip_reason] = (
+                        files_skipped_reasons.get(file_skip_reason, 0) + 1
+                    )
+                else:
+                    files_processed += 1
                 if progress_callback is not None:
                     progress_callback("extract", file_idx, total_files, path.name)
 
@@ -672,6 +696,8 @@ class Indexer:
             files_pruned=files_pruned,
             elapsed_seconds=elapsed,
             validation_errors=validation_errors,
+            files_skipped=files_skipped,
+            files_skipped_reasons=files_skipped_reasons,
         )
 
     async def index_async(self, *, force: bool = False) -> IndexResult:
@@ -721,6 +747,11 @@ class Indexer:
         # markdown files (both freshly extracted AND unchanged-on-disk
         # ones, which we re-validate so re-runs surface the violation).
         validation_errors = 0
+        # SR3-8: per-extractor skip accounting so files_processed only
+        # counts files that produced anchors; files_skipped + breakdown
+        # by reason makes silent "where did my files go" puzzles loud.
+        files_skipped = 0
+        files_skipped_reasons: dict[str, int] = {}
 
         with db.acquire_write_lock():
             try:
@@ -776,13 +807,19 @@ class Indexer:
                 rel = path.relative_to(self._repo_root).as_posix()
                 for old_anchor in db.list_anchors(path=rel):
                     db.delete_anchor(old_anchor.id)
-                extracted, file_validation_errors = _extract_file_anchors(
+                extracted, file_validation_errors, file_skip_reason = _extract_file_anchors(
                     path, target, config, self._repo_root
                 )
                 all_anchors.extend(extracted)
-                files_processed += 1
                 anchors_extracted += len(extracted)
                 validation_errors += file_validation_errors
+                if file_skip_reason is not None:
+                    files_skipped += 1
+                    files_skipped_reasons[file_skip_reason] = (
+                        files_skipped_reasons.get(file_skip_reason, 0) + 1
+                    )
+                else:
+                    files_processed += 1
 
             # SR3-6: re-validate UNCHANGED markdown files (see sync index()).
             unchanged_md_files = [
@@ -867,6 +904,8 @@ class Indexer:
             files_pruned=files_pruned,
             elapsed_seconds=elapsed,
             validation_errors=validation_errors,
+            files_skipped=files_skipped,
+            files_skipped_reasons=files_skipped_reasons,
         )
 
     def reembed(
@@ -1084,24 +1123,29 @@ def _extract_file_anchors(
     target: ExtractionTarget,
     config: Config,
     repo_root: Path,
-) -> tuple[list[Anchor], int]:
+) -> tuple[list[Anchor], int, str | None]:
     """Dispatch to the appropriate extractor.
 
     Logs a warning and returns an empty list on I/O errors so a single bad
     file does not abort the entire index run.
 
     Returns:
-        ``(anchors, validation_errors)`` — ``validation_errors`` is the
-        SR3-6 §15.3 duplicate-scry-id count for the file (0 for non-
-        markdown files).  Caller accumulates the count into
-        :class:`IndexResult`.
+        ``(anchors, validation_errors, skip_reason)``:
+
+        * ``validation_errors`` — SR3-6 §15.3 duplicate-scry-id count
+          for the file (0 for non-markdown files).
+        * ``skip_reason`` — SR3-8.  When non-None the file produced no
+          anchors AND the reason is known (``"oversized"``, ``"utf16"``,
+          ``"binary"``, ``"read_error"``, ``"frontmatter_skip"``,
+          ``"empty_body"``, ``"no_anchors"``).  Caller increments
+          ``files_skipped`` instead of ``files_processed`` for these.
     """
     if target.kind == "markdown":
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             logger.warning("Skipping %s (read error): %s", path, exc)
-            return [], 0
+            return [], 0, "read_error"
         frontmatter, _ = parse_frontmatter(text)
         anchors, diag = extract_markdown_with_diagnostics(
             path,
@@ -1110,21 +1154,42 @@ def _extract_file_anchors(
             config=config.sections,
             max_file_size_bytes=config.index.max_file_size_bytes,
         )
-        return anchors, diag.validation_errors
+        return anchors, diag.validation_errors, diag.skip_reason
 
     if target.kind == "code" and target.language is not None:
-        return (
-            extract_code_symbols(
-                path,
-                repo_root,
-                language=target.language,
-                config=config.code_anchors,
-                max_file_size_bytes=config.index.max_file_size_bytes,
-            ),
-            0,
+        # SR3-8: pre-flight detect the same skip categories the
+        # markdown extractor surfaces via diagnostics, so the indexer
+        # can split files_processed from files_skipped consistently
+        # across both extractors.  We avoid refactoring
+        # extract_code_symbols (8 return paths) by re-checking the
+        # cheap prerequisites here.
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            return [], 0, "read_error"
+        if file_size > config.index.max_file_size_bytes:
+            return [], 0, "oversized"
+        try:
+            with path.open("rb") as _f:
+                head = _f.read(4)
+        except OSError:
+            return [], 0, "read_error"
+        if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
+            return [], 0, "utf16"
+        anchors_code = extract_code_symbols(
+            path,
+            repo_root,
+            language=target.language,
+            config=config.code_anchors,
+            max_file_size_bytes=config.index.max_file_size_bytes,
         )
+        if not anchors_code:
+            # tree-sitter parsed but produced 0 anchors (no_anchors)
+            # OR the language was rejected by config.languages[lang]==skip.
+            return anchors_code, 0, "no_anchors"
+        return anchors_code, 0, None
 
-    return [], 0  # kind == 'skip'
+    return [], 0, None  # kind == 'skip' (already excluded by classify)
 
 
 def _process_anchor(

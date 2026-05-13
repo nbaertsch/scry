@@ -1153,6 +1153,11 @@ async def reindex(
         "anchors_embedded": result.anchors_embedded,
         "files_processed": result.files_processed,
         "files_pruned": result.files_pruned,
+        # SR3-8: report files_skipped + per-reason breakdown so MCP
+        # callers (and the user) can detect when a config / corpus
+        # problem is dropping files silently.
+        "files_skipped": result.files_skipped,
+        "files_skipped_reasons": result.files_skipped_reasons,
         # SR3-6: surface §15.3 duplicate scry-id violations to MCP
         # callers so the agent can warn the user (parity with the CLI
         # which exits non-zero).

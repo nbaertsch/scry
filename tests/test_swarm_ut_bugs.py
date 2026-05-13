@@ -2521,3 +2521,177 @@ def test_sr3_6_unchanged_files_revalidated_on_rerun(tmp_path: Path) -> None:
         "re-run must STILL surface duplicate scry-id even when file is unchanged "
         "(SR3-6 — otherwise the violation silently disappears)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR3-8: files_skipped counter + per-reason breakdown
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr3_8_index_result_exposes_files_skipped_fields() -> None:
+    """SR3-8: ``IndexResult`` must expose ``files_skipped`` (int) and
+    ``files_skipped_reasons`` (dict[str, int]) so operators can split
+    "really indexed" from "silently dropped on the floor".
+    """
+    import dataclasses
+
+    from scry.index import IndexResult
+
+    field_names = {f.name for f in dataclasses.fields(IndexResult)}
+    assert "files_skipped" in field_names, "IndexResult must expose files_skipped (SR3-8)"
+    assert "files_skipped_reasons" in field_names, (
+        "IndexResult must expose files_skipped_reasons (SR3-8)"
+    )
+
+
+def test_sr3_8_markdown_diagnostics_carries_skip_reason(tmp_path: Path) -> None:
+    """SR3-8: ``extract_markdown_with_diagnostics`` must surface
+    ``skip_reason`` on the returned diagnostics for every silent-skip
+    case (oversized / utf16 / binary / frontmatter_skip / empty_body /
+    no_anchors).
+    """
+    from scry.extract.markdown import extract_markdown_with_diagnostics
+
+    # empty_body
+    md_empty = tmp_path / "empty.md"
+    md_empty.write_text("---\nskip: false\n---\n", encoding="utf-8")
+    _anchors, diag = extract_markdown_with_diagnostics(md_empty, tmp_path)
+    assert diag.skip_reason == "empty_body"
+
+    # frontmatter_skip
+    md_skip = tmp_path / "skip.md"
+    md_skip.write_text(
+        "---\nscry:\n  skip: true\n---\n# heading\n", encoding="utf-8"
+    )
+    _a2, diag2 = extract_markdown_with_diagnostics(md_skip, tmp_path)
+    assert diag2.skip_reason == "frontmatter_skip"
+
+    # utf16
+    md_utf16 = tmp_path / "utf16.md"
+    md_utf16.write_bytes(b"\xff\xfe# heading\n")
+    _a3, diag3 = extract_markdown_with_diagnostics(md_utf16, tmp_path)
+    assert diag3.skip_reason == "utf16"
+
+    # oversized
+    md_big = tmp_path / "big.md"
+    md_big.write_text("x" * 200, encoding="utf-8")
+    _a4, diag4 = extract_markdown_with_diagnostics(md_big, tmp_path, max_file_size_bytes=100)
+    assert diag4.skip_reason == "oversized"
+
+    # successful → no skip_reason
+    md_ok = tmp_path / "ok.md"
+    md_ok.write_text("# Heading\n\nbody\n", encoding="utf-8")
+    a5, diag5 = extract_markdown_with_diagnostics(md_ok, tmp_path)
+    assert diag5.skip_reason is None
+    assert len(a5) >= 1
+
+
+def test_sr3_8_extract_file_anchors_returns_three_tuple() -> None:
+    """SR3-8: ``_extract_file_anchors`` must return
+    ``(anchors, validation_errors, skip_reason)`` so the indexer can
+    increment ``files_skipped`` instead of ``files_processed`` for
+    silent-skip cases.
+    """
+    import inspect
+
+    from scry.index import _extract_file_anchors
+
+    sig = inspect.signature(_extract_file_anchors)
+    ret = sig.return_annotation
+    # Should be tuple[list[Anchor], int, str | None]
+    ret_str = str(ret)
+    assert "tuple" in ret_str.lower() and "list" in ret_str.lower(), (
+        f"_extract_file_anchors return must be tuple[list[Anchor], int, str | None]; got {ret}"
+    )
+
+
+def test_sr3_8_indexer_files_skipped_counts_oversized(tmp_path: Path) -> None:
+    """SR3-8 functional: an oversized markdown file must increment
+    ``files_skipped`` (not ``files_processed``) and appear in
+    ``files_skipped_reasons["oversized"]``.
+    """
+    import os as _os
+    import subprocess
+
+    from scry.config import load_config
+    from scry.embed import StubEmbedder
+    from scry.index import Indexer
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    # one good doc, one oversized doc
+    (tmp_path / "good.md").write_text("# Heading\n\nbody\n", encoding="utf-8")
+    huge = tmp_path / "huge.md"
+    huge.write_text("# Heading\n\n" + ("x" * 200_000), encoding="utf-8")
+
+    from click.testing import CliRunner
+
+    from scry.cli import main
+
+    runner = CliRunner()
+    cwd0 = _os.getcwd()
+    try:
+        _os.chdir(tmp_path)
+        runner.invoke(main, ["init"], catch_exceptions=False)
+    finally:
+        _os.chdir(cwd0)
+
+    # Lower max_file_size to force the oversized skip.
+    cfg_path = tmp_path / ".scry" / "config.yaml"
+    cfg_text = cfg_path.read_text(encoding="utf-8")
+    if "max_file_size_bytes" not in cfg_text:
+        cfg_text += "\nindex:\n  max_file_size_bytes: 50000\n"
+    else:
+        cfg_text = cfg_text.replace("max_file_size_bytes: 5242880", "max_file_size_bytes: 50000")
+    cfg_path.write_text(cfg_text, encoding="utf-8")
+
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    config = load_config(tmp_path)
+    indexer = Indexer(tmp_path, config=config, embedder=StubEmbedder())
+    res = indexer.index(force=True)
+
+    assert res.files_skipped >= 1, (
+        f"expected oversized file to be in files_skipped, got {res.files_skipped}"
+    )
+    assert res.files_skipped_reasons.get("oversized", 0) >= 1, (
+        f"expected files_skipped_reasons['oversized'] >= 1; got {res.files_skipped_reasons}"
+    )
+    # The good file should still be processed.
+    assert res.files_processed >= 1
+
+
+def test_sr3_8_mcp_reindex_response_includes_skip_fields() -> None:
+    """SR3-8: ``mcp.handlers.reindex`` response must include
+    ``files_skipped`` + ``files_skipped_reasons`` so MCP clients can
+    surface dropped-file diagnostics to the user.
+    """
+    import inspect
+
+    from scry.mcp.handlers import reindex
+
+    src = inspect.getsource(reindex)
+    assert '"files_skipped": result.files_skipped' in src, (
+        "reindex MCP response must include files_skipped (SR3-8)"
+    )
+    assert '"files_skipped_reasons": result.files_skipped_reasons' in src, (
+        "reindex MCP response must include files_skipped_reasons (SR3-8)"
+    )

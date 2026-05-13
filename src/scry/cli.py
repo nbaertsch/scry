@@ -811,7 +811,13 @@ def index(
 
     click.echo(
         f"Indexed: files_processed={result.files_processed} "
-        f"anchors_extracted={result.anchors_extracted} "
+        f"files_skipped={result.files_skipped}"
+        + (
+            f" (reasons: {' '.join(f'{k}={v}' for k, v in sorted(result.files_skipped_reasons.items()))})"
+            if result.files_skipped_reasons
+            else ""
+        )
+        + f" anchors_extracted={result.anchors_extracted} "
         f"anchors_embedded={result.anchors_embedded} "
         f"chunks_written={result.chunks_written} "
         f"files_pruned={result.files_pruned} "
