@@ -2894,3 +2894,228 @@ def test_sr4_4_install_filter_does_not_add_root_handler_when_empty() -> None:
         root.handlers = saved_handlers
         if logging.lastResort is not None:
             logging.lastResort.filters = saved_last_resort_filters
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR5-5: TypeScript / JavaScript Jest-style describe()/it() anchors
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr5_5_typescript_describe_it_emit_anchors(tmp_path: Path) -> None:
+    """SR5-5: a TypeScript file with Jest-style ``describe`` / ``it``
+    must produce anchors for each test (was 0 anchors pre-fix).
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "auth.test.ts"
+    test_file.write_text(
+        """
+describe('Auth flow', () => {
+  it('rejects expired tokens', () => {
+    expect(true).toBe(true);
+  });
+
+  it('accepts valid tokens', () => {
+    expect(false).toBe(false);
+  });
+});
+
+test('flat test', () => { expect(1).toBe(1); });
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    names = [a.symbol_name for a in anchors]
+    assert any("describe:auth-flow" in n for n in names), f"expected describe anchor; got {names}"
+    assert any("it:rejects-expired-tokens" in n for n in names), (
+        f"expected first it anchor; got {names}"
+    )
+    assert any("it:accepts-valid-tokens" in n for n in names), (
+        f"expected second it anchor; got {names}"
+    )
+    assert any("test:flat-test" in n for n in names), f"expected flat test anchor; got {names}"
+
+
+def test_sr5_5_javascript_describe_it_emit_anchors(tmp_path: Path) -> None:
+    """SR5-5: parity for plain JavaScript test files."""
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "math.spec.js"
+    test_file.write_text(
+        """
+describe('Math', function() {
+  it('adds', function() { expect(1+1).toBe(2); });
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="javascript")
+    names = [a.symbol_name for a in anchors]
+    assert any("describe:math" in n for n in names), names
+    assert any("it:adds" in n for n in names), names
+
+
+def test_sr5_5_nested_describes_carry_parent_path(tmp_path: Path) -> None:
+    """SR5-5: nested ``describe``s must produce hierarchical symbol
+    paths (``describe:Outer::it:inner test``) so the parent context
+    is preserved on the anchor.
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "nested.test.ts"
+    test_file.write_text(
+        """
+describe('Outer', () => {
+  describe('Inner', () => {
+    it('deep test', () => {});
+  });
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    names = [a.symbol_name for a in anchors]
+    assert any(
+        "describe:outer" in n and "describe:inner" in n and "it:deep-test" in n for n in names
+    ), f"expected hierarchical name with all three layers; got {names}"
+
+
+def test_sr5_5_skip_only_each_variants_recognized(tmp_path: Path) -> None:
+    """SR5-5: ``describe.skip``, ``it.only``, ``test.each`` must all
+    be recognized — the canonical symbol_path should preserve the
+    variant.  (The derived ``symbol_name`` field strips the dotted
+    namespace prefix; assertions go against ``id`` which carries the
+    full path.)
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "variants.test.ts"
+    test_file.write_text(
+        """
+describe.skip('skipped suite', () => {});
+it.only('focused test', () => {});
+test.concurrent('concurrent test', () => {});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    ids = [a.id for a in anchors]
+    assert any("describe.skip:skipped-suite" in i for i in ids), ids
+    assert any("it.only:focused-test" in i for i in ids), ids
+    assert any("test.concurrent:concurrent-test" in i for i in ids), ids
+
+
+def test_sr5_5_hooks_use_line_col_suffix_not_first_arg(tmp_path: Path) -> None:
+    """SR5-5: ``beforeEach``, ``afterEach``, etc. take the callback as
+    arg 0 — naming them with ``@<line>:<col>`` avoids confusing them
+    with described/it patterns.
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "hooks.test.ts"
+    test_file.write_text(
+        """
+describe('with hooks', () => {
+  beforeEach(() => { setup(); });
+  afterEach(() => { teardown(); });
+  it('runs', () => {});
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    names = [a.symbol_name for a in anchors]
+    assert any("beforeEach@" in n for n in names), names
+    assert any("afterEach@" in n for n in names), names
+
+
+def test_sr5_5_dynamic_test_name_falls_back_to_line_col(tmp_path: Path) -> None:
+    """SR5-5: when the first arg is dynamic (an identifier, not a
+    string), the anchor name must fall back to ``@line:col`` —
+    NOT use the full call_expression text (which includes the
+    callback body and could blow past AnchorId length).
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "dynamic.test.ts"
+    test_file.write_text(
+        """
+const suiteName = 'computed';
+describe(suiteName, () => {
+  it('inner', () => {});
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    names = [a.symbol_name for a in anchors]
+    # The describe with a dynamic name should have a @line:col suffix
+    # rather than the literal `suiteName` identifier text or the full
+    # call body.
+    dynamic_names = [n for n in names if "describe:@" in n]
+    assert dynamic_names, f"expected dynamic-named describe to fall back to @line:col; got {names}"
+    # Must be short — no callback body included.
+    assert all(len(n) < 200 for n in names), (
+        f"anchor names must stay bounded; got long names: {[n for n in names if len(n) >= 200]}"
+    )
+
+
+def test_sr5_5_anchor_ids_are_well_formed(tmp_path: Path) -> None:
+    """SR5-5 (review-r6sr5-5): all generated anchor IDs must satisfy
+    the ``_ANCHOR_ID_RE`` constraint (no spaces, etc.) so that downstream
+    tooling that calls ``is_well_formed_anchor_id`` accepts them.
+    """
+    from scry.extract.code import extract_code_symbols
+    from scry.models import is_well_formed_anchor_id
+
+    test_file = tmp_path / "complex.test.ts"
+    test_file.write_text(
+        """
+describe('Auth Flow', () => {
+  it('rejects expired tokens (with reason)', () => {});
+  it('handles UTF-8 names: 测试', () => {});
+});
+beforeEach(() => {});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    bad = [a.id for a in anchors if not is_well_formed_anchor_id(a.id)]
+    assert not bad, f"All anchor IDs must be well-formed (SR5-5); offenders: {bad}"
+
+
+def test_sr5_5_duplicate_sibling_test_names_get_collision_suffix(tmp_path: Path) -> None:
+    """SR5-5 (review-r6sr5-5): two ``it`` blocks with the same name
+    under one ``describe`` must NOT collide on AnchorId; the second
+    occurrence gets an ``@2`` suffix per the existing
+    ``_apply_collisions`` convention.
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "dupes.test.ts"
+    test_file.write_text(
+        """
+describe('Outer', () => {
+  it('handles foo', () => {});
+  it('handles foo', () => {});
+  it('handles foo', () => {});
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    ids = [a.id for a in anchors]
+    # Three uniquely identifiable IDs for the three duplicate test names.
+    foo_ids = [i for i in ids if "handles-foo" in i]
+    assert len(foo_ids) == 3, (
+        f"Expected 3 distinct anchor IDs for the duplicate sibling tests; got {foo_ids}"
+    )
+    assert len(set(foo_ids)) == 3, (
+        f"Duplicate sibling tests must produce DISTINCT IDs (review-r6sr5-5); got {foo_ids}"
+    )
+    assert any(i.endswith("@2") for i in foo_ids), (
+        f"Second occurrence must carry an @2 suffix; got {foo_ids}"
+    )
+    assert any(i.endswith("@3") for i in foo_ids), (
+        f"Third occurrence must carry an @3 suffix; got {foo_ids}"
+    )

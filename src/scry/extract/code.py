@@ -57,6 +57,7 @@ from scry.anchor_id import (
     canonicalize_content,
     content_hash,
     fingerprint_simhash,
+    slugify,
 )
 from scry.models import Anchor, AnchorType, CodeAnchorsConfig, TransitiveHashStatus
 
@@ -480,6 +481,13 @@ def _walk_typescript(
       signatures are treated as the implementation body and extracted with
       the bare name (or ``@N`` collision suffix).
 
+    SR5-5: in addition to the regular declaration kinds, this walker
+    also extracts Jest-style test-framework calls
+    (``describe()``, ``it()``, ``test()``, hooks, plus
+    ``.skip`` / ``.only`` / ``.each`` / ``.concurrent`` variants).
+    Without this, TypeScript test files produce zero anchors —
+    significant test/prod parity gap.
+
     Note: ``function_signature`` nodes inside interface bodies are NOT
     extracted here - only top-level ones (direct children of *nodes*).
     """
@@ -521,6 +529,261 @@ def _walk_typescript(
         # Recurse into class body for methods.
         if node.type == "class_declaration":
             results.extend(_ts_class_methods(node, src, resolved_name))
+
+    # SR5-5: Jest-style test-framework anchors.  Recursive walker
+    # collects describe/it/test/hooks anywhere in the file (top-level
+    # AND nested inside other describes), building hierarchical
+    # symbol paths so nested ``it``s carry their parent ``describe``
+    # name as a prefix.
+    results.extend(_walk_typescript_test_calls(nodes, src, parent_path=()))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# SR5-5: Jest / Mocha / Vitest test-framework anchors
+# ---------------------------------------------------------------------------
+
+#: Test-framework function names worth anchoring.  Includes the bare
+#: forms (``describe``, ``it``, …) plus the well-known ``.skip``,
+#: ``.only``, ``.each``, and ``.concurrent`` variants (member
+#: expressions resolve to e.g. ``describe.skip``).  Also covers the
+#: jest legacy prefix forms ``xdescribe`` / ``fit``.
+_TS_TEST_NAMED_FNS: frozenset[str] = frozenset(
+    {
+        "describe",
+        "it",
+        "test",
+        "context",  # mocha alias
+        "suite",  # mocha alias
+        "specify",  # mocha alias
+        # Jest legacy skip/focus prefixes.
+        "xdescribe",
+        "xit",
+        "xtest",
+        "fdescribe",
+        "fit",
+        "ftest",
+    }
+)
+
+#: Hooks take ``(callback)`` not ``(name, callback)`` — handle separately.
+_TS_TEST_HOOK_FNS: frozenset[str] = frozenset(
+    {
+        "beforeEach",
+        "afterEach",
+        "beforeAll",
+        "afterAll",
+        "before",
+        "after",
+        "setup",
+        "teardown",
+    }
+)
+
+
+def _ts_callee_name(call_node: Any, src: bytes) -> str | None:
+    """Return the canonical callee name for a call_expression.
+
+    Handles three patterns:
+      * ``foo(...)`` → ``"foo"``
+      * ``obj.method(...)`` → ``"obj.method"``
+      * ``foo.each(...)("name", cb)`` → ``"foo.each"`` (the OUTER call's
+        callee is itself a call_expression; we read THAT inner call's
+        callee as the canonical name).
+    """
+    callee = (
+        call_node.child_by_field_name("function")
+        if hasattr(call_node, "child_by_field_name")
+        else None
+    )
+    if callee is None:
+        # Fall back to the first non-syntax child.
+        for c in call_node.children:
+            if c.is_named:
+                callee = c
+                break
+    if callee is None:
+        return None
+    if callee.type == "identifier":
+        return src[callee.start_byte : callee.end_byte].decode("utf-8", errors="replace")
+    if callee.type == "member_expression":
+        return src[callee.start_byte : callee.end_byte].decode("utf-8", errors="replace")
+    if callee.type == "call_expression":
+        # ``describe.each(...)('name', cb)`` — callee is itself a call.
+        inner = _ts_callee_name(callee, src)
+        return inner
+    return None
+
+
+def _ts_call_first_string_arg(call_node: Any, src: bytes) -> str | None:
+    """Return the FIRST argument of a call_expression as a literal string.
+
+    Returns the unquoted/decoded text for ``string`` and
+    ``template_string`` literal arguments.  Returns ``None`` when the
+    first arg is dynamic (an identifier, expression, etc.).
+    """
+    args = (
+        call_node.child_by_field_name("arguments")
+        if hasattr(call_node, "child_by_field_name")
+        else None
+    )
+    if args is None:
+        for c in call_node.children:
+            if c.type == "arguments":
+                args = c
+                break
+    if args is None:
+        return None
+    for c in args.children:
+        if not c.is_named:
+            continue
+        if c.type == "string":
+            text = src[c.start_byte : c.end_byte].decode("utf-8", errors="replace")
+            return text.strip("\"'`")
+        if c.type == "template_string":
+            text = src[c.start_byte : c.end_byte].decode("utf-8", errors="replace")
+            return text.strip("`")
+        # First named child wasn't a literal — give up.
+        return None
+    return None
+
+
+def _ts_call_test_name(call_node: Any, src: bytes) -> str:
+    """Build the suffix for a test-framework anchor name.
+
+    Prefers the literal first-argument string (slugified to keep
+    AnchorId chars in the well-known set ``[A-Za-z0-9_./@#%:-]``);
+    falls back to ``@<line>:<col>`` so dynamically-named tests still
+    get a stable, bounded ID (per code-review: must NOT use full
+    call text — it includes the callback body and can blow past
+    AnchorId length).
+    """
+    name = _ts_call_first_string_arg(call_node, src)
+    if name is None:
+        return f"@{call_node.start_point[0] + 1}:{call_node.start_point[1] + 1}"
+    slug = slugify(name, fallback_prefix="test")
+    return slug
+
+
+def _ts_test_hook_name(call_node: Any) -> str:
+    """SR5-5: hooks (``beforeEach``, etc.) take a callback as arg 0,
+    not a name + callback.  Anchor name uses ``@line:col`` suffix.
+    """
+    return f"@{call_node.start_point[0] + 1}:{call_node.start_point[1] + 1}"
+
+
+def _walk_typescript_test_calls(
+    nodes: list[Any],
+    src: bytes,
+    *,
+    parent_path: tuple[str, ...],
+    sibling_seen: dict[tuple[str, ...], dict[str, int]] | None = None,
+) -> list[_PyRec]:
+    """SR5-5: recursive walker that emits anchors for Jest-style
+    test-framework calls anywhere in the source tree.
+
+    Builds a hierarchical symbol path so nested ``it`` blocks carry
+    their parent ``describe`` name as a prefix
+    (e.g. ``describe:auth-flow::it:rejects-expired-tokens``).
+
+    review-r6sr5-5: sibling tests with the same name (e.g. two
+    ``it('handles foo')`` under one describe) get an ``@2`` / ``@3``
+    suffix so AnchorIds remain unique — without this they'd collide
+    on the DB primary-key constraint and silently overwrite.
+    """
+    results: list[_PyRec] = []
+    if sibling_seen is None:
+        sibling_seen = {}
+
+    def _resolve_collision(symbol: str) -> str:
+        bucket = sibling_seen.setdefault(parent_path, {})
+        n = bucket.get(symbol, 0) + 1
+        bucket[symbol] = n
+        return symbol if n == 1 else f"{symbol}@{n}"
+
+    for raw_node in nodes:
+        node = _ts_unwrap(raw_node)
+        # Recurse into class/function bodies for nested test calls.
+        if node.type in (
+            "class_body",
+            "statement_block",
+            "program",
+        ):
+            results.extend(
+                _walk_typescript_test_calls(
+                    list(node.children),
+                    src,
+                    parent_path=parent_path,
+                    sibling_seen=sibling_seen,
+                )
+            )
+            continue
+
+        if node.type != "expression_statement":
+            # Walk into other compound nodes too — some test frameworks
+            # wrap calls in additional layers.
+            if hasattr(node, "children") and node.children:
+                results.extend(
+                    _walk_typescript_test_calls(
+                        list(node.children),
+                        src,
+                        parent_path=parent_path,
+                        sibling_seen=sibling_seen,
+                    )
+                )
+            continue
+
+        # expression_statement → call_expression
+        call = None
+        for c in node.children:
+            if c.type == "call_expression":
+                call = c
+                break
+        if call is None:
+            continue
+
+        callee_name = _ts_callee_name(call, src)
+        if callee_name is None:
+            continue
+        # Normalize "describe.skip" → base "describe" for the dispatch
+        # but keep the FULL string for the anchor's display name.
+        base = callee_name.split(".")[0]
+
+        if base in _TS_TEST_NAMED_FNS:
+            test_name = _ts_call_test_name(call, src)
+            symbol = _resolve_collision(f"{callee_name}:{test_name}")
+            full_path = "::".join((*parent_path, symbol))
+            results.append(
+                (full_path, _node_text(call, src), call.start_point[0], call.start_point[1])
+            )
+            # Recurse into the callback body to surface nested tests.
+            # New nested scope gets a fresh sibling_seen sub-dict.
+            results.extend(
+                _walk_typescript_test_calls(
+                    list(call.children),
+                    src,
+                    parent_path=(*parent_path, symbol),
+                    sibling_seen=sibling_seen,
+                )
+            )
+        elif base in _TS_TEST_HOOK_FNS:
+            symbol = _resolve_collision(f"{callee_name}{_ts_test_hook_name(call)}")
+            full_path = "::".join((*parent_path, symbol))
+            results.append(
+                (full_path, _node_text(call, src), call.start_point[0], call.start_point[1])
+            )
+        # Otherwise: not a test-framework call — keep walking to find
+        # nested describes inside e.g. an IIFE.
+        elif hasattr(call, "children") and call.children:
+            results.extend(
+                _walk_typescript_test_calls(
+                    list(call.children),
+                    src,
+                    parent_path=parent_path,
+                    sibling_seen=sibling_seen,
+                )
+            )
 
     return results
 
