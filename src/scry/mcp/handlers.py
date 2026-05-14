@@ -38,6 +38,7 @@ from scry.embed import Embedder
 from scry.git_context import GitContextProvider, get_current_user
 from scry.index import Indexer
 from scry.models import (
+    Anchor,
     AnchorLinkProjection,
     AnchorType,
     Config,
@@ -252,6 +253,10 @@ async def search(
         List of :class:`~scry.models.AnchorPacket` dicts, sorted by descending
         relevance score.  Each dict includes a populated ``links`` field sourced
         from the active overlay (Wave 2 section-level drift only).
+
+        UAT-21: when results < 3, each result dict (AND the list itself
+        if empty — as a single-element list with just the meta) carries
+        a ``did_you_mean`` key with up to 3 fuzzy-matched symbol names.
     """
     # UAT-M-10 / U-fix-7: reject empty/whitespace-only queries early.
     # Was silently reaching the DB and returning unranked results,
@@ -329,6 +334,23 @@ async def search(
         packet = packet.model_copy(update={"links": links})
         packets.append(_compact_packet(packet.model_dump()))
 
+    # UAT-21: when few results come back, surface "did you mean?"
+    # suggestions from the symbol_name corpus.  Attached to each
+    # result dict (and as a standalone meta entry when results are
+    # empty) so the return type stays list[dict] — no breaking
+    # API change for existing MCP clients that iterate the list.
+    did_you_mean: list[str] = []
+    if len(packets) < 3 and query.strip():
+        did_you_mean = _did_you_mean_suggestions(query, db=ctx.db, max_suggestions=3)
+
+    if did_you_mean:
+        for pkt in packets:
+            pkt["did_you_mean"] = did_you_mean
+        if not packets:
+            # No results at all — return a single meta entry so the
+            # client still gets the suggestions.
+            packets.append({"did_you_mean": did_you_mean})
+
     return packets
 
 
@@ -349,6 +371,38 @@ _COMPACT_DROP_KEYS: tuple[str, ...] = (
     # is incomplete (lsp_unavailable / lsp_error / partial).  Bulky hashes
     # are dropped; this single status field stays.
 )
+
+
+def _did_you_mean_suggestions(query: str, *, db: ScryDB, max_suggestions: int = 3) -> list[str]:
+    """UAT-21: fuzzy-match *query* tokens against the indexed symbol_name corpus.
+
+    Runs a case-insensitive LIKE on each whitespace-split token of the
+    query against ``anchors.symbol_name`` and returns up to
+    *max_suggestions* distinct symbol names that partially match.
+    Cheap (single SQL query) and avoids false positives by requiring
+    at least one query token to appear as a substring.
+
+    Returns an empty list when nothing matches or the corpus is empty.
+    """
+    tokens = [t.strip() for t in query.lower().split() if len(t.strip()) >= 3]
+    if not tokens:
+        return []
+    # Build a UNION ALL of LIKE predicates — one per token — to find
+    # symbols that contain ANY of the query tokens as a substring.
+    clauses = " OR ".join("LOWER(symbol_name) LIKE ?" for _ in tokens)
+    params = [f"%{t}%" for t in tokens]
+    try:
+        rows = db._conn.execute(
+            f"""
+            SELECT DISTINCT symbol_name FROM anchors
+            WHERE symbol_name IS NOT NULL AND ({clauses})
+            LIMIT ?
+            """,
+            [*params, max_suggestions],
+        ).fetchall()
+    except Exception:
+        return []
+    return [str(r[0]) for r in rows if r[0]]
 
 
 def _compact_packet(packet: dict[str, Any]) -> dict[str, Any]:
@@ -373,6 +427,60 @@ def _compact_packet(packet: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _resolve_anchor_by_id(db: ScryDB, anchor_id: str) -> Anchor | None:
+    """UAT-20: look up an anchor by ID, tolerating the ``:``/``::``
+    separator confusion.
+
+    Code anchors use ``:`` (``path:Symbol``), doc sections use ``::``
+    (``path::heading::sub``).  Users frequently mix them up when
+    typing by hand.  This helper tries the exact ID first; if not
+    found, it generates alternate forms and tries each before giving
+    up.
+
+    Alternate forms (tried in order):
+      * ``::`` → ``:`` throughout  (user typed doc-style for a code anchor).
+      * ``:`` → ``::`` for the FIRST occurrence (user typed code-style
+        for a single-level doc anchor).
+      * ``:`` → ``::`` for ALL occurrences AFTER the path portion
+        (user typed ``path:heading:sub`` instead of ``path::heading::sub``
+        for a nested doc anchor — review-r6uat20).
+
+    Only the first alternate that matches is returned; this is a
+    best-effort UX improvement, not a search facility.
+    """
+    anchor = db.get_anchor(anchor_id)
+    if anchor is not None:
+        return anchor
+
+    # Try 1: user typed :: everywhere but the anchor uses : (code-style).
+    if "::" in anchor_id:
+        alt1 = anchor_id.replace("::", ":")
+        anchor = db.get_anchor(alt1)
+        if anchor is not None:
+            return anchor
+
+    # Try 2: user typed : everywhere but the anchor uses :: for section
+    # separators.  Split on first : to get path portion, then replace
+    # all remaining : with :: in the heading portion.
+    if ":" in anchor_id and "::" not in anchor_id:
+        # Single-level: replace first : with ::
+        alt2 = anchor_id.replace(":", "::", 1)
+        anchor = db.get_anchor(alt2)
+        if anchor is not None:
+            return anchor
+        # Multi-level (review-r6uat20): path:heading:sub → path::heading::sub
+        first_colon = anchor_id.index(":")
+        path_part = anchor_id[:first_colon]
+        rest = anchor_id[first_colon + 1 :]
+        if ":" in rest:
+            alt3 = path_part + "::" + rest.replace(":", "::")
+            anchor = db.get_anchor(alt3)
+            if anchor is not None:
+                return anchor
+
+    return None
+
+
 async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
     """Load a single anchor by its primary ID.
 
@@ -388,6 +496,10 @@ async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
     ``fingerprint_simhash``, ``def_line``/``def_char``, etc.) are
     stripped from the response to reduce token bloat in LLM contexts.
     Use the CLI ``scry get-anchor`` command for the full record.
+
+    UAT-20: tolerates both ``:`` and ``::`` separator forms.  If the
+    exact ID is not found, the resolver tries the alternate separator
+    before returning None.
     """
     git_ctx = ctx.git_context.get()
     index_state = await ctx.index_state_tracker.poll_and_maybe_reconcile(
@@ -398,7 +510,7 @@ async def get_anchor(ctx: MCPContext, id: str) -> dict[str, Any] | None:
         ipc_client=ctx.ipc_client,
         repo_root=ctx.repo_root,
     )
-    anchor = ctx.db.get_anchor(id)
+    anchor = _resolve_anchor_by_id(ctx.db, id)
     if anchor is None:
         return None
     result = _compact_packet(anchor.model_dump())

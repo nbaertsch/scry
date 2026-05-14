@@ -3691,3 +3691,115 @@ def test_uat_10_apply_link_suggestions_stamps_created_by() -> None:
     assert '"created_by": get_current_user' in src, (
         "apply_link_suggestions must stamp created_by on write records (UAT-10)"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# UAT-20: anchor ID separator unification (: vs ::)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_uat_20_resolve_anchor_by_id_exact_match() -> None:
+    """UAT-20: ``_resolve_anchor_by_id`` returns exact match first."""
+    import inspect
+
+    from scry.mcp.handlers import _resolve_anchor_by_id
+
+    sig = inspect.signature(_resolve_anchor_by_id)
+    assert "anchor_id" in sig.parameters
+
+
+def test_uat_20_resolve_anchor_by_id_tries_alternate_separator() -> None:
+    """UAT-20: ``_resolve_anchor_by_id`` tries ``::`` → ``:`` and
+    ``:`` → ``::`` when the exact match fails — so users who mix up
+    the separator get a result instead of None.
+    """
+    import inspect
+
+    from scry.mcp.handlers import _resolve_anchor_by_id
+
+    src = inspect.getsource(_resolve_anchor_by_id)
+    assert '"::"' in src and '":" in anchor_id' in src, (
+        "_resolve_anchor_by_id must check both :: and : separators (UAT-20)"
+    )
+    # Must try :: → : (user typed doc-style for a code anchor).
+    assert 'replace("::", ":")' in src, "Must try :: → : alternate (UAT-20)"
+    # Must try : → :: (user typed code-style for a doc anchor).
+    assert 'replace(":", "::", 1)' in src, "Must try : → :: alternate (UAT-20)"
+    # review-r6uat20: multi-level nested docs (path:h1:h2 → path::h1::h2)
+    assert 'rest.replace(":", "::")' in src, (
+        "Must try multi-level : → :: for nested doc anchors (UAT-20)"
+    )
+
+
+def test_uat_20_get_anchor_handler_uses_resolver() -> None:
+    """UAT-20: the ``get_anchor`` MCP handler must use
+    ``_resolve_anchor_by_id`` (not raw ``db.get_anchor``) so the
+    separator tolerance is applied.
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_anchor
+
+    src = inspect.getsource(get_anchor)
+    assert "_resolve_anchor_by_id" in src, (
+        "get_anchor handler must use _resolve_anchor_by_id (UAT-20)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# UAT-21: "did you mean" for zero-result searches
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_uat_21_search_returns_list_with_did_you_mean() -> None:
+    """UAT-21: ``search`` handler must attach ``did_you_mean`` to each
+    result dict when results < 3.  Return type stays ``list[dict]``
+    for back-compat — no breaking API change.
+    """
+    import inspect
+
+    from scry.mcp.handlers import search
+
+    sig = inspect.signature(search)
+    ret = str(sig.return_annotation)
+    assert "list" in ret.lower(), (
+        f"search return must stay list[dict[str, Any]] for back-compat; got {ret}"
+    )
+    src = inspect.getsource(search)
+    assert '"did_you_mean"' in src, "search response must include did_you_mean key (UAT-21)"
+    assert "_did_you_mean_suggestions" in src, (
+        "search must call _did_you_mean_suggestions when results < 3 (UAT-21)"
+    )
+
+
+def test_uat_21_did_you_mean_helper_exists_and_queries_db() -> None:
+    """UAT-21: ``_did_you_mean_suggestions`` must query the symbol_name
+    corpus for fuzzy matches when results are sparse.
+    """
+    import inspect
+
+    from scry.mcp.handlers import _did_you_mean_suggestions
+
+    sig = inspect.signature(_did_you_mean_suggestions)
+    assert "query" in sig.parameters
+    assert "db" in sig.parameters
+    assert "max_suggestions" in sig.parameters
+    src = inspect.getsource(_did_you_mean_suggestions)
+    assert "symbol_name" in src, "_did_you_mean_suggestions must query symbol_name corpus (UAT-21)"
+
+
+def test_uat_21_mcp_search_tool_stays_list_return_type() -> None:
+    """UAT-21: MCP ``search`` tool return type must stay
+    ``list[dict[str, Any]]`` for back-compat (per review-r6uat20-21:
+    changing to ``dict`` would break every existing MCP client that
+    iterates the result as a list).  ``did_you_mean`` is attached
+    per-result-dict when present.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "list[dict[str, Any]]" in src, (
+        "MCP search tool return annotation must stay list[dict] (UAT-21 review fix)"
+    )

@@ -280,9 +280,9 @@ class MCPServer:
 
             Returns ranked anchor packets.  Use ``types`` to restrict to
             ``["section"]``, ``["code"]``, or ``["code_in_doc"]``.
-            SR5-6: pass ``exclude_tests=True`` to suppress anchors from
-            test files (filename heuristic) AND test-framework anchors
-            (Jest-style ``describe`` / ``it`` / hooks).
+            SR5-6: pass ``exclude_tests=True`` to suppress test anchors.
+            UAT-21: when results < 3, each result dict carries a
+            ``did_you_mean`` key with up to 3 fuzzy-matched symbol names.
             """
             return cast(
                 list[dict[str, Any]],
