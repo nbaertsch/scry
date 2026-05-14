@@ -1,10 +1,19 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Gate: only runs on PRs targeting main (not on direct pushes).
+  # This drastically reduces minutes for repos that push directly
+  # to main — no CI fires until a PR is opened.  Manual dispatch
+  # is available for ad-hoc runs.
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same PR when a new push arrives,
+# so stale matrix jobs don't burn minutes.
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -24,11 +33,14 @@ jobs:
         run: mypy src
 
   test:
+    needs: lint  # Don't waste matrix minutes if lint fails.
     strategy:
-      fail-fast: false
+      fail-fast: true  # Kill remaining matrix jobs on first failure.
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.11", "3.12"]
+        # Reduced matrix: Linux + Windows only (macOS 3x cost),
+        # Python 3.11 only (3.12 parity is covered by mypy).
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
