@@ -102,6 +102,7 @@ def _link_from_record(record: LinkRecord) -> Link:
         worktree_dirty=record.worktree_dirty,
         evidence=record.evidence,
         last_event_id=record.event_id,
+        created_by=record.created_by,
     )
 
 

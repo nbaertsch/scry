@@ -310,6 +310,14 @@ class LinkRecord(BaseModel):
     # Only valid for delete.
     reason: str | None = None
 
+    # UAT-10: identity of the user/session that authored this event.
+    # Auto-populated from ``SCRY_USER`` env or ``git config user.email``
+    # at creation time (propose_link, unlink, CLI scry link).  None for
+    # legacy baseline records (pre-UAT-10) — these parse cleanly since
+    # the field has a default.  Promoted records (commit_links) preserve
+    # the original created_by rather than re-stamping the promoter.
+    created_by: str | None = None
+
     @model_validator(mode="after")
     def _shape_check(self) -> LinkRecord:
         if self.op == LinkOp.UPSERT.value:
@@ -380,6 +388,9 @@ class Link(BaseModel):
     evidence: str | None = None
     last_event_id: EventId
     """The event_id of the most recent record establishing this link."""
+
+    # UAT-10: identity of the user/session that created this logical link.
+    created_by: str | None = None
 
 
 # ───── Anchor packet (search result envelope) ────────────────────────

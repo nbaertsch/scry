@@ -3521,3 +3521,173 @@ def test_sr5_6_backfill_skips_markdown_anchors(tmp_path: Path) -> None:
         "Markdown SECTION anchors under tests/* must remain is_test=False (SR5-6)"
     )
     db2.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# UAT-10: created_by + cross-user collaboration hazard mitigation
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_uat_10_link_record_has_created_by_field() -> None:
+    """UAT-10: ``LinkRecord`` must carry ``created_by: str | None``
+    (optional, defaults to None for pre-UAT-10 baselines).
+    """
+    from scry.models import LinkRecord
+
+    fields = LinkRecord.model_fields
+    assert "created_by" in fields, "LinkRecord must have created_by field (UAT-10)"
+    assert fields["created_by"].default is None, "created_by must default to None for back-compat"
+
+
+def test_uat_10_link_model_has_created_by() -> None:
+    """UAT-10: ``Link`` (the replayed active-link shape) must surface
+    ``created_by`` so ``get_links`` can expose it.
+    """
+    from scry.models import Link
+
+    assert "created_by" in Link.model_fields
+
+
+def test_uat_10_get_current_user_prefers_env(tmp_path: Path) -> None:
+    """UAT-10: ``get_current_user`` must check ``SCRY_USER`` env first,
+    before falling back to ``git config user.email``.
+    """
+    import os as _os
+
+    from scry.git_context import _user_identity_cache, get_current_user
+
+    # Clear cache for this test.
+    _user_identity_cache.clear()
+    old = _os.environ.get("SCRY_USER")
+    try:
+        _os.environ["SCRY_USER"] = "test-handle"
+        assert get_current_user(tmp_path) == "test-handle"
+    finally:
+        if old is None:
+            _os.environ.pop("SCRY_USER", None)
+        else:
+            _os.environ["SCRY_USER"] = old
+        _user_identity_cache.clear()
+
+
+def test_uat_10_get_current_user_falls_back_to_git(tmp_path: Path) -> None:
+    """UAT-10: when ``SCRY_USER`` is unset, ``get_current_user`` falls
+    back to ``git config user.email`` from the repo.
+    """
+    import os as _os
+    import subprocess
+
+    from scry.git_context import _user_identity_cache, get_current_user
+
+    _user_identity_cache.clear()
+    old = _os.environ.pop("SCRY_USER", None)
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        result = get_current_user(tmp_path)
+        assert result == "test@example.com"
+    finally:
+        if old is not None:
+            _os.environ["SCRY_USER"] = old
+        _user_identity_cache.clear()
+
+
+def test_uat_10_propose_link_stamps_created_by() -> None:
+    """UAT-10: ``propose_link`` handler must populate ``created_by``
+    on the ``LinkRecord`` before writing to the overlay.
+    """
+    import inspect
+
+    from scry.mcp.handlers import propose_link
+
+    src = inspect.getsource(propose_link)
+    assert '"created_by": get_current_user' in src, (
+        "propose_link must stamp created_by via get_current_user (UAT-10)"
+    )
+
+
+def test_uat_10_unlink_stamps_created_by() -> None:
+    """UAT-10: ``unlink`` handler must populate ``created_by``
+    on the DELETE ``LinkRecord``.
+    """
+    import inspect
+
+    from scry.mcp.handlers import unlink
+
+    src = inspect.getsource(unlink)
+    assert '"created_by": get_current_user' in src, (
+        "unlink must stamp created_by via get_current_user (UAT-10)"
+    )
+
+
+def test_uat_10_get_links_response_includes_created_by() -> None:
+    """UAT-10: ``get_links`` MCP response per-link dicts must include
+    ``created_by`` so callers can detect cross-user contamination.
+    """
+    import inspect
+
+    from scry.mcp.handlers import get_links
+
+    src = inspect.getsource(get_links)
+    assert '"created_by": link.created_by' in src, (
+        "get_links must include created_by in per-link response (UAT-10)"
+    )
+
+
+def test_uat_10_status_surfaces_baseline_authors() -> None:
+    """UAT-10: MCP ``status`` handler must include ``baseline_authors``
+    and ``has_unattributed_records`` fields so callers can detect
+    cross-user contamination.
+    """
+    import inspect
+
+    from scry.mcp.handlers import status
+
+    src = inspect.getsource(status)
+    assert '"baseline_authors":' in src, "status must include baseline_authors (UAT-10)"
+    assert '"has_unattributed_records":' in src, (
+        "status must include has_unattributed_records (UAT-10)"
+    )
+
+
+def test_uat_10_legacy_baseline_without_created_by_parses_cleanly() -> None:
+    """UAT-10: a pre-UAT-10 JSONL record (without ``created_by``)
+    must parse cleanly via ``LinkRecord`` (Pydantic defaults it to
+    None, ``extra='forbid'`` does not reject absent optionals).
+    """
+    from scry.models import LinkOp, LinkRecord
+
+    raw = {
+        "op": LinkOp.UPSERT,
+        "link_id": "lnk_test",
+        "event_id": "evt_test",
+        "from": "a.py:foo",
+        "from_type": "code",
+        "to": "spec.md::auth",
+        "to_type": "section",
+        "type": "implements",
+        "from_content_hash": "sha256:" + "0" * 64,
+        "to_content_hash": "sha256:" + "1" * 64,
+    }
+    record = LinkRecord.model_validate(raw)
+    assert record.created_by is None
+
+
+def test_uat_10_apply_link_suggestions_stamps_created_by() -> None:
+    """UAT-10 (review-r6uat10): ``apply_link_suggestions`` write path
+    must stamp ``created_by`` on suggestion-created ``LinkRecord``s so
+    they don't enter the shared baseline as unattributed records.
+    """
+    import inspect
+
+    from scry.mcp.handlers import apply_link_suggestions
+
+    src = inspect.getsource(apply_link_suggestions)
+    assert '"created_by": get_current_user' in src, (
+        "apply_link_suggestions must stamp created_by on write records (UAT-10)"
+    )

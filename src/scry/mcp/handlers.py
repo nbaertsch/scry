@@ -35,7 +35,7 @@ from typing import Any, Literal
 
 from scry.drift import DriftEvaluation, compute_drift_summary, evaluate_link_drift
 from scry.embed import Embedder
-from scry.git_context import GitContextProvider
+from scry.git_context import GitContextProvider, get_current_user
 from scry.index import Indexer
 from scry.models import (
     AnchorLinkProjection,
@@ -497,6 +497,9 @@ async def get_links(
                 "direction": link_direction,
                 "from_content_hash": link.from_content_hash,
                 "to_content_hash": link.to_content_hash,
+                # UAT-10: surface the author so callers can detect
+                # cross-user contamination in the baseline.
+                "created_by": link.created_by,
             }
         )
 
@@ -779,6 +782,8 @@ async def propose_link(
             "evidence": evidence,
             "commit_sha": git_ctx.head_sha,
             "worktree_dirty": bool(git_ctx.dirty_files),
+            # UAT-10: attribute the record to the current user.
+            "created_by": get_current_user(ctx.repo_root),
         }
     )
 
@@ -973,6 +978,8 @@ async def unlink(
             # supersedes is required on DELETE per §3.5 rule 5.
             "supersedes": active.last_event_id,
             "reason": reason or "scry unlink (MCP)",
+            # UAT-10: attribute the deletion to the current user.
+            "created_by": get_current_user(ctx.repo_root),
         }
     )
     try:
@@ -1017,12 +1024,23 @@ async def status(ctx: MCPContext) -> dict[str, Any]:
     replay = _replay_active(ctx.overlay_mgr)
     pending = ctx.overlay_mgr.list_pending_overlay_records()
 
+    # UAT-10: collect distinct non-null created_by values from the active
+    # link set so callers can detect cross-user contamination.  Legacy
+    # un-attributed records (created_by=None) are reported separately.
+    baseline_authors = sorted(
+        {lk.created_by for lk in replay.active_links.values() if lk.created_by is not None}
+    )
+    has_unattributed = any(lk.created_by is None for lk in replay.active_links.values())
+
     return {
         "role": ctx.role,
         "branch": git_ctx.branch,
         "head_sha": git_ctx.head_sha,
         "pending_count": len(pending),
         "merge_conflict_count": len(replay.merge_conflicts),
+        # UAT-10: multi-author awareness.
+        "baseline_authors": baseline_authors,
+        "has_unattributed_records": has_unattributed,
         "index_state": index_state,
     }
 
@@ -1724,6 +1742,10 @@ async def apply_link_suggestions(
                 "commit_sha": git_ctx.head_sha,
                 "worktree_dirty": bool(git_ctx.dirty_files),
                 "evidence": s.reason,
+                # UAT-10: attribute suggestion-created links to the
+                # current user so they don't end up as unattributed
+                # records in the shared baseline (review-r6uat10).
+                "created_by": get_current_user(ctx.repo_root),
             }
         )
         try:

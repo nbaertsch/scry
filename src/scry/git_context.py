@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -29,6 +30,7 @@ __all__ = [
     "GitContextError",
     "GitContextProvider",
     "derive_overlay_slug",
+    "get_current_user",
 ]
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,43 @@ def _run_git_bytes(
         timeout=timeout,
         stdin=subprocess.DEVNULL,  # UT3-1 — see _run_git for rationale.
     )
+
+
+# UAT-10: per-process cached user identity for the ``created_by``
+# field on link records.  Checks ``SCRY_USER`` env first (lets users
+# set a non-PII handle), then falls back to ``git config user.email``.
+_user_identity_cache: dict[str, str | None] = {}
+
+
+def get_current_user(repo_root: Path) -> str | None:
+    """Return the current user identity for link attribution (UAT-10).
+
+    Resolution order:
+      1. ``SCRY_USER`` environment variable (non-PII handle preferred).
+      2. ``git config user.email`` from *repo_root*'s config.
+      3. ``None`` (unavailable — record persists un-attributed).
+
+    Cached per ``repo_root`` per process so repeated calls (e.g.
+    during a batch ``scry link`` loop) don't re-spawn git.
+    """
+    env: str | None = os.environ.get("SCRY_USER")
+    if env:
+        return env.strip()
+    key = str(repo_root)
+    cached = _user_identity_cache.get(key)
+    if cached is not None:
+        return cached
+    if key in _user_identity_cache:
+        # Explicitly cached as None (no email found).
+        return None
+    try:
+        result = _run_git(["config", "user.email"], repo_root, timeout=5.0)
+        email: str | None = result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        email = None
+    resolved: str | None = email if email else None
+    _user_identity_cache[key] = resolved
+    return resolved
 
 
 def derive_overlay_slug(branch: str | None, head_sha: str) -> str:
