@@ -178,6 +178,36 @@ def _get_parent_anchor_paths(
     return {str(r[0]): str(r[1]) for r in rows}
 
 
+def _get_parent_anchor_is_test(
+    parent_ids: Sequence[str],
+    *,
+    db: ScryDB,
+) -> dict[str, bool]:
+    """SR5-6: return ``is_test`` per parent anchor.
+
+    Used by :func:`hybrid_search` to push the ``exclude_tests`` filter
+    BEFORE the final ``top_k`` truncation.  Tolerates a legacy DB
+    without the column via the read-side compatibility path in
+    :meth:`ScryDB._anchor_select_columns` (column reads as ``0``).
+    """
+    if not parent_ids:
+        return {}
+    placeholders = ",".join("?" * len(parent_ids))
+    # Use the column directly so this path works on freshly migrated
+    # DBs.  Read-only legacy DBs without the column will fail the
+    # SELECT — callers that hit those should pass exclude_tests=False.
+    try:
+        rows = db._conn.execute(
+            f"SELECT id, is_test FROM anchors WHERE id IN ({placeholders})",
+            list(parent_ids),
+        ).fetchall()
+    except Exception:
+        # Legacy schema; treat all as non-test so exclude_tests is a
+        # no-op rather than silently zeroing the result set.
+        return dict.fromkeys(parent_ids, False)
+    return {str(r[0]): bool(r[1]) for r in rows}
+
+
 def _promote(
     ranked: list[tuple[int, int]],
     rowid_to_parent: dict[int, str],
@@ -299,6 +329,7 @@ def hybrid_search(
     top_k: int = 10,
     anchor_types: Sequence[AnchorType] | None = None,
     path_globs: Sequence[str] | None = None,
+    exclude_tests: bool = False,
 ) -> list[SearchResult]:
     """Run the §4.1 v3.1 hybrid BM25 + vector retrieval algorithm.
 
@@ -407,6 +438,18 @@ def hybrid_search(
         }
         rowid_to_parent = {
             rowid: pid for rowid, pid in rowid_to_parent.items() if pid in allowed_by_path
+        }
+
+    # SR5-6: same pre-truncation pattern for the test-anchor filter.
+    # Filtering AFTER top_k would return < top_k results when test
+    # anchors dominate the head of the ranking even though non-test
+    # results exist below the cutoff.
+    if exclude_tests:
+        is_test_parent_ids: list[str] = list(set(rowid_to_parent.values()))
+        test_flag_map = _get_parent_anchor_is_test(is_test_parent_ids, db=db)
+        allowed_by_is_test = {pid for pid, t in test_flag_map.items() if not t}
+        rowid_to_parent = {
+            rowid: pid for rowid, pid in rowid_to_parent.items() if pid in allowed_by_is_test
         }
 
     # Step 3: Assign 1-indexed original ranks to each chunk list, then promote

@@ -3119,3 +3119,405 @@ describe('Outer', () => {
     assert any(i.endswith("@3") for i in foo_ids), (
         f"Third occurrence must carry an @3 suffix; got {foo_ids}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SR5-6: is_test metadata on anchors
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_sr5_6_is_test_path_heuristic_recognizes_common_patterns() -> None:
+    """SR5-6: ``is_test_path`` must recognize the common test-file
+    naming patterns across Python / JS / TS / Go / Rust / Java / Kotlin.
+    """
+    from scry.extract._test_detection import is_test_path
+
+    test_cases = [
+        # Python
+        ("tests/test_foo.py", True),
+        ("test/test_foo.py", True),
+        ("src/foo/tests/test_x.py", True),
+        ("foo_test.py", True),
+        ("foo_tests.py", True),
+        ("conftest.py", True),
+        ("src/conftest.py", True),
+        # JS / TS
+        ("src/auth.test.ts", True),
+        ("src/auth.spec.ts", True),
+        ("src/auth.test.tsx", True),
+        ("src/auth.test.jsx", True),
+        ("src/auth.test.mjs", True),
+        ("src/__tests__/auth.ts", True),
+        # Go
+        ("auth_test.go", True),
+        # Rust
+        ("tests/auth_integration.rs", True),
+        ("foo_test.rs", True),
+        # Java / Kotlin
+        ("src/AuthTest.java", True),
+        ("src/AuthTests.java", True),
+        ("src/AuthTest.kt", True),
+        ("src/AuthSpec.kt", True),
+        # Production code (must NOT match)
+        ("src/auth.py", False),
+        ("src/auth.ts", False),
+        ("src/main.go", False),
+        ("README.md", False),
+        ("docs/usage.md", False),
+        ("", False),
+    ]
+    for path, expected in test_cases:
+        assert is_test_path(path) is expected, (
+            f"is_test_path({path!r}) expected {expected}, got {is_test_path(path)}"
+        )
+
+
+def test_sr5_6_anchor_model_has_is_test_field() -> None:
+    """SR5-6: the ``Anchor`` model must expose ``is_test: bool``
+    (default False for back-compat with pre-SR5-6 callers/DBs).
+    """
+    from scry.models import Anchor
+
+    fields = Anchor.model_fields
+    assert "is_test" in fields, "Anchor must have is_test field (SR5-6)"
+    assert fields["is_test"].default is False, "is_test must default to False"
+
+
+def test_sr5_6_extract_code_sets_is_test_for_test_filename(tmp_path: Path) -> None:
+    """SR5-6: anchors extracted from a ``.test.ts`` file all carry
+    ``is_test=True`` regardless of whether the symbol is a test
+    construct.
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "auth.test.ts"
+    test_file.write_text(
+        """
+function helper(): boolean { return true; }
+class TestUtil { static foo() { return 1; } }
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    assert anchors, "extractor should produce anchors for the test file"
+    assert all(a.is_test for a in anchors), (
+        f"All anchors from a *.test.ts file must have is_test=True; "
+        f"offenders: {[a.id for a in anchors if not a.is_test]}"
+    )
+
+
+def test_sr5_6_extract_code_clears_is_test_for_production_filename(tmp_path: Path) -> None:
+    """SR5-6: anchors extracted from a non-test file have
+    ``is_test=False``.
+    """
+    from scry.extract.code import extract_code_symbols
+
+    test_file = tmp_path / "auth.ts"
+    test_file.write_text("function login(): boolean { return true; }\n", encoding="utf-8")
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    assert anchors
+    assert not any(a.is_test for a in anchors), (
+        f"All anchors from a production .ts file must have is_test=False; "
+        f"offenders: {[a.id for a in anchors if a.is_test]}"
+    )
+
+
+def test_sr5_6_jest_describe_in_non_test_file_still_marked_test(tmp_path: Path) -> None:
+    """SR5-6: a Jest-style ``describe`` call in a production-named file
+    must STILL produce an anchor with ``is_test=True`` (the SR5-5
+    walker overrides — describes are inherently test constructs).
+    """
+    from scry.extract.code import extract_code_symbols
+
+    # File doesn't match the test heuristic (no .test., no _test).
+    test_file = tmp_path / "auth.ts"
+    test_file.write_text(
+        """
+function helper() { return 1; }
+describe('Auth flow', () => {
+  it('rejects expired tokens', () => {});
+});
+""".lstrip(),
+        encoding="utf-8",
+    )
+    anchors = extract_code_symbols(test_file, tmp_path, language="typescript")
+    describe_anchors = [a for a in anchors if "describe" in a.id]
+    assert describe_anchors, f"expected describe anchor; got {[a.id for a in anchors]}"
+    assert all(a.is_test for a in describe_anchors), (
+        f"describe/it anchors must always be is_test=True even in non-test files (SR5-6); "
+        f"offenders: {[a.id for a in describe_anchors if not a.is_test]}"
+    )
+    # The plain `helper` function should NOT be is_test (file doesn't match).
+    helper = next((a for a in anchors if "helper" in a.id and "describe" not in a.id), None)
+    assert helper is not None
+    assert helper.is_test is False, (
+        "Production-file non-test symbols must have is_test=False even when "
+        "the file ALSO contains test calls (SR5-6)"
+    )
+
+
+def test_sr5_6_db_round_trip_preserves_is_test(tmp_path: Path) -> None:
+    """SR5-6: an Anchor with ``is_test=True`` survives a write+read
+    round-trip through the DB.
+    """
+    from scry.models import Anchor, AnchorType, TransitiveHashStatus
+    from scry.store.db import ScryDB
+
+    (tmp_path / ".scry").mkdir()
+    db = ScryDB(tmp_path)
+    db.init_schema(embedding_dimensions=384)
+
+    anchor = Anchor(
+        id="test/foo.test.ts:helper",
+        type=AnchorType.CODE,
+        path="test/foo.test.ts",
+        symbol_name="helper",
+        content_text="function helper() {}",
+        content_hash="sha256:" + "a" * 64,
+        fingerprint_simhash=12345,
+        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+        is_test=True,
+    )
+    db.upsert_anchor(anchor)
+    db.close()
+
+    db2 = ScryDB(tmp_path)
+    loaded = db2.get_anchor(anchor.id)
+    assert loaded is not None
+    assert loaded.is_test is True, "is_test must round-trip through the DB (SR5-6)"
+    db2.close()
+
+
+def test_sr5_6_db_default_is_false_for_anchors_without_explicit_value(tmp_path: Path) -> None:
+    """SR5-6: anchors written without an explicit ``is_test`` default
+    to ``False`` after a round-trip (back-compat for pre-SR5-6 callers).
+    """
+    from scry.models import Anchor, AnchorType, TransitiveHashStatus
+    from scry.store.db import ScryDB
+
+    (tmp_path / ".scry").mkdir()
+    db = ScryDB(tmp_path)
+    db.init_schema(embedding_dimensions=384)
+
+    anchor = Anchor(
+        id="src/foo.py:bar",
+        type=AnchorType.CODE,
+        path="src/foo.py",
+        symbol_name="bar",
+        content_text="def bar(): pass",
+        content_hash="sha256:" + "b" * 64,
+        fingerprint_simhash=99,
+        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+    )
+    db.upsert_anchor(anchor)
+    db.close()
+
+    db2 = ScryDB(tmp_path)
+    loaded = db2.get_anchor(anchor.id)
+    assert loaded is not None
+    assert loaded.is_test is False
+    db2.close()
+
+
+def test_sr5_6_db_migration_backfills_test_paths(tmp_path: Path) -> None:
+    """SR5-6: when the migration runs over a pre-existing anchors
+    table, rows whose ``path`` matches the test heuristic are
+    backfilled to ``is_test=1`` so callers don't have to wait for a
+    full reindex.
+    """
+    import sqlite3
+
+    from scry.models import Anchor, AnchorType, TransitiveHashStatus
+    from scry.store.db import ScryDB
+
+    (tmp_path / ".scry").mkdir()
+    db = ScryDB(tmp_path)
+    db.init_schema(embedding_dimensions=384)
+
+    # Insert one anchor in tests/ and one elsewhere — both with default
+    # is_test=False at write time.
+    test_anchor = Anchor(
+        id="tests/test_x.py:foo",
+        type=AnchorType.CODE,
+        path="tests/test_x.py",
+        symbol_name="foo",
+        content_text="def foo(): pass",
+        content_hash="sha256:" + "1" * 64,
+        fingerprint_simhash=1,
+        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+    )
+    prod_anchor = Anchor(
+        id="src/auth.py:login",
+        type=AnchorType.CODE,
+        path="src/auth.py",
+        symbol_name="login",
+        content_text="def login(): pass",
+        content_hash="sha256:" + "2" * 64,
+        fingerprint_simhash=2,
+        transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+    )
+    db.upsert_anchor(test_anchor)
+    db.upsert_anchor(prod_anchor)
+
+    # Manually clear is_test to simulate a pre-SR5-6 row.
+    raw = sqlite3.connect(str(tmp_path / ".scry" / "vectors.db"))
+    raw.execute("UPDATE anchors SET is_test = 0")
+    raw.commit()
+    raw.close()
+    db.close()
+
+    # Re-open: init_schema runs the SR5-6 backfill.
+    db2 = ScryDB(tmp_path)
+    db2.init_schema(embedding_dimensions=384)
+    test_loaded = db2.get_anchor(test_anchor.id)
+    prod_loaded = db2.get_anchor(prod_anchor.id)
+    assert test_loaded is not None and prod_loaded is not None
+    assert test_loaded.is_test is True, (
+        "Migration must backfill is_test=True for tests/* paths (SR5-6)"
+    )
+    assert prod_loaded.is_test is False, (
+        "Migration must NOT backfill is_test for production paths (SR5-6)"
+    )
+    db2.close()
+
+
+def test_sr5_6_hybrid_search_exclude_tests_filters_before_top_k(tmp_path: Path) -> None:
+    """SR5-6: ``hybrid_search(exclude_tests=True)`` must filter test
+    anchors BEFORE the top_k truncation — otherwise a query whose top
+    hits are tests returns an empty result even though non-test hits
+    exist below the cutoff.
+    """
+    import inspect
+
+    from scry.retrieve import hybrid_search
+
+    sig = inspect.signature(hybrid_search)
+    assert "exclude_tests" in sig.parameters, (
+        "hybrid_search must accept exclude_tests kwarg (SR5-6)"
+    )
+    assert sig.parameters["exclude_tests"].default is False, (
+        "exclude_tests must default to False (back-compat)"
+    )
+    src = inspect.getsource(hybrid_search)
+    # The filter must operate on rowid_to_parent BEFORE the promote/RRF stage.
+    rrf_idx = src.find("Step 3:")
+    excl_idx = src.find("if exclude_tests:")
+    assert excl_idx != -1, "hybrid_search must contain the exclude_tests filter (SR5-6)"
+    if rrf_idx != -1:
+        assert excl_idx < rrf_idx, (
+            "exclude_tests filter must run BEFORE Step 3 (promote / RRF / top_k) "
+            "to avoid silently returning < top_k results (SR5-6)"
+        )
+
+
+def test_sr5_6_mcp_search_tool_exposes_exclude_tests_param() -> None:
+    """SR5-6: the MCP ``search`` tool surface must expose the
+    ``exclude_tests`` parameter and forward it via ``_dispatch``.
+    """
+    import inspect
+
+    from scry.mcp.server import MCPServer
+
+    src = inspect.getsource(MCPServer._register_tools)
+    assert "exclude_tests: bool" in src, (
+        "MCP search tool must accept exclude_tests parameter (SR5-6)"
+    )
+    assert '"exclude_tests": exclude_tests' in src, (
+        "MCP search tool must forward exclude_tests through _dispatch (SR5-6)"
+    )
+
+
+def test_sr5_6_backfill_is_case_sensitive(tmp_path: Path) -> None:
+    """SR5-6 (review-r6sr5-6): the migration backfill must be
+    case-sensitive — production-named paths like ``Latest.java`` /
+    ``Contest.java`` must NOT be flipped to ``is_test=True`` even
+    though they share the ``Test.java`` substring at end-of-file.
+    """
+    import sqlite3
+
+    from scry.models import Anchor, AnchorType, TransitiveHashStatus
+    from scry.store.db import ScryDB
+
+    (tmp_path / ".scry").mkdir()
+    db = ScryDB(tmp_path)
+    db.init_schema(embedding_dimensions=384)
+
+    # Three production-looking paths that the case-INSENSITIVE LIKE
+    # would have falsely matched: Latest.java, Contest.java, auth.TEST.ts.
+    fixtures = [
+        ("src/Latest.java:foo", "src/Latest.java"),
+        ("src/Contest.java:bar", "src/Contest.java"),
+        ("src/auth.TEST.ts:baz", "src/auth.TEST.ts"),
+    ]
+    for ix, (anchor_id, path) in enumerate(fixtures):
+        db.upsert_anchor(
+            Anchor(
+                id=anchor_id,
+                type=AnchorType.CODE,
+                path=path,
+                symbol_name=anchor_id.split(":")[-1],
+                content_text=f"// {ix}",
+                content_hash="sha256:" + str(ix) * 64,
+                fingerprint_simhash=ix,
+                transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+            )
+        )
+
+    # Force is_test=0 to simulate pre-SR5-6 state, then re-run the migration.
+    raw = sqlite3.connect(str(tmp_path / ".scry" / "vectors.db"))
+    raw.execute("UPDATE anchors SET is_test = 0")
+    raw.commit()
+    raw.close()
+    db.close()
+
+    db2 = ScryDB(tmp_path)
+    db2.init_schema(embedding_dimensions=384)
+    for anchor_id, _ in fixtures:
+        loaded = db2.get_anchor(anchor_id)
+        assert loaded is not None
+        assert loaded.is_test is False, (
+            f"Case-sensitive backfill must NOT mark {anchor_id} as is_test (SR5-6 review-r6sr5-6)"
+        )
+    db2.close()
+
+
+def test_sr5_6_backfill_skips_markdown_anchors(tmp_path: Path) -> None:
+    """SR5-6 (review-r6sr5-6): the migration backfill must NOT mark
+    SECTION (markdown) anchors as ``is_test=True`` even when their
+    path lives under ``tests/`` — markdown has no test/prod
+    distinction; only code anchors carry the flag.
+    """
+    import sqlite3
+
+    from scry.models import Anchor, AnchorType
+    from scry.store.db import ScryDB
+
+    (tmp_path / ".scry").mkdir()
+    db = ScryDB(tmp_path)
+    db.init_schema(embedding_dimensions=384)
+
+    md_anchor = Anchor(
+        id="tests/README.md:#intro",
+        type=AnchorType.SECTION,
+        path="tests/README.md",
+        heading_path=["intro"],
+        content_text="# Intro\n\nbody",
+        content_hash="sha256:" + "f" * 64,
+        fingerprint_simhash=42,
+    )
+    db.upsert_anchor(md_anchor)
+
+    raw = sqlite3.connect(str(tmp_path / ".scry" / "vectors.db"))
+    raw.execute("UPDATE anchors SET is_test = 0")
+    raw.commit()
+    raw.close()
+    db.close()
+
+    db2 = ScryDB(tmp_path)
+    db2.init_schema(embedding_dimensions=384)
+    loaded = db2.get_anchor(md_anchor.id)
+    assert loaded is not None
+    assert loaded.is_test is False, (
+        "Markdown SECTION anchors under tests/* must remain is_test=False (SR5-6)"
+    )
+    db2.close()

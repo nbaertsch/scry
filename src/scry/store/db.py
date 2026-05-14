@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS anchors (
     closure_hash          TEXT,
     def_line              INTEGER,
     def_char              INTEGER,
+    is_test               INTEGER NOT NULL DEFAULT 0,
     overview_embedding    BLOB,
     created_at            TEXT    NOT NULL,
     updated_at            TEXT    NOT NULL
@@ -310,6 +311,8 @@ class ScryDB:
         # ``NULL AS <col>`` instead of selecting a column that doesn't
         # exist (review-w6e HIGH fix).
         self._has_def_position_columns = self._detect_def_position_columns()
+        # SR5-6: same pattern for the is_test column.
+        self._has_is_test_column = self._detect_is_test_column()
 
     def _detect_def_position_columns(self) -> bool:
         """Return True if the ``anchors`` table already has ``def_line``/``def_char``.
@@ -325,24 +328,39 @@ class ScryDB:
         names = {row[1] for row in rows}
         return "def_line" in names and "def_char" in names
 
+    def _detect_is_test_column(self) -> bool:
+        """SR5-6: return True if the ``anchors`` table has ``is_test``."""
+        try:
+            rows = self._conn.execute("PRAGMA table_info(anchors)").fetchall()
+        except sqlite3.OperationalError:
+            return False
+        return "is_test" in {row[1] for row in rows}
+
     def _anchor_select_columns(self) -> str:
         """Return the comma-separated SELECT clause for the ``anchors`` table.
 
         When ``def_line`` / ``def_char`` are not present (read-only opens
         of pre-W6e databases), substitute ``NULL`` so ``_row_to_anchor``
         still receives 12 values and renders ``def_line=None``.
+
+        SR5-6: when ``is_test`` is missing on a read-only legacy DB,
+        substitute ``0 AS is_test`` so newer code can still assume the
+        column is present.
         """
+        is_test_col = "is_test" if self._has_is_test_column else "0 AS is_test"
         if self._has_def_position_columns:
             return (
                 "id, type, path, heading_path_json, symbol_name, "
                 "content_text, content_hash, fingerprint_simhash, "
-                "transitive_hash_status, closure_hash, def_line, def_char"
+                "transitive_hash_status, closure_hash, def_line, def_char, "
+                f"{is_test_col}"
             )
         return (
             "id, type, path, heading_path_json, symbol_name, "
             "content_text, content_hash, fingerprint_simhash, "
             "transitive_hash_status, closure_hash, "
-            "NULL AS def_line, NULL AS def_char"
+            "NULL AS def_line, NULL AS def_char, "
+            f"{is_test_col}"
         )
 
     # ------------------------------------------------------------------
@@ -408,9 +426,58 @@ class ScryDB:
                 self._conn.execute("ALTER TABLE anchors ADD COLUMN def_line INTEGER")
             with contextlib.suppress(sqlite3.OperationalError):
                 self._conn.execute("ALTER TABLE anchors ADD COLUMN def_char INTEGER")
+            # SR5-6 migration: add is_test column.  Idempotent.
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute(
+                    "ALTER TABLE anchors ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0"
+                )
+            # SR5-6 backfill (review-r6sr5-6 follow-up): tag pre-existing
+            # CODE rows whose path matches the test-file heuristic.
+            #
+            # Two bugs in the original LIKE-based version:
+            #  * SQLite ``LIKE`` is case-insensitive for ASCII, so
+            #    ``'%Test.java'`` would match ``Latest.java`` /
+            #    ``Contest.java`` / etc. — causing false positives the
+            #    Python ``is_test_path`` regex does NOT trigger.
+            #  * The unrestricted UPDATE would also flip markdown
+            #    SECTION / CODE_IN_DOC anchors under ``tests/`` to
+            #    ``is_test=True``, but the markdown extractor leaves
+            #    those False (markdown has no test/prod distinction).
+            #
+            # Fix: case-sensitive ``GLOB`` patterns (mirroring the
+            # regex), restricted to ``type = 'code'``.  Idempotent.
+            self._conn.execute(
+                """
+                UPDATE anchors SET is_test = 1
+                WHERE is_test = 0
+                  AND type = 'code'
+                  AND (
+                       path GLOB 'test_*.py'           OR path GLOB '*/test_*.py'
+                    OR path GLOB '*_test.py'           OR path GLOB '*/*_test.py'
+                    OR path GLOB '*_tests.py'          OR path GLOB '*/*_tests.py'
+                    OR path = 'conftest.py'            OR path GLOB '*/conftest.py'
+                    OR path GLOB 'tests/*'             OR path GLOB '*/tests/*'
+                    OR path GLOB 'test/*'              OR path GLOB '*/test/*'
+                    OR path GLOB '*.test.ts'           OR path GLOB '*.test.tsx'
+                    OR path GLOB '*.test.js'           OR path GLOB '*.test.jsx'
+                    OR path GLOB '*.test.mjs'          OR path GLOB '*.test.cjs'
+                    OR path GLOB '*.spec.ts'           OR path GLOB '*.spec.tsx'
+                    OR path GLOB '*.spec.js'           OR path GLOB '*.spec.jsx'
+                    OR path GLOB '*.spec.mjs'          OR path GLOB '*.spec.cjs'
+                    OR path GLOB '__tests__/*'         OR path GLOB '*/__tests__/*'
+                    OR path GLOB '*_test.go'           OR path GLOB '*/*_test.go'
+                    OR path GLOB '*_test.rs'           OR path GLOB '*/*_test.rs'
+                    OR path GLOB '*Test.java'          OR path GLOB '*/*Test.java'
+                    OR path GLOB '*Tests.java'         OR path GLOB '*/*Tests.java'
+                    OR path GLOB '*Test.kt'            OR path GLOB '*/*Test.kt'
+                    OR path GLOB '*Spec.kt'            OR path GLOB '*/*Spec.kt'
+                  )
+                """
+            )
             # Refresh the cached column-presence flag now that the migration
             # has (idempotently) run.
             self._has_def_position_columns = self._detect_def_position_columns()
+            self._has_is_test_column = self._detect_is_test_column()
 
             # Decide whether to create or recreate the vec virtual table.
             row = self._conn.execute(
@@ -1024,9 +1091,9 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
         INSERT INTO anchors
             (id, type, path, heading_path_json, symbol_name, content_text,
              content_hash, fingerprint_simhash, transitive_hash_status,
-             closure_hash, def_line, def_char, overview_embedding,
+             closure_hash, def_line, def_char, is_test, overview_embedding,
              created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             type                  = excluded.type,
             path                  = excluded.path,
@@ -1039,6 +1106,7 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             closure_hash          = excluded.closure_hash,
             def_line              = excluded.def_line,
             def_char              = excluded.def_char,
+            is_test               = excluded.is_test,
             overview_embedding    = CASE
                 WHEN content_hash != excluded.content_hash THEN NULL
                 ELSE overview_embedding
@@ -1060,6 +1128,7 @@ def _upsert_anchor_in_txn(conn: sqlite3.Connection, anchor: Anchor, now: str) ->
             anchor.closure_hash,
             anchor.def_line,
             anchor.def_char,
+            1 if anchor.is_test else 0,
             now,
             now,
         ),
@@ -1120,11 +1189,11 @@ def _replace_chunks_in_txn(
 
 
 def _row_to_anchor(row: Any) -> Anchor:
-    """Reconstruct an ``Anchor`` from a SELECT row (12 columns, no embedding).
+    """Reconstruct an ``Anchor`` from a SELECT row (13 columns, no embedding).
 
     Column order: id, type, path, heading_path_json, symbol_name,
     content_text, content_hash, fingerprint_simhash, transitive_hash_status,
-    closure_hash, def_line, def_char.
+    closure_hash, def_line, def_char, is_test.
 
     Args:
         row: A tuple (or sqlite3.Row) from an anchors SELECT query.
@@ -1145,6 +1214,7 @@ def _row_to_anchor(row: Any) -> Anchor:
         closure_hash,
         def_line,
         def_char,
+        is_test,
     ) = row
     heading_path: list[str] | None = (
         json.loads(heading_path_json) if heading_path_json is not None else None
@@ -1166,4 +1236,5 @@ def _row_to_anchor(row: Any) -> Anchor:
         closure_hash=closure_hash,
         def_line=int(def_line) if def_line is not None else None,
         def_char=int(def_char) if def_char is not None else None,
+        is_test=bool(is_test),
     )

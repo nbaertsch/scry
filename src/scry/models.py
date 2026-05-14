@@ -125,6 +125,16 @@ class Anchor(BaseModel):
     transitive_hash_status: TransitiveHashStatus | None = None
     """Set on CODE anchors only; omitted from JSON for SECTION/CODE_IN_DOC."""
 
+    is_test: bool = False
+    """SR5-6: True when the anchor lives in a test file (per filename
+    heuristic) OR is itself a test-framework construct (e.g. a Jest
+    ``describe`` / ``it`` anchor produced by the SR5-5 test-call
+    walker).  Always False for SECTION (markdown) anchors — there is
+    no test/prod distinction for documentation.  Callers that want to
+    suppress test results can pass ``exclude_tests=True`` to
+    :func:`~scry.retrieve.hybrid_search` or the MCP ``search`` tool.
+    """
+
     closure_hash: str | None = None
     """SHA-256 over transitive callee content hashes (CODE anchors only).
 

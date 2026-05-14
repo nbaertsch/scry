@@ -237,6 +237,7 @@ async def search(
     *,
     types: list[str] | None = None,
     top_k: int = 10,
+    exclude_tests: bool = False,
 ) -> list[dict[str, Any]]:
     """Hybrid BM25 + vector retrieval; returns ranked :class:`~scry.models.AnchorPacket` dicts.
 
@@ -302,6 +303,7 @@ async def search(
         config=ctx.config.retrieval,
         top_k=top_k,
         anchor_types=anchor_types,
+        exclude_tests=exclude_tests,
     )
 
     replay = _replay_active(ctx.overlay_mgr)

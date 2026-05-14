@@ -59,6 +59,7 @@ from scry.anchor_id import (
     fingerprint_simhash,
     slugify,
 )
+from scry.extract._test_detection import is_test_path
 from scry.models import Anchor, AnchorType, CodeAnchorsConfig, TransitiveHashStatus
 
 # Re-export the W1c canonicalizer under the historical name for callers that
@@ -1102,6 +1103,8 @@ def _make_anchor(
     raw_content: str,
     def_line: int = 0,
     def_char: int = 0,
+    *,
+    is_test: bool = False,
 ) -> Anchor:
     """Build an ``Anchor`` for a code symbol.
 
@@ -1155,6 +1158,7 @@ def _make_anchor(
         content_hash=chash,
         fingerprint_simhash=shash,
         transitive_hash_status=TransitiveHashStatus.LSP_UNAVAILABLE,
+        is_test=is_test,
         def_line=def_line,
         def_char=def_char,
     )
@@ -1328,9 +1332,27 @@ def extract_code_symbols(
         return []
 
     # Build Anchor objects.
+    # SR5-6: file-level test detection.  SR5-5 test-framework anchors
+    # always carry is_test=True regardless of filename (a ``describe``
+    # call is a test construct even if it lives outside the test
+    # filename heuristic — rare but real).  Detection key: a symbol
+    # path that contains "::" was emitted by the SR5-5 nested walker,
+    # OR the leaf segment matches a known test-fn prefix.
+    file_is_test = is_test_path(path_str)
     anchors: list[Anchor] = []
     for symbol_path, raw_content, def_line, def_char in records:
-        anchor = _make_anchor(path_str, symbol_path, raw_content, def_line, def_char)
+        is_sr5_5_anchor = "::" in symbol_path or any(
+            symbol_path.startswith(f"{fn}.") or symbol_path.startswith(f"{fn}:")
+            for fn in (*_TS_TEST_NAMED_FNS, *_TS_TEST_HOOK_FNS)
+        )
+        anchor = _make_anchor(
+            path_str,
+            symbol_path,
+            raw_content,
+            def_line,
+            def_char,
+            is_test=file_is_test or is_sr5_5_anchor,
+        )
         anchors.append(anchor)
 
     return anchors

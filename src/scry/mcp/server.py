@@ -274,15 +274,27 @@ class MCPServer:
             query: str,
             types: list[str] | None = None,
             top_k: int = 10,
+            exclude_tests: bool = False,
         ) -> list[dict[str, Any]]:
             """Hybrid BM25 + vector retrieval over the indexed repository.
 
             Returns ranked anchor packets.  Use ``types`` to restrict to
             ``["section"]``, ``["code"]``, or ``["code_in_doc"]``.
+            SR5-6: pass ``exclude_tests=True`` to suppress anchors from
+            test files (filename heuristic) AND test-framework anchors
+            (Jest-style ``describe`` / ``it`` / hooks).
             """
             return cast(
                 list[dict[str, Any]],
-                await self._dispatch("search", {"query": query, "types": types, "top_k": top_k}),
+                await self._dispatch(
+                    "search",
+                    {
+                        "query": query,
+                        "types": types,
+                        "top_k": top_k,
+                        "exclude_tests": exclude_tests,
+                    },
+                ),
             )
 
         @mcp.tool(annotations=_read)
