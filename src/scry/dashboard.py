@@ -114,6 +114,7 @@ def gather_dashboard_data(repo_root: Path) -> dict[str, Any]:
                 "heading_path": a.heading_path,
                 "symbol_name": a.symbol_name,
                 "is_test": a.is_test,
+                "language": _lang_from_path(a.path),
                 "content_preview": (
                     a.content_text[:300] + "…" if len(a.content_text) > 300 else a.content_text
                 ),
@@ -171,6 +172,26 @@ def _safe_branch(repo_root: Path) -> str | None:
         return GitContextProvider(repo_root).get().branch
     except Exception:
         return None
+
+
+_EXT_TO_LANGUAGE: dict[str, str] = {
+    ".py": "python", ".pyi": "python",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx",
+    ".go": "go",
+    ".rs": "rust",
+    ".zig": "zig",
+    ".md": "markdown", ".markdown": "markdown",
+    ".java": "java", ".kt": "kotlin",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp",
+    ".rb": "ruby", ".cs": "csharp", ".swift": "swift",
+}
+
+
+def _lang_from_path(path: str) -> str | None:
+    """Derive a language tag from a file path's extension."""
+    ext = Path(path).suffix.lower()
+    return _EXT_TO_LANGUAGE.get(ext)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -628,16 +649,22 @@ function renderOverview() {
   html += '</div>';
 
   // Legend
+  const usedLangs = new Set(DATA.anchors.filter(a => a.language).map(a => a.language));
   html += `<div class="legend">
-    <strong style="color:var(--fg)">Edge colors:</strong>
+    <strong style="color:var(--fg)">Edges:</strong>
     ${Object.entries(DRIFT_COLORS).map(([s,c]) =>
       `<span class="legend-item"><span class="legend-swatch" style="background:${c}"></span>${s}</span>`
     ).join('')}
   </div>
   <div class="legend">
-    <strong style="color:var(--fg)">Node colors:</strong>
+    <strong style="color:var(--fg)">Nodes:</strong>
     ${Object.entries(TYPE_COLORS).map(([t,c]) =>
       `<span class="legend-item"><span class="legend-swatch" style="background:${c};height:8px;width:8px;border-radius:50%"></span>${t}</span>`
+    ).join('')}
+    &nbsp;·&nbsp;
+    <strong style="color:var(--fg)">Language badges:</strong>
+    ${[...usedLangs].sort().map(l =>
+      `<span class="legend-item"><span class="legend-swatch" style="background:${LANG_COLORS[l]||'#8b949e'};height:6px;width:6px;border-radius:50%"></span>${l}</span>`
     ).join('')}
   </div>`;
 
@@ -650,13 +677,20 @@ function renderOverview() {
 }
 
 // ── Force-directed graph ──
+const LANG_COLORS = {
+  'python':'#3572A5','typescript':'#3178c6','javascript':'#f1e05a','tsx':'#3178c6',
+  'jsx':'#f1e05a','go':'#00ADD8','rust':'#dea584','zig':'#f7a41d',
+  'markdown':'#083fa1','java':'#b07219','kotlin':'#A97BFF','c':'#555555',
+  'cpp':'#f34b7d','ruby':'#701516','csharp':'#178600','swift':'#F05138',
+};
+
 function renderGraph() {
   const container = document.getElementById('graph-container');
   const width = container.clientWidth || 900;
-  const height = Math.max(500, Math.min(700, DATA.evaluations.length * 15));
+  const height = 600;
   container.style.height = height + 'px';
 
-  // Only show anchors that have links (otherwise the graph is unreadable for large repos)
+  // Only show anchors that have links
   const linkedIds = new Set();
   DATA.evaluations.forEach(ev => { linkedIds.add(ev.from_id); linkedIds.add(ev.to_id); });
 
@@ -664,6 +698,7 @@ function renderGraph() {
     .filter(a => linkedIds.has(a.id))
     .map(a => ({
       id: a.id, type: a.type, path: a.path, symbol_name: a.symbol_name,
+      language: a.language,
       label: a.symbol_name || a.id.split('::').pop() || a.id
     }));
   const nodeSet = new Set(nodes.map(n => n.id));
@@ -680,7 +715,6 @@ function renderGraph() {
     return;
   }
 
-  // Guard against extremely large graphs that would freeze the browser.
   const MAX_GRAPH_NODES = 300;
   if (nodes.length > MAX_GRAPH_NODES) {
     container.innerHTML = `<div style="padding:40px;text-align:center;color:var(--fg2)">
@@ -694,89 +728,110 @@ function renderGraph() {
     .attr('width', width).attr('height', height)
     .attr('viewBox', [0, 0, width, height]);
 
-  // Zoom
   const g = svg.append('g');
-  svg.call(d3.zoom().scaleExtent([0.1, 5]).on('zoom', e => g.attr('transform', e.transform)));
+  svg.call(d3.zoom().scaleExtent([0.1, 8]).on('zoom', e => g.attr('transform', e.transform)));
 
-  // Arrow marker
+  // Arrow markers
   svg.append('defs').selectAll('marker')
     .data(Object.keys(DRIFT_COLORS)).enter().append('marker')
     .attr('id', d => 'arrow-' + d).attr('viewBox', '0 -5 10 10')
-    .attr('refX', 20).attr('refY', 0).attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('refX', 18).attr('refY', 0).attr('markerWidth', 5).attr('markerHeight', 5)
     .attr('orient', 'auto')
-    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', d => DRIFT_COLORS[d]);
+    .append('path').attr('d', 'M0,-4L8,0L0,4').attr('fill', d => DRIFT_COLORS[d]);
 
   // ── Physics controls ──
-  const defaults = { charge: -120, linkDist: 100, linkStrength: 0.4, collide: 15, centerStrength: 0.05, alpha: 0.3 };
+  const cx = width / 2, cy = height / 2;
+  const defaults = {
+    charge: -40, linkDist: 50, linkStrength: 0.7, collide: 12,
+    gravity: 0.15, alpha: 0.5
+  };
   const P = { ...defaults };
   const ctrlBox = document.getElementById('graph-controls');
   ctrlBox.innerHTML = `<div class="physics-controls">
-    <div class="ctrl"><label>Repulsion</label><input type="range" id="p-charge" min="-500" max="0" step="10" value="${P.charge}"><span class="val" id="v-charge">${P.charge}</span></div>
-    <div class="ctrl"><label>Link dist</label><input type="range" id="p-linkDist" min="20" max="300" step="5" value="${P.linkDist}"><span class="val" id="v-linkDist">${P.linkDist}</span></div>
+    <div class="ctrl"><label>Repulsion</label><input type="range" id="p-charge" min="-300" max="0" step="5" value="${P.charge}"><span class="val" id="v-charge">${P.charge}</span></div>
+    <div class="ctrl"><label>Link dist</label><input type="range" id="p-linkDist" min="10" max="200" step="5" value="${P.linkDist}"><span class="val" id="v-linkDist">${P.linkDist}</span></div>
     <div class="ctrl"><label>Link pull</label><input type="range" id="p-linkStr" min="0" max="1" step="0.05" value="${P.linkStrength}"><span class="val" id="v-linkStr">${P.linkStrength}</span></div>
-    <div class="ctrl"><label>Collision</label><input type="range" id="p-collide" min="0" max="60" step="2" value="${P.collide}"><span class="val" id="v-collide">${P.collide}</span></div>
-    <div class="ctrl"><label>Centering</label><input type="range" id="p-center" min="0" max="1" step="0.05" value="${P.centerStrength}"><span class="val" id="v-center">${P.centerStrength}</span></div>
+    <div class="ctrl"><label>Collision</label><input type="range" id="p-collide" min="0" max="40" step="1" value="${P.collide}"><span class="val" id="v-collide">${P.collide}</span></div>
+    <div class="ctrl"><label>Gravity</label><input type="range" id="p-gravity" min="0" max="1" step="0.01" value="${P.gravity}"><span class="val" id="v-gravity">${P.gravity}</span></div>
     <div class="ctrl"><label>Reheat</label><input type="range" id="p-alpha" min="0.05" max="1" step="0.05" value="${P.alpha}"><span class="val" id="v-alpha">${P.alpha}</span></div>
     <button style="padding:4px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);cursor:pointer;font-size:12px" id="p-reset">Reset</button>
   </div>`;
 
+  // Gravity: forceX + forceY pull all nodes toward center
   const sim = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(links).id(d => d.id).distance(P.linkDist).strength(P.linkStrength))
     .force('charge', d3.forceManyBody().strength(P.charge))
-    .force('center', d3.forceCenter(width/2, height/2).strength(P.centerStrength))
-    .force('collide', d3.forceCollide(P.collide));
+    .force('x', d3.forceX(cx).strength(P.gravity))
+    .force('y', d3.forceY(cy).strength(P.gravity))
+    .force('collide', d3.forceCollide(P.collide))
+    .alphaDecay(0.02)
+    .velocityDecay(0.4);
 
   function reheat() { sim.alpha(P.alpha).restart(); }
 
-  function bindSlider(sliderId, valId, fn) {
-    const slider = document.getElementById(sliderId);
-    const valEl = document.getElementById(valId);
-    slider.addEventListener('input', () => {
-      const v = parseFloat(slider.value);
-      valEl.textContent = v;
-      fn(v);
-      reheat();
-    });
+  function bindSlider(sid, vid, fn) {
+    const s = document.getElementById(sid), v = document.getElementById(vid);
+    s.addEventListener('input', () => { const n = parseFloat(s.value); v.textContent = n; fn(n); reheat(); });
   }
   bindSlider('p-charge', 'v-charge', v => { P.charge = v; sim.force('charge').strength(v); });
   bindSlider('p-linkDist', 'v-linkDist', v => { P.linkDist = v; sim.force('link').distance(v); });
   bindSlider('p-linkStr', 'v-linkStr', v => { P.linkStrength = v; sim.force('link').strength(v); });
   bindSlider('p-collide', 'v-collide', v => { P.collide = v; sim.force('collide').radius(v); });
-  bindSlider('p-center', 'v-center', v => { P.centerStrength = v; sim.force('center').strength(v); });
+  bindSlider('p-gravity', 'v-gravity', v => { P.gravity = v; sim.force('x').strength(v); sim.force('y').strength(v); });
   bindSlider('p-alpha', 'v-alpha', v => { P.alpha = v; });
   document.getElementById('p-reset').addEventListener('click', () => {
     Object.assign(P, defaults);
     sim.force('charge').strength(P.charge);
     sim.force('link').distance(P.linkDist).strength(P.linkStrength);
     sim.force('collide').radius(P.collide);
-    sim.force('center').strength(P.centerStrength);
-    document.getElementById('p-charge').value = P.charge; document.getElementById('v-charge').textContent = P.charge;
-    document.getElementById('p-linkDist').value = P.linkDist; document.getElementById('v-linkDist').textContent = P.linkDist;
-    document.getElementById('p-linkStr').value = P.linkStrength; document.getElementById('v-linkStr').textContent = P.linkStrength;
-    document.getElementById('p-collide').value = P.collide; document.getElementById('v-collide').textContent = P.collide;
-    document.getElementById('p-center').value = P.centerStrength; document.getElementById('v-center').textContent = P.centerStrength;
-    document.getElementById('p-alpha').value = P.alpha; document.getElementById('v-alpha').textContent = P.alpha;
+    sim.force('x').strength(P.gravity); sim.force('y').strength(P.gravity);
+    ['charge','linkDist','linkStr','collide','gravity','alpha'].forEach((k,i) => {
+      const keys = ['charge','linkDist','linkStrength','collide','gravity','alpha'];
+      document.getElementById('p-' + k).value = P[keys[i]];
+      document.getElementById('v-' + k).textContent = P[keys[i]];
+    });
     reheat();
   });
 
-  const link = g.append('g').selectAll('line').data(links).enter().append('line')
+  // ── Edges ──
+  const linkEl = g.append('g').selectAll('line').data(links).enter().append('line')
     .attr('stroke', d => DRIFT_COLORS[d.drift_status] || '#484f58')
-    .attr('stroke-width', 2).attr('stroke-opacity', 0.7)
+    .attr('stroke-width', 1.5).attr('stroke-opacity', 0.6)
     .attr('marker-end', d => `url(#arrow-${d.drift_status})`);
 
-  const node = g.append('g').selectAll('circle').data(nodes).enter().append('circle')
-    .attr('r', d => d.type === 'section' ? 8 : 6)
-    .attr('fill', d => TYPE_COLORS[d.type] || '#8b949e')
-    .attr('stroke', d => anchorDrift[d.id] ? DRIFT_COLORS[anchorDrift[d.id]] : '#30363d')
-    .attr('stroke-width', 2)
+  // ── Node groups (circle + language badge + label) ──
+  const nodeG = g.append('g').selectAll('g').data(nodes).enter().append('g')
     .style('cursor', 'pointer')
     .call(d3.drag().on('start', dragStart).on('drag', dragging).on('end', dragEnd));
 
+  // Main circle
+  nodeG.append('circle')
+    .attr('r', d => d.type === 'section' ? 7 : 5)
+    .attr('fill', d => TYPE_COLORS[d.type] || '#8b949e')
+    .attr('stroke', d => anchorDrift[d.id] ? DRIFT_COLORS[anchorDrift[d.id]] : '#30363d')
+    .attr('stroke-width', 1.5);
+
+  // Language badge (small colored dot below-right)
+  nodeG.filter(d => d.language && LANG_COLORS[d.language])
+    .append('circle')
+    .attr('r', 3).attr('cx', 6).attr('cy', 6)
+    .attr('fill', d => LANG_COLORS[d.language])
+    .attr('stroke', 'var(--bg)').attr('stroke-width', 0.5);
+
+  // Labels — always shown, truncated
+  nodeG.append('text')
+    .text(d => { const l = d.label; return l.length > 20 ? l.slice(0,17) + '…' : l; })
+    .attr('font-size', 8).attr('fill', '#8b949e')
+    .attr('dx', 10).attr('dy', 3)
+    .style('pointer-events', 'none');
+
+  // Tooltip
   const tooltip = document.getElementById('tooltip');
-  node.on('mouseover', (e, d) => {
+  nodeG.on('mouseover', (e, d) => {
     tooltip.style.display = 'block';
+    const lang = d.language ? `<span style="color:${LANG_COLORS[d.language] || 'var(--fg2)'}">${esc(d.language)}</span> · ` : '';
     tooltip.innerHTML = `<strong>${esc(d.label)}</strong><br>
-      <span style="color:${TYPE_COLORS[d.type]}">${esc(d.type)}</span> · ${esc(d.path)}
+      ${lang}<span style="color:${TYPE_COLORS[d.type]}">${esc(d.type)}</span> · ${esc(d.path)}
       ${anchorDrift[d.id] ? `<br>drift: <span style="color:${DRIFT_COLORS[anchorDrift[d.id]]}">${anchorDrift[d.id]}</span>` : ''}`;
   }).on('mousemove', e => {
     tooltip.style.left = (e.pageX + 12) + 'px';
@@ -784,21 +839,26 @@ function renderGraph() {
   }).on('mouseout', () => { tooltip.style.display = 'none'; })
     .on('click', (e, d) => showDetail(d.id));
 
-  // Labels for small graphs
-  if (nodes.length <= 60) {
-    g.append('g').selectAll('text').data(nodes).enter().append('text')
-      .text(d => d.label.length > 25 ? d.label.slice(0,22) + '…' : d.label)
-      .attr('font-size', 9).attr('fill', '#8b949e')
-      .attr('dx', 12).attr('dy', 4);
-  }
-
+  // Tick
   sim.on('tick', () => {
-    link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-    node.attr('cx', d => d.x).attr('cy', d => d.y);
-    if (nodes.length <= 60) {
-      g.selectAll('text').attr('x', d => d.x).attr('y', d => d.y);
-    }
+    linkEl.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+           .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    nodeG.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  // Auto-fit after simulation settles
+  sim.on('end', () => {
+    const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
+    const pad = 40;
+    const x0 = Math.min(...xs) - pad, y0 = Math.min(...ys) - pad;
+    const x1 = Math.max(...xs) + pad + 80, y1 = Math.max(...ys) + pad;
+    const bw = x1 - x0, bh = y1 - y0;
+    const scale = Math.min(width / bw, height / bh, 2);
+    const tx = (width - bw * scale) / 2 - x0 * scale;
+    const ty = (height - bh * scale) / 2 - y0 * scale;
+    svg.transition().duration(750).call(
+      d3.zoom().transform, d3.zoomIdentity.translate(tx, ty).scale(scale)
+    );
   });
 
   function dragStart(e, d) { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }
