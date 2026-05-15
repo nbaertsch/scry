@@ -3357,26 +3357,44 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
 
             signal.signal(signal.SIGINT, _win_sigint_handler)
 
-            # Parent-process watchdog: when Copilot kills the scry.exe
-            # wrapper, the Python child process becomes orphaned (its
-            # parent PID dies but the child keeps running, holding the
-            # leader lock and DB write lock forever).  This daemon
-            # thread polls the parent PID every 2s and force-exits
-            # when it disappears.
-            _parent_pid = os.getppid()
-
-            def _parent_watchdog() -> None:
+            # Stdin-EOF watchdog: when Copilot kills the session, the
+            # stdin pipe handle becomes invalid.  FastMCP's anyio stdio
+            # transport may not detect EOF promptly on Windows (known
+            # limitation UT4-3), leaving the process orphaned with the
+            # leader lock held.  This daemon thread periodically probes
+            # the stdin handle via PeekNamedPipe — when the pipe is
+            # broken, we clean up and exit.  Only activates when stdin
+            # is a pipe (MCP mode), not when it's a console (terminal).
+            def _stdin_watchdog() -> None:
+                import msvcrt
                 import time
+
+                try:
+                    stdin_handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+                except Exception:
+                    return
+
+                # Verify stdin is a pipe (not a console) before polling.
+                # GetFileType returns 3 for pipes, 2 for console.
+                try:
+                    import win32file  # type: ignore[import-untyped]
+
+                    if win32file.GetFileType(stdin_handle) != win32file.FILE_TYPE_PIPE:
+                        return  # console stdin — no watchdog needed
+                except Exception:
+                    return
+
+                import win32pipe  # type: ignore[import-untyped]
 
                 while True:
                     time.sleep(2)
                     try:
-                        os.kill(_parent_pid, 0)
-                    except OSError:
+                        win32pipe.PeekNamedPipe(stdin_handle, 0)
+                    except Exception:
                         _sync_cleanup()
-                        os._exit(1)
+                        os._exit(0)
 
-            _wd = threading.Thread(target=_parent_watchdog, daemon=True, name="scry-parent-wd")
+            _wd = threading.Thread(target=_stdin_watchdog, daemon=True, name="scry-stdin-wd")
             _wd.start()
 
         if daemon:
