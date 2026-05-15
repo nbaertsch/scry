@@ -395,6 +395,19 @@ tbody tr:hover { background: var(--bg2); }
           font-size: 12px; color: var(--fg2); }
 .legend-item { display: flex; align-items: center; gap: 4px; }
 .legend-swatch { width: 12px; height: 3px; border-radius: 2px; }
+
+/* Graph physics controls */
+.physics-controls { display: flex; flex-wrap: wrap; gap: 16px; padding: 12px 16px;
+                    background: var(--bg); border: 1px solid var(--border);
+                    border-radius: var(--radius); margin-bottom: 12px;
+                    align-items: center; }
+.physics-controls .ctrl { display: flex; align-items: center; gap: 6px; font-size: 12px;
+                          color: var(--fg2); min-width: 0; }
+.physics-controls .ctrl label { white-space: nowrap; min-width: 70px; }
+.physics-controls .ctrl input[type=range] { width: 100px; accent-color: var(--accent);
+                                            cursor: pointer; }
+.physics-controls .ctrl .val { font-variant-numeric: tabular-nums; min-width: 36px;
+                               text-align: right; color: var(--fg); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -593,6 +606,7 @@ function renderOverview() {
   </div>`;
 
   // Graph container
+  html += '<div id="graph-controls"></div>';
   html += '<div id="graph-container"></div>';
   panel.innerHTML = html;
 
@@ -656,11 +670,58 @@ function renderGraph() {
     .attr('orient', 'auto')
     .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', d => DRIFT_COLORS[d]);
 
+  // ── Physics controls ──
+  const defaults = { charge: -120, linkDist: 100, linkStrength: 0.4, collide: 15, centerStrength: 0.05, alpha: 0.3 };
+  const P = { ...defaults };
+  const ctrlBox = document.getElementById('graph-controls');
+  ctrlBox.innerHTML = `<div class="physics-controls">
+    <div class="ctrl"><label>Repulsion</label><input type="range" id="p-charge" min="-500" max="0" step="10" value="${P.charge}"><span class="val" id="v-charge">${P.charge}</span></div>
+    <div class="ctrl"><label>Link dist</label><input type="range" id="p-linkDist" min="20" max="300" step="5" value="${P.linkDist}"><span class="val" id="v-linkDist">${P.linkDist}</span></div>
+    <div class="ctrl"><label>Link pull</label><input type="range" id="p-linkStr" min="0" max="1" step="0.05" value="${P.linkStrength}"><span class="val" id="v-linkStr">${P.linkStrength}</span></div>
+    <div class="ctrl"><label>Collision</label><input type="range" id="p-collide" min="0" max="60" step="2" value="${P.collide}"><span class="val" id="v-collide">${P.collide}</span></div>
+    <div class="ctrl"><label>Centering</label><input type="range" id="p-center" min="0" max="1" step="0.05" value="${P.centerStrength}"><span class="val" id="v-center">${P.centerStrength}</span></div>
+    <div class="ctrl"><label>Reheat</label><input type="range" id="p-alpha" min="0.05" max="1" step="0.05" value="${P.alpha}"><span class="val" id="v-alpha">${P.alpha}</span></div>
+    <button style="padding:4px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);cursor:pointer;font-size:12px" id="p-reset">Reset</button>
+  </div>`;
+
   const sim = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(80))
-    .force('charge', d3.forceManyBody().strength(-200))
-    .force('center', d3.forceCenter(width/2, height/2))
-    .force('collide', d3.forceCollide(20));
+    .force('link', d3.forceLink(links).id(d => d.id).distance(P.linkDist).strength(P.linkStrength))
+    .force('charge', d3.forceManyBody().strength(P.charge))
+    .force('center', d3.forceCenter(width/2, height/2).strength(P.centerStrength))
+    .force('collide', d3.forceCollide(P.collide));
+
+  function reheat() { sim.alpha(P.alpha).restart(); }
+
+  function bindSlider(sliderId, valId, fn) {
+    const slider = document.getElementById(sliderId);
+    const valEl = document.getElementById(valId);
+    slider.addEventListener('input', () => {
+      const v = parseFloat(slider.value);
+      valEl.textContent = v;
+      fn(v);
+      reheat();
+    });
+  }
+  bindSlider('p-charge', 'v-charge', v => { P.charge = v; sim.force('charge').strength(v); });
+  bindSlider('p-linkDist', 'v-linkDist', v => { P.linkDist = v; sim.force('link').distance(v); });
+  bindSlider('p-linkStr', 'v-linkStr', v => { P.linkStrength = v; sim.force('link').strength(v); });
+  bindSlider('p-collide', 'v-collide', v => { P.collide = v; sim.force('collide').radius(v); });
+  bindSlider('p-center', 'v-center', v => { P.centerStrength = v; sim.force('center').strength(v); });
+  bindSlider('p-alpha', 'v-alpha', v => { P.alpha = v; });
+  document.getElementById('p-reset').addEventListener('click', () => {
+    Object.assign(P, defaults);
+    sim.force('charge').strength(P.charge);
+    sim.force('link').distance(P.linkDist).strength(P.linkStrength);
+    sim.force('collide').radius(P.collide);
+    sim.force('center').strength(P.centerStrength);
+    document.getElementById('p-charge').value = P.charge; document.getElementById('v-charge').textContent = P.charge;
+    document.getElementById('p-linkDist').value = P.linkDist; document.getElementById('v-linkDist').textContent = P.linkDist;
+    document.getElementById('p-linkStr').value = P.linkStrength; document.getElementById('v-linkStr').textContent = P.linkStrength;
+    document.getElementById('p-collide').value = P.collide; document.getElementById('v-collide').textContent = P.collide;
+    document.getElementById('p-center').value = P.centerStrength; document.getElementById('v-center').textContent = P.centerStrength;
+    document.getElementById('p-alpha').value = P.alpha; document.getElementById('v-alpha').textContent = P.alpha;
+    reheat();
+  });
 
   const link = g.append('g').selectAll('line').data(links).enter().append('line')
     .attr('stroke', d => DRIFT_COLORS[d.drift_status] || '#484f58')
