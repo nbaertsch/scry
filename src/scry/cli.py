@@ -128,6 +128,10 @@ _DETECT_SKIP_DIRS: set[str] = {
     "tmp",
     ".tmp",
     "vendor",
+    # Zig build/cache directories.
+    ".zig-cache",
+    "zig-cache",
+    "zig-out",
 }
 
 
@@ -210,6 +214,10 @@ exclude:
   - .ruff_cache/**
   - .venv/**
   - venv/**
+  # Zig build/cache directories.
+  - .zig-cache/**
+  - zig-cache/**
+  - zig-out/**
   # UT5-3: exclude common diagnostic / scratch script names so a quick
   # debug.py or scratch.py at the repo root doesn't pollute the index.
   # Remove these globs if your project intentionally tracks files with
@@ -479,6 +487,55 @@ def _detect_doc_translation_excludes(repo: Path) -> list[str]:
     return [f"docs/{d.name}/**" for d in sorted(lang_dirs) if d.name.lower() != "en"]
 
 
+# Signature files that indicate a directory is a vendored toolchain/SDK
+# and should be excluded from indexing.  Each entry maps a filename to a
+# human-readable label used in the ``scry init`` hint.
+_VENDORED_TOOLCHAIN_MARKERS: dict[str, str] = {
+    "zig.exe": "Zig toolchain",
+    "zig": "Zig toolchain",
+    "rustc.exe": "Rust toolchain",
+    "rustc": "Rust toolchain",
+    "go.exe": "Go toolchain",
+    "go": "Go toolchain",
+    "node.exe": "Node.js runtime",
+    "node": "Node.js runtime",
+    "python.exe": "Python runtime",
+    "python3": "Python runtime",
+    "javac": "Java SDK",
+    "javac.exe": "Java SDK",
+}
+
+
+def _detect_vendored_toolchain_excludes(repo: Path) -> list[tuple[str, str]]:
+    """Detect directories containing vendored toolchain binaries.
+
+    Scans top-level and second-level directories for known toolchain
+    marker files (e.g. ``zig.exe``, ``rustc``, ``go``) and returns
+    ``(glob, label)`` pairs for each match.  Only checks directories
+    that are NOT already in ``_DETECT_SKIP_DIRS``.
+
+    Returns:
+        List of ``("dirname/**", "Zig toolchain")`` tuples.
+    """
+    results: list[tuple[str, str]] = []
+    try:
+        for entry in sorted(repo.iterdir()):
+            if not entry.is_dir() or entry.name in _DETECT_SKIP_DIRS or entry.name.startswith(".git"):
+                continue
+            # Check the directory itself and one level down.
+            for candidate in [entry] + [
+                sub for sub in entry.iterdir() if sub.is_dir()
+            ] if entry.is_dir() else []:
+                for marker, label in _VENDORED_TOOLCHAIN_MARKERS.items():
+                    if (candidate / marker).is_file():
+                        rel = candidate.relative_to(repo).as_posix()
+                        results.append((f"{rel}/**", label))
+                        break  # one match per directory is enough
+    except OSError:
+        pass
+    return results
+
+
 # ─── Root group ───────────────────────────────────────────────────────────────
 
 
@@ -594,6 +651,32 @@ def init(ctx: click.Context, force: bool, register_global: bool, max_files: int)
                 )
                 for excl in trans_excludes:
                     click.echo(f"    - {excl}", err=True)
+            # Detect vendored toolchain directories (e.g. .tooling/zig-*/,
+            # embedded Go/Rust/Node SDKs) that would pollute the index
+            # with thousands of stdlib anchors.
+            toolchain_excludes = _detect_vendored_toolchain_excludes(repo)
+            if toolchain_excludes:
+                click.echo(
+                    f"  hint: detected {len(toolchain_excludes)} vendored "
+                    f"toolchain director{'ies' if len(toolchain_excludes) != 1 else 'y'}. "
+                    f"Add these to the exclude list in .scry/config.yaml:",
+                    err=True,
+                )
+                for excl, label in toolchain_excludes:
+                    click.echo(f"    - {excl}  # {label}", err=True)
+        # Always check for vendored toolchains, even when file count is OK —
+        # a vendored Zig/Go/Rust SDK produces thousands of stdlib anchors
+        # that dilute search results regardless of total file count.
+        else:
+            toolchain_excludes = _detect_vendored_toolchain_excludes(repo)
+            if toolchain_excludes:
+                click.echo(
+                    f"hint: detected vendored toolchain(s) that will be indexed. "
+                    f"Consider adding these excludes to .scry/config.yaml:",
+                    err=True,
+                )
+                for excl, label in toolchain_excludes:
+                    click.echo(f"  - {excl}  # {label}", err=True)
     except (ConfigError, OSError):
         pass  # non-fatal; don't block init on a walk failure
 
