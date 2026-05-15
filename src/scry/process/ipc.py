@@ -1637,6 +1637,26 @@ class IPCClient:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    async def health_check(self, timeout_seconds: float = 2.0) -> bool:
+        """Verify the leader endpoint is reachable and responding.
+
+        Sends a lightweight ``status`` call with a short timeout.
+        Returns ``True`` if the leader responds, ``False`` on any
+        connection or timeout error.  Used during follower startup to
+        detect stale leader metadata (dead process, zombie wrapper)
+        before committing to IPC forwarding.
+        """
+        try:
+            await asyncio.wait_for(
+                self.call("status", {}, timeout_seconds=timeout_seconds),
+                timeout=timeout_seconds,
+            )
+            return True
+        except Exception:
+            # Connection refused, timeout, protocol error — leader is unreachable.
+            await self.close()
+            return False
+
 
 # ─── Public re-exports ────────────────────────────────────────────────
 

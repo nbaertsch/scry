@@ -909,14 +909,28 @@ class MCPServer:
             # Step 4a: Read leader metadata.
             leader_metadata = read_leader_metadata_if_present(self._repo_root)
 
-            # Step 4b: Connect IPC client.
+            # Step 4b: Connect IPC client and health-check the leader.
+            # On Windows, zombie scry.exe wrapper processes can hold the
+            # byte-range lock while the actual Python backend is dead,
+            # leaving stale metadata pointing to a defunct named pipe.
+            # A quick health-check prevents the follower from silently
+            # forwarding tool calls to a dead endpoint (which would
+            # timeout after ~5s per call).
             ipc_client: IPCClient | None = None
             if leader_metadata is not None and leader_metadata.endpoint_uri is not None:
                 try:
                     spec: EndpointSpec = parse_endpoint_uri(
                         leader_metadata.endpoint_uri, self._repo_root
                     )
-                    ipc_client = IPCClient(spec, config=cfg.ipc)
+                    candidate = IPCClient(spec, config=cfg.ipc)
+                    if await candidate.health_check(timeout_seconds=2.0):
+                        ipc_client = candidate
+                    else:
+                        logger.warning(
+                            "scry: leader IPC endpoint unreachable (PID %s may be dead); "
+                            "proceeding as degraded follower — write tools unavailable",
+                            leader_metadata.pid,
+                        )
                 except (ValueError, NotImplementedError) as exc:
                     logger.warning("scry: follower cannot connect to leader IPC: %s", exc)
 
