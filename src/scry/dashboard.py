@@ -28,7 +28,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import socket
 import threading
 from functools import partial
 from http import HTTPStatus
@@ -221,18 +220,40 @@ class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
-    """Serves the SPA and ``/api/data`` JSON endpoint.
+    """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades.
 
-    WebSocket is handled on a separate port by ``_ws_server_loop``.
+    WebSocket connections are handled inline: after the 101 handshake,
+    the handler blocks in a read loop until the client disconnects.
+    ``handle()`` is overridden to skip the ``finish()`` cleanup when
+    the connection has been upgraded — ``BaseHTTPRequestHandler``
+    normally closes ``rfile``/``wfile`` (and the underlying socket)
+    after ``handle()`` returns, which kills the WS connection.
     """
 
     protocol_version = "HTTP/1.1"
 
     repo_root: Path
-    ws_port: int  # set by make_handler — the WS port for the frontend to connect to
+    _ws_upgraded: bool = False  # set True when connection upgrades to WS
+
+    def handle(self) -> None:
+        """Override to skip finish() socket teardown for WS connections."""
+        self._ws_upgraded = False
+        try:
+            super().handle()
+        finally:
+            # If WS, the socket is already managed by our read loop
+            # and was closed there. Prevent finish() from double-closing.
+            if self._ws_upgraded:
+                # Neuter rfile/wfile so finish() doesn't close the socket
+                import io
+
+                self.rfile = io.BytesIO()
+                self.wfile = io.BytesIO()
 
     def do_GET(self) -> None:  # noqa: N802
-        logger.debug("HTTP request: %s", self.path)
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_ws_upgrade()
+            return
         if self.path == "/api/data":
             self._serve_api()
         elif self.path in ("/", "/index.html"):
@@ -268,6 +289,73 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_ws_upgrade(self) -> None:
+        """WebSocket handshake + read loop (blocks until client disconnects)."""
+        import base64
+        import hashlib as _hl
+        import struct
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(
+            _hl.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
+        ).decode()
+
+        # Send 101 directly on the raw socket to avoid any handler buffering.
+        sock = self.request
+        resp = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        sock.sendall(resp.encode())
+        self._ws_upgraded = True
+        self.close_connection = True
+
+        # Detach rfile/wfile from the socket BEFORE entering the WS
+        # read loop. The BufferedReader (rfile) may interfere with
+        # raw socket reads if it holds the file descriptor.
+        import io
+        self.rfile = io.BytesIO()
+        self.wfile = io.BytesIO()
+
+        with _ws_lock:
+            _ws_clients.append(sock)
+        try:
+            while True:
+                h = _recv_exact(sock, 2)
+                if h is None:
+                    break
+                opcode = h[0] & 0x0F
+                if opcode == 0x8:
+                    break
+                length = h[1] & 0x7F
+                if length == 126:
+                    raw = _recv_exact(sock, 2)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">H", raw)[0]
+                elif length == 127:
+                    raw = _recv_exact(sock, 8)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">Q", raw)[0]
+                if h[1] & 0x80:
+                    if _recv_exact(sock, 4) is None:
+                        break
+                if length > 0:
+                    if _recv_exact(sock, length) is None:
+                        break
+        except Exception:
+            pass
+        finally:
+            with _ws_lock:
+                if sock in _ws_clients:
+                    _ws_clients.remove(sock)
+            with contextlib.suppress(Exception):
+                sock.close()
+
     def log_message(self, format: str, *args: Any) -> None:
         """Log requests via the module logger instead of stdout."""
         logger.debug("HTTP: %s", format % args)
@@ -296,123 +384,18 @@ def _ws_send_text(sock: Any, text: str) -> bool:
         return False
 
 
-def make_handler(repo_root: Path, ws_port: int) -> type[_DashboardHandler]:
+def make_handler(repo_root: Path) -> type[_DashboardHandler]:
     """Create a handler class bound to a specific repo root."""
 
     class BoundHandler(_DashboardHandler):
         pass
 
     BoundHandler.repo_root = repo_root  # type: ignore[attr-defined]
-    BoundHandler.ws_port = ws_port  # type: ignore[attr-defined]
     return BoundHandler
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Standalone WebSocket server (raw TCP — avoids BaseHTTPRequestHandler
-# lifecycle issues that close the socket after the 101 handshake)
-# ──────────────────────────────────────────────────────────────────────
-
 _ws_clients: list[Any] = []
 _ws_lock = threading.Lock()
-
-
-def _ws_server_loop(host: str, port: int) -> None:
-    """Accept WS connections on a raw TCP socket. Runs in a daemon thread."""
-    import base64
-    import struct
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, port))
-    srv.listen(8)
-    srv.settimeout(1.0)  # so the thread can exit on shutdown
-    logger.info("scry dashboard: WS server listening on %s:%d", host, port)
-
-    def handle_client(conn: socket.socket, addr: tuple[str, int]) -> None:
-        """Handle one WS client on its own thread."""
-        try:
-            # Read HTTP upgrade request
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    conn.close()
-                    return
-                data += chunk
-
-            # Parse Sec-WebSocket-Key from headers
-            key = ""
-            for line in data.decode("utf-8", errors="replace").split("\r\n"):
-                if line.lower().startswith("sec-websocket-key:"):
-                    key = line.split(":", 1)[1].strip()
-                    break
-            if not key:
-                conn.close()
-                return
-
-            accept = base64.b64encode(
-                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
-            ).decode()
-
-            resp = (
-                "HTTP/1.1 101 Switching Protocols\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Accept: {accept}\r\n"
-                "\r\n"
-            )
-            conn.sendall(resp.encode())
-
-            with _ws_lock:
-                _ws_clients.append(conn)
-            logger.debug("scry dashboard: WS client connected from %s, total=%d", addr, len(_ws_clients))
-
-            # Read loop — just consume frames to keep connection alive
-            while True:
-                header = _recv_exact(conn, 2)
-                if header is None:
-                    break
-                opcode = header[0] & 0x0F
-                if opcode == 0x8:
-                    break
-                length = header[1] & 0x7F
-                if length == 126:
-                    raw = _recv_exact(conn, 2)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">H", raw)[0]
-                elif length == 127:
-                    raw = _recv_exact(conn, 8)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">Q", raw)[0]
-                if header[1] & 0x80:
-                    if _recv_exact(conn, 4) is None:
-                        break
-                if length > 0:
-                    if _recv_exact(conn, length) is None:
-                        break
-        except Exception:
-            pass
-        finally:
-            with _ws_lock:
-                if conn in _ws_clients:
-                    _ws_clients.remove(conn)
-            logger.debug("scry dashboard: WS client disconnected, total=%d", len(_ws_clients))
-            with contextlib.suppress(Exception):
-                conn.close()
-
-    while True:
-        try:
-            conn, addr = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
-        except socket.timeout:
-            continue  # normal — just loop and accept again
-        except OSError:
-            break  # server socket closed — exit thread
-        except Exception:
-            continue
 
 
 def _recv_exact(sock: Any, n: int) -> bytes | None:
@@ -480,22 +463,14 @@ def serve_dashboard(
 
     Args:
         repo_root:    Absolute path to the repository root.
-        port:         TCP port to listen on (WebSocket runs on port+1).
+        port:         TCP port to listen on (WS upgrades on same port).
         open_browser: Open the dashboard URL in the default browser.
     """
-    ws_port = port + 1
-    handler_cls = make_handler(repo_root, ws_port)
+    handler_cls = make_handler(repo_root)
     server = _ThreadedHTTPServer(("127.0.0.1", port), handler_cls)
     url = f"http://127.0.0.1:{port}"
-    logger.info("scry dashboard: serving at %s (WS on :%d)", url, ws_port)
+    logger.info("scry dashboard: serving at %s", url)
     print(f"scry dashboard → {url}  (Ctrl-C to stop)")  # noqa: T201
-
-    # Start WS server thread.
-    ws_thread = threading.Thread(
-        target=_ws_server_loop, args=("127.0.0.1", ws_port),
-        daemon=True, name="scry-ws-server",
-    )
-    ws_thread.start()
 
     # Start WS push thread.
     push_thread = threading.Thread(
@@ -815,9 +790,7 @@ function loadData() {
 
 function connectWS() {
   if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
-  // WS runs on HTTP port + 1
-  const wsPort = parseInt(location.port) + 1;
-  const url = `ws://${location.hostname}:${wsPort}/ws`;
+  const url = `ws://${location.host}/ws`;
   console.log('scry: connecting WebSocket to', url);
   const ws = new WebSocket(url);
   _ws = ws;
