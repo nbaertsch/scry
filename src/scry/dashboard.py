@@ -729,18 +729,31 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = `${proto}//${location.host}/ws`;
   console.log('scry: connecting WebSocket to', url);
-  _ws = new WebSocket(url);
+  const ws = new WebSocket(url);
+  _ws = ws;
   const statusEl = document.getElementById('ws-status');
 
-  _ws.onopen = () => { console.log('scry: WS connected'); statusEl.textContent = '🟢 live'; statusEl.style.color = 'var(--green)'; };
-  _ws.onclose = (e) => {
-    console.log('scry: WS closed', e.code, e.reason);
-    statusEl.textContent = '🔴 disconnected'; statusEl.style.color = 'var(--red)';
-    if (document.getElementById('auto-refresh-toggle').checked)
-      setTimeout(connectWS, 3000);
+  ws.onopen = () => {
+    console.log('scry: WS connected');
+    statusEl.textContent = '🟢 live';
+    statusEl.style.color = 'var(--green)';
   };
-  _ws.onerror = (e) => { console.error('scry: WS error', e); _ws.close(); };
-  _ws.onmessage = (evt) => {
+  ws.onclose = (e) => {
+    console.log('scry: WS closed', e.code, e.reason);
+    // Only update UI if this is still the active socket
+    if (_ws === ws) {
+      _ws = null;
+      statusEl.textContent = '🔴 disconnected';
+      statusEl.style.color = 'var(--red)';
+      if (document.getElementById('auto-refresh-toggle').checked)
+        setTimeout(connectWS, 3000);
+    }
+  };
+  ws.onerror = (e) => {
+    console.error('scry: WS error', e);
+    // onclose will fire after onerror — let it handle cleanup
+  };
+  ws.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data);
       if (data.anchors && data.summary) {
@@ -752,7 +765,9 @@ function connectWS() {
 }
 
 function disconnectWS() {
-  if (_ws) { _ws.onclose = null; _ws.close(); _ws = null; }
+  const ws = _ws;
+  _ws = null;  // clear first so onclose doesn't reconnect
+  if (ws) { ws.onclose = null; ws.close(); }
   document.getElementById('ws-status').textContent = '⏸ paused';
   document.getElementById('ws-status').style.color = 'var(--fg2)';
 }
@@ -762,8 +777,10 @@ document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
   if (e.target.checked) connectWS(); else disconnectWS();
 });
 
-// Initial load via HTTP, then connect WS for live updates
-loadData().then(() => {
+// Initial load via HTTP, then connect WS for live updates.
+// connectWS is called unconditionally after loadData — the toggle
+// is checked by default so this always starts the WS connection.
+loadData().finally(() => {
   if (document.getElementById('auto-refresh-toggle').checked) connectWS();
 });
 
