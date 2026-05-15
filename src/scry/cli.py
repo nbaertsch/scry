@@ -3165,6 +3165,17 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
             await asyncio.Event().wait()
 
     try:
+        # Windows Ctrl-C fix: FastMCP's anyio stdio transport swallows
+        # KeyboardInterrupt inside its event loop, so Ctrl-C does
+        # nothing.  Install a brute-force signal handler that calls
+        # os._exit() to force-terminate the process.  The `finally`
+        # block below won't run, but the OS reclaims the lock file,
+        # pipes, and DB handles on process exit anyway.
+        if sys.platform == "win32":
+            import signal
+
+            signal.signal(signal.SIGINT, lambda *_: os._exit(130))
+
         if daemon:
             asyncio.run(_serve_daemon())
         else:
