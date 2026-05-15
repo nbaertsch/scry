@@ -26,6 +26,7 @@ import platform
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -3328,14 +3329,44 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
     try:
         # Windows Ctrl-C fix: FastMCP's anyio stdio transport swallows
         # KeyboardInterrupt inside its event loop, so Ctrl-C does
-        # nothing.  Install a brute-force signal handler that calls
-        # os._exit() to force-terminate the process.  The `finally`
-        # block below won't run, but the OS reclaims the lock file,
-        # pipes, and DB handles on process exit anyway.
+        # nothing.  Install a signal handler that runs cleanup before
+        # force-exiting.  We call server.stop() synchronously to
+        # release the leader lock and unlink the lock file — without
+        # this, Ctrl-C (or Copilot killing the session) leaves an
+        # orphaned python.exe holding the lock forever.
         if sys.platform == "win32":
             import signal
 
-            signal.signal(signal.SIGINT, lambda *_: os._exit(130))
+            def _win_sigint_handler(*_args: object) -> None:
+                with contextlib.suppress(Exception):
+                    asyncio.run(server.stop())
+                os._exit(130)
+
+            signal.signal(signal.SIGINT, _win_sigint_handler)
+
+            # Parent-process watchdog: when Copilot kills the scry.exe
+            # wrapper, the Python child process becomes orphaned (its
+            # parent PID dies but the child keeps running, holding the
+            # leader lock and DB write lock forever).  This daemon
+            # thread polls the parent PID every 2s and force-exits
+            # when it disappears.
+            _parent_pid = os.getppid()
+
+            def _parent_watchdog() -> None:
+                import time
+
+                while True:
+                    time.sleep(2)
+                    try:
+                        os.kill(_parent_pid, 0)
+                    except OSError:
+                        # Parent is dead — clean up and exit.
+                        with contextlib.suppress(Exception):
+                            asyncio.run(server.stop())
+                        os._exit(1)
+
+            _wd = threading.Thread(target=_parent_watchdog, daemon=True, name="scry-parent-wd")
+            _wd.start()
 
         if daemon:
             asyncio.run(_serve_daemon())
