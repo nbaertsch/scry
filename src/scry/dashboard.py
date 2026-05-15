@@ -31,6 +31,7 @@ import threading
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,17 @@ def _lang_from_path(path: str) -> str | None:
 # ──────────────────────────────────────────────────────────────────────
 
 
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer that handles each request in a new thread.
+
+    Required for WebSocket support: WS connections hold their handler
+    thread open for the lifetime of the connection, so a single-threaded
+    server would be unable to serve any other requests.
+    """
+
+    daemon_threads = True
+
+
 class _DashboardHandler(BaseHTTPRequestHandler):
     """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades."""
 
@@ -267,6 +279,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
+
+        # Prevent BaseHTTPRequestHandler from processing more requests
+        # on this connection — it's now a WebSocket, not HTTP.
+        self.close_connection = True
 
         sock = self.request
         with self._ws_lock:
@@ -384,7 +400,7 @@ def serve_dashboard(
         open_browser: Open the dashboard URL in the default browser.
     """
     handler_cls = make_handler(repo_root)
-    server = HTTPServer(("127.0.0.1", port), handler_cls)
+    server = _ThreadedHTTPServer(("127.0.0.1", port), handler_cls)
     url = f"http://127.0.0.1:{port}"
     logger.info("scry dashboard: serving at %s", url)
     print(f"scry dashboard → {url}  (Ctrl-C to stop)")  # noqa: T201
