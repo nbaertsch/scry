@@ -24,9 +24,11 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
+import socket
 import threading
 from functools import partial
 from http import HTTPStatus
@@ -219,21 +221,18 @@ class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
-    """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades."""
+    """Serves the SPA and ``/api/data`` JSON endpoint.
 
-    # HTTP/1.1 is required for WebSocket upgrades — browsers reject
-    # 101 Switching Protocols responses over HTTP/1.0.
+    WebSocket is handled on a separate port by ``_ws_server_loop``.
+    """
+
     protocol_version = "HTTP/1.1"
 
-    repo_root: Path  # set via make_handler
-    ws_clients: list[Any]  # shared mutable list of WS sockets
-    _ws_lock: threading.Lock
+    repo_root: Path
+    ws_port: int  # set by make_handler — the WS port for the frontend to connect to
 
     def do_GET(self) -> None:  # noqa: N802
-        # WebSocket upgrade
-        if self.headers.get("Upgrade", "").lower() == "websocket":
-            self._handle_ws_upgrade()
-            return
+        logger.debug("HTTP request: %s", self.path)
         if self.path == "/api/data":
             self._serve_api()
         elif self.path in ("/", "/index.html"):
@@ -269,78 +268,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_ws_upgrade(self) -> None:
-        """Perform the WebSocket handshake and enter the read loop.
-
-        After the 101 response, this method blocks reading client frames
-        until the connection closes.  Reads use ``self.rfile`` (not the
-        raw socket) because ``BaseHTTPRequestHandler`` wraps the socket
-        in a buffered reader — any bytes the browser sends immediately
-        after the handshake may already be in ``rfile``'s buffer.
-        """
-        import base64
-        import hashlib as _hl
-        import struct
-
-        key = self.headers.get("Sec-WebSocket-Key", "")
-        accept = base64.b64encode(
-            _hl.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
-        ).decode()
-        self.send_response(101, "Switching Protocols")
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", accept)
-        self.end_headers()
-        self.wfile.flush()
-
-        self.close_connection = True
-        sock = self.request
-        rfile = self.rfile
-
-        def recv_exact(n: int) -> bytes | None:
-            """Read exactly n bytes via rfile (buffered). None on EOF."""
-            try:
-                data = rfile.read(n)
-                return data if data and len(data) == n else None
-            except Exception:
-                return None
-
-        with self._ws_lock:
-            self.ws_clients.append(sock)
-        try:
-            while True:
-                header = recv_exact(2)
-                if header is None:
-                    break
-                opcode = header[0] & 0x0F
-                if opcode == 0x8:  # close frame
-                    break
-                length = header[1] & 0x7F
-                if length == 126:
-                    raw = recv_exact(2)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">H", raw)[0]
-                elif length == 127:
-                    raw = recv_exact(8)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">Q", raw)[0]
-                if header[1] & 0x80:  # masked
-                    if recv_exact(4) is None:
-                        break
-                if length > 0:
-                    if recv_exact(length) is None:
-                        break
-        except Exception:
-            pass
-        finally:
-            with self._ws_lock:
-                if sock in self.ws_clients:
-                    self.ws_clients.remove(sock)
-
     def log_message(self, format: str, *args: Any) -> None:
-        """Suppress noisy per-request stdout logging."""
+        """Log requests via the module logger instead of stdout."""
+        logger.debug("HTTP: %s", format % args)
 
 
 def _ws_send_text(sock: Any, text: str) -> bool:
@@ -366,51 +296,178 @@ def _ws_send_text(sock: Any, text: str) -> bool:
         return False
 
 
-def make_handler(repo_root: Path) -> type[_DashboardHandler]:
+def make_handler(repo_root: Path, ws_port: int) -> type[_DashboardHandler]:
     """Create a handler class bound to a specific repo root."""
 
     class BoundHandler(_DashboardHandler):
         pass
 
     BoundHandler.repo_root = repo_root  # type: ignore[attr-defined]
-    BoundHandler.ws_clients = []  # type: ignore[attr-defined]
-    BoundHandler._ws_lock = threading.Lock()  # type: ignore[attr-defined]
+    BoundHandler.ws_port = ws_port  # type: ignore[attr-defined]
     return BoundHandler
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Standalone WebSocket server (raw TCP — avoids BaseHTTPRequestHandler
+# lifecycle issues that close the socket after the 101 handshake)
+# ──────────────────────────────────────────────────────────────────────
+
+_ws_clients: list[Any] = []
+_ws_lock = threading.Lock()
+
+
+def _ws_server_loop(host: str, port: int) -> None:
+    """Accept WS connections on a raw TCP socket. Runs in a daemon thread."""
+    import base64
+    import struct
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(8)
+    srv.settimeout(1.0)  # so the thread can exit on shutdown
+    logger.info("scry dashboard: WS server listening on %s:%d", host, port)
+
+    def handle_client(conn: socket.socket, addr: tuple[str, int]) -> None:
+        """Handle one WS client on its own thread."""
+        try:
+            # Read HTTP upgrade request
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    conn.close()
+                    return
+                data += chunk
+
+            # Parse Sec-WebSocket-Key from headers
+            key = ""
+            for line in data.decode("utf-8", errors="replace").split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    key = line.split(":", 1)[1].strip()
+                    break
+            if not key:
+                conn.close()
+                return
+
+            accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
+            ).decode()
+
+            resp = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n"
+                "\r\n"
+            )
+            conn.sendall(resp.encode())
+
+            with _ws_lock:
+                _ws_clients.append(conn)
+            logger.debug("scry dashboard: WS client connected from %s, total=%d", addr, len(_ws_clients))
+
+            # Read loop — just consume frames to keep connection alive
+            while True:
+                header = _recv_exact(conn, 2)
+                if header is None:
+                    break
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:
+                    break
+                length = header[1] & 0x7F
+                if length == 126:
+                    raw = _recv_exact(conn, 2)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">H", raw)[0]
+                elif length == 127:
+                    raw = _recv_exact(conn, 8)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">Q", raw)[0]
+                if header[1] & 0x80:
+                    if _recv_exact(conn, 4) is None:
+                        break
+                if length > 0:
+                    if _recv_exact(conn, length) is None:
+                        break
+        except Exception:
+            pass
+        finally:
+            with _ws_lock:
+                if conn in _ws_clients:
+                    _ws_clients.remove(conn)
+            logger.debug("scry dashboard: WS client disconnected, total=%d", len(_ws_clients))
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    while True:
+        try:
+            conn, addr = srv.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+        except socket.timeout:
+            continue  # normal — just loop and accept again
+        except OSError:
+            break  # server socket closed — exit thread
+        except Exception:
+            continue
+
+
+def _recv_exact(sock: Any, n: int) -> bytes | None:
+    """Read exactly n bytes. Returns None on EOF/error."""
+    buf = b""
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except Exception:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
 
 
 def _ws_push_loop(
     repo_root: Path,
-    handler_cls: type[_DashboardHandler],
     interval: float = 5.0,
 ) -> None:
     """Background thread: gather data and push to all WS clients when data changes."""
-    import hashlib as _hl
     import time
 
     last_hash = ""
+    last_client_count = 0
     while True:
         time.sleep(interval)
-        clients = list(handler_cls.ws_clients)  # type: ignore[attr-defined]
+        with _ws_lock:
+            clients = list(_ws_clients)
         if not clients:
+            last_client_count = 0
             continue
         try:
             data = gather_dashboard_data(repo_root)
             payload = json.dumps(data)
-            data_hash = _hl.sha256(payload.encode()).hexdigest()[:16]
-            if data_hash == last_hash:
+            data_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+            # Always push when new clients join (they need initial data),
+            # or when data has changed.
+            new_clients = len(clients) > last_client_count
+            last_client_count = len(clients)
+            if data_hash == last_hash and not new_clients:
                 continue
             last_hash = data_hash
         except Exception:
+            logger.exception("scry dashboard: push loop gather error")
             continue
         dead: list[Any] = []
         for sock in clients:
             if not _ws_send_text(sock, payload):
                 dead.append(sock)
         if dead:
-            with handler_cls._ws_lock:  # type: ignore[attr-defined]
+            with _ws_lock:
                 for s in dead:
-                    if s in handler_cls.ws_clients:  # type: ignore[attr-defined]
-                        handler_cls.ws_clients.remove(s)  # type: ignore[attr-defined]
+                    if s in _ws_clients:
+                        _ws_clients.remove(s)
 
 
 def serve_dashboard(
@@ -423,21 +480,29 @@ def serve_dashboard(
 
     Args:
         repo_root:    Absolute path to the repository root.
-        port:         TCP port to listen on.
+        port:         TCP port to listen on (WebSocket runs on port+1).
         open_browser: Open the dashboard URL in the default browser.
     """
-    handler_cls = make_handler(repo_root)
+    ws_port = port + 1
+    handler_cls = make_handler(repo_root, ws_port)
     server = _ThreadedHTTPServer(("127.0.0.1", port), handler_cls)
     url = f"http://127.0.0.1:{port}"
-    logger.info("scry dashboard: serving at %s", url)
+    logger.info("scry dashboard: serving at %s (WS on :%d)", url, ws_port)
     print(f"scry dashboard → {url}  (Ctrl-C to stop)")  # noqa: T201
 
-    # Start WS push thread.
+    # Start WS server thread.
     ws_thread = threading.Thread(
-        target=_ws_push_loop, args=(repo_root, handler_cls, 5.0),
-        daemon=True, name="scry-ws-push",
+        target=_ws_server_loop, args=("127.0.0.1", ws_port),
+        daemon=True, name="scry-ws-server",
     )
     ws_thread.start()
+
+    # Start WS push thread.
+    push_thread = threading.Thread(
+        target=_ws_push_loop, args=(repo_root, 5.0),
+        daemon=True, name="scry-ws-push",
+    )
+    push_thread.start()
 
     if open_browser:
         import webbrowser
@@ -676,6 +741,8 @@ let anchorIndex = {};  // id -> anchor
 let anchorDrift = {};  // anchor_id -> worst drift status
 let anchorLinks = {};  // anchor_id -> [evaluation]
 
+console.log('scry dashboard: script loaded, v2');
+
 // ── Tab switching ──
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -748,8 +815,9 @@ function loadData() {
 
 function connectWS() {
   if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.host}/ws`;
+  // WS runs on HTTP port + 1
+  const wsPort = parseInt(location.port) + 1;
+  const url = `ws://${location.hostname}:${wsPort}/ws`;
   console.log('scry: connecting WebSocket to', url);
   const ws = new WebSocket(url);
   _ws = ws;
@@ -800,11 +868,11 @@ document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
 });
 
 // Initial load via HTTP, then connect WS for live updates.
-// connectWS is called unconditionally after loadData — the toggle
-// is checked by default so this always starts the WS connection.
-loadData().finally(() => {
-  if (document.getElementById('auto-refresh-toggle').checked) connectWS();
-});
+console.log('scry: calling loadData + connectWS');
+loadData();
+if (document.getElementById('auto-refresh-toggle').checked) {
+  connectWS();
+}
 
 function driftSeverity(status) {
   const order = ['fresh','drift-unknown','code-changed','spec-changed',

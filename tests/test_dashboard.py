@@ -248,14 +248,15 @@ class TestDashboardServer:
     """Test the HTTP server endpoints."""
 
     def test_make_handler_binds_repo_root(self, tmp_path: Path) -> None:
-        handler_cls = make_handler(tmp_path)
+        handler_cls = make_handler(tmp_path, ws_port=5556)
         assert handler_cls.repo_root == tmp_path  # type: ignore[attr-defined]
+        assert handler_cls.ws_port == 5556  # type: ignore[attr-defined]
 
     def test_serve_html_and_api(self, indexed_repo: Path) -> None:
         """Start the server in a thread, hit both endpoints, then shut down."""
         from http.server import HTTPServer
 
-        handler_cls = make_handler(indexed_repo)
+        handler_cls = make_handler(indexed_repo, ws_port=0)
         server = HTTPServer(("127.0.0.1", 0), handler_cls)
         port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
