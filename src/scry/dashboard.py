@@ -595,8 +595,9 @@ tbody tr:hover { background: var(--bg2); }
   <div class="tab" data-panel="explorer">Anchor Explorer</div>
 </div>
 
+<div id="loading" class="loading"><div class="spinner"></div><p>Loading index…</p></div>
+
 <div id="overview" class="panel active">
-  <div class="loading" id="loading"><div class="spinner"></div><p>Loading index…</p></div>
 </div>
 
 <div id="explorer" class="panel">
