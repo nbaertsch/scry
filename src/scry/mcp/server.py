@@ -56,7 +56,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 import scry
-from scry.config import load_config
+from scry.config import ConfigError, load_config
 from scry.embed import make_embedder
 from scry.git_context import GitContextProvider
 from scry.index import Indexer
@@ -777,8 +777,41 @@ class MCPServer:
         if self._started:
             return
 
-        # Step 1: Load config.
-        cfg = self._preloaded_config or load_config(self._repo_root)
+        # Step 1: Load config.  If missing, auto-create a default config
+        # so `scry mcp` works in repos that haven't run `scry init` yet
+        # (the MCP host starts the server; users shouldn't have to
+        # manually init before the first MCP connection).
+        if self._preloaded_config is not None:
+            cfg = self._preloaded_config
+        else:
+            try:
+                cfg = load_config(self._repo_root)
+            except ConfigError:
+                # Auto-init: create .scry/config.yaml with defaults so
+                # the MCP server starts cleanly on first use.
+                logger.info(
+                    "scry: no .scry/config.yaml found — auto-creating "
+                    "default config for MCP startup"
+                )
+                scry_dir = self._repo_root / ".scry"
+                scry_dir.mkdir(parents=True, exist_ok=True)
+                config_path = scry_dir / "config.yaml"
+                if not config_path.exists():
+                    # Import lazily to avoid circular deps.
+                    from scry.cli import _detect_repo_languages, _render_config_yaml
+
+                    detected = _detect_repo_languages(self._repo_root)
+                    config_text = _render_config_yaml(detected)
+                    config_path.write_text(config_text, encoding="utf-8")
+                    # Also write .gitignore inside .scry/ so vectors.db
+                    # and other generated files stay out of version control.
+                    gitignore = scry_dir / ".gitignore"
+                    if not gitignore.exists():
+                        gitignore.write_text(
+                            "vectors.db\nvectors.db-*\nleader.lock\noverlays/\ncache/\nstats.json\ncommit-links.*.marker\n",
+                            encoding="utf-8",
+                        )
+                cfg = load_config(self._repo_root)
 
         # Step 2: Try to acquire the leader lock.
         leader_lock = LeaderLock.try_acquire(self._repo_root)
@@ -797,7 +830,12 @@ class MCPServer:
             overlay_mgr = OverlayManager(self._repo_root, git_context=git_context)
             embedder = make_embedder(cfg.embeddings)
 
-            # Step 3c: Build indexer + run initial reconciliation.
+            # Step 3c: Build indexer.  The initial reconciliation is
+            # deferred to a background task (see serve_stdio) so the
+            # MCP handshake can complete promptly — otherwise the
+            # fastembed model load (~2-15s on cold disk + Windows
+            # Defender) blocks stdin reading and the MCP host times
+            # out with -32000 "connection closed".
             indexer = Indexer(
                 repo_root=self._repo_root,
                 config=cfg,
@@ -806,7 +844,6 @@ class MCPServer:
                 git_context=git_context,
                 allow_untrusted=self._allow_untrusted_lsp_config,
             )
-            await indexer.index_async(force=False)
 
             # Step 3d: Crash recovery for any prior commit-links transaction
             # interrupted before its marker was deleted.
@@ -951,6 +988,15 @@ class MCPServer:
         Blocks until stdin closes (i.e. the MCP client disconnects).
         Calls :meth:`start` first if not yet started.
 
+        The initial index reconciliation (``indexer.index_async``) is
+        run as a background task AFTER the MCP transport begins
+        accepting messages — this ensures the MCP ``initialize``
+        handshake completes promptly even on repos that require a
+        multi-second fastembed model load or a large first-index pass.
+        Tools invoked before indexing completes will work (the DB is
+        already open + schema initialized), they'll just see an empty
+        or stale index until the background task finishes.
+
         Known limitation (UT4-3, Windows-only): FastMCP's anyio-backed
         stdio transport does not reliably surface ``stdin`` EOF on
         Windows ``ProactorEventLoop`` — the process can hang for up
@@ -963,4 +1009,21 @@ class MCPServer:
         """
         if not self._started:
             await self.start()
+
+        # Deferred initial index — run in background so the MCP
+        # transport is responsive during model load + first index.
+        async def _deferred_index() -> None:
+            if self._ctx is not None and self._ctx.indexer is not None:
+                try:
+                    await self._ctx.indexer.index_async(force=False)
+                    logger.info("scry: deferred initial index complete")
+                except Exception:
+                    logger.exception("scry: deferred initial index failed")
+
+        import asyncio
+
+        self._deferred_index_task: asyncio.Task[None] | None = asyncio.create_task(
+            _deferred_index()
+        )
+
         await self._mcp.run_stdio_async(show_banner=False)

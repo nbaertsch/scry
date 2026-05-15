@@ -3137,6 +3137,10 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
     async def _serve_daemon() -> None:
         """Run the leader/IPC server forever, no stdio."""
         await server.start()
+        # Daemon mode can afford to block on indexing since there's no
+        # MCP handshake timeout to worry about.
+        if server._ctx is not None and server._ctx.indexer is not None:
+            await server._ctx.indexer.index_async(force=False)
         # SR1-4: detect follower-mode startup so we don't silently
         # claim leader status when another --daemon is already running.
         # ``_ctx`` is populated by ``start()``; reading it directly is
