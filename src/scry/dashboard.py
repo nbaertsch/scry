@@ -415,6 +415,13 @@ tbody tr:hover { background: var(--bg2); }
 <div class="header">
   <h1>🔮 <span>scry</span> dashboard</h1>
   <span class="branch" id="branch-label"></span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:12px">
+    <span id="last-updated" style="font-size:12px;color:var(--fg2)"></span>
+    <button id="refresh-btn" title="Refresh data" style="padding:4px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);cursor:pointer;font-size:13px">↻ Refresh</button>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2);cursor:pointer">
+      <input type="checkbox" id="auto-refresh-toggle"> Auto (30s)
+    </label>
+  </div>
 </div>
 
 <div class="tabs">
@@ -498,24 +505,53 @@ function esc(s) {
   return d.innerHTML;
 }
 
-// ── Load data ──
-fetch('/api/data')
-  .then(r => {
-    if (!r.ok) return r.json().then(d => { throw new Error(d.error || r.statusText); });
-    return r.json();
-  })
-  .then(data => {
-    if (!data.anchors || !data.summary) throw new Error('Unexpected API response shape');
-    DATA = data; init();
-  })
-  .catch(err => {
-    document.getElementById('loading').innerHTML =
-      `<p style="color:#f85149">Failed to load data: ${esc(err.message)}</p>`;
-  });
+// ── Data loading + refresh ──
+let _autoRefreshTimer = null;
+
+function loadData() {
+  const loading = document.getElementById('loading');
+  loading.style.display = 'block';
+  loading.innerHTML = '<div class="spinner"></div><p>Loading index…</p>';
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true; btn.textContent = '↻ …';
+
+  return fetch('/api/data')
+    .then(r => {
+      if (!r.ok) return r.json().then(d => { throw new Error(d.error || r.statusText); });
+      return r.json();
+    })
+    .then(data => {
+      if (!data.anchors || !data.summary) throw new Error('Unexpected API response shape');
+      DATA = data;
+      init();
+      const now = new Date().toLocaleTimeString();
+      document.getElementById('last-updated').textContent = `updated ${now}`;
+    })
+    .catch(err => {
+      loading.style.display = 'block';
+      loading.innerHTML = `<p style="color:#f85149">Failed to load data: ${esc(err.message)}</p>`;
+    })
+    .finally(() => { btn.disabled = false; btn.textContent = '↻ Refresh'; });
+}
+
+document.getElementById('refresh-btn').addEventListener('click', loadData);
+document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
+  if (e.target.checked) {
+    _autoRefreshTimer = setInterval(loadData, 30000);
+  } else {
+    clearInterval(_autoRefreshTimer); _autoRefreshTimer = null;
+  }
+});
+
+// Initial load
+loadData();
 
 function init() {
   document.getElementById('loading').style.display = 'none';
   document.getElementById('branch-label').textContent = DATA.branch ? `branch: ${DATA.branch}` : '';
+
+  // Reset indices for refresh
+  anchorIndex = {}; anchorDrift = {}; anchorLinks = {};
 
   // Build indices
   DATA.anchors.forEach(a => anchorIndex[a.id] = a);
