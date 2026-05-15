@@ -10,6 +10,12 @@ Serves a self-contained single-page app over HTTP with two views:
 No external dependencies beyond the Python stdlib — the frontend uses
 D3.js loaded from a CDN.
 
+**Read-only / follower-only:**  The dashboard never acquires the leader
+lock and never writes to the DB or overlay files.  All data is gathered
+via ``ScryDB(read_only=True)`` and ``LinkStore.replay()`` (read-only
+JSONL replay).  This ensures the dashboard can run safely alongside a
+leader MCP server or when no leader is running.
+
 Usage::
 
     from scry.dashboard import serve_dashboard
