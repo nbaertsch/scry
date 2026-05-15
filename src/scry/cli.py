@@ -3337,9 +3337,22 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
         if sys.platform == "win32":
             import signal
 
-            def _win_sigint_handler(*_args: object) -> None:
+            def _sync_cleanup() -> None:
+                """Release locks synchronously without asyncio (safe from signal handlers)."""
                 with contextlib.suppress(Exception):
-                    asyncio.run(server.stop())
+                    if server._ipc_server is not None:
+                        # Can't await stop() from a signal handler;
+                        # the OS will reclaim the pipe on exit.
+                        pass
+                with contextlib.suppress(Exception):
+                    if server._leader_lock is not None:
+                        server._leader_lock.release()
+                with contextlib.suppress(Exception):
+                    if server._ctx is not None and server._ctx.db is not None:
+                        server._ctx.db.close()
+
+            def _win_sigint_handler(*_args: object) -> None:
+                _sync_cleanup()
                 os._exit(130)
 
             signal.signal(signal.SIGINT, _win_sigint_handler)
@@ -3360,9 +3373,7 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
                     try:
                         os.kill(_parent_pid, 0)
                     except OSError:
-                        # Parent is dead — clean up and exit.
-                        with contextlib.suppress(Exception):
-                            asyncio.run(server.stop())
+                        _sync_cleanup()
                         os._exit(1)
 
             _wd = threading.Thread(target=_parent_watchdog, daemon=True, name="scry-parent-wd")
