@@ -1218,7 +1218,7 @@ async def repo_summary(ctx: MCPContext) -> dict[str, Any]:
         "anchor_counts": counts_by_type,
         "drift_score": summary.drift_score,
         "coverage_score": summary.coverage_score,
-        "drift_counts": summary.counts.model_dump(),
+        "drift_counts": {k.replace("_", "-"): v for k, v in summary.counts.model_dump().items()},
         "drift_coverage": "section-only",
         "index_state": index_state,
         "branch": git_ctx.branch,
