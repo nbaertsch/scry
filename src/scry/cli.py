@@ -511,8 +511,10 @@ def _detect_vendored_toolchain_excludes(repo: Path) -> list[tuple[str, str]]:
 
     Scans top-level and second-level directories for known toolchain
     marker files (e.g. ``zig.exe``, ``rustc``, ``go``) and returns
-    ``(glob, label)`` pairs for each match.  Only checks directories
-    that are NOT already in ``_DETECT_SKIP_DIRS``.
+    ``(glob, label)`` pairs for each match.  Only flags directories
+    that contain indexable source files (not just binaries) to avoid
+    false positives like ``test/python_runtime/`` which has
+    ``python.exe`` but no ``.py`` files scry would index.
 
     Returns:
         List of ``("dirname/**", "Zig toolchain")`` tuples.
@@ -528,12 +530,45 @@ def _detect_vendored_toolchain_excludes(repo: Path) -> list[tuple[str, str]]:
             ] if entry.is_dir() else []:
                 for marker, label in _VENDORED_TOOLCHAIN_MARKERS.items():
                     if (candidate / marker).is_file():
-                        rel = candidate.relative_to(repo).as_posix()
-                        results.append((f"{rel}/**", label))
+                        # Only flag if the directory tree has indexable source files.
+                        if _has_indexable_sources(candidate):
+                            rel = candidate.relative_to(repo).as_posix()
+                            results.append((f"{rel}/**", label))
                         break  # one match per directory is enough
     except OSError:
         pass
     return results
+
+
+# Extensions scry indexes — if a vendored toolchain dir has none of
+# these, it won't pollute the index and doesn't need an exclude hint.
+_INDEXABLE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx",
+    ".go", ".rs", ".zig", ".md", ".markdown",
+    ".java", ".kt", ".c", ".h", ".cpp", ".hpp",
+    ".rb", ".cs", ".swift",
+})
+
+
+def _has_indexable_sources(directory: Path, max_check: int = 200) -> bool:
+    """Quick check whether *directory* contains any source files scry would index.
+
+    Walks at most *max_check* files to avoid slow scans on huge vendored trees.
+    """
+    checked = 0
+    try:
+        for _root, _dirs, files in os.walk(directory):
+            for f in files:
+                if Path(f).suffix.lower() in _INDEXABLE_EXTENSIONS:
+                    return True
+                checked += 1
+                if checked >= max_check:
+                    # Assume yes if we hit the cap without finding one —
+                    # better to over-warn than miss a 10k-file stdlib.
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 # ─── Root group ───────────────────────────────────────────────────────────────
