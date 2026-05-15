@@ -270,7 +270,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_ws_upgrade(self) -> None:
-        """Perform the WebSocket handshake and enter the read loop."""
+        """Perform the WebSocket handshake and enter the read loop.
+
+        After the 101 response, this method blocks reading client frames
+        until the connection closes.  Reads use ``self.rfile`` (not the
+        raw socket) because ``BaseHTTPRequestHandler`` wraps the socket
+        in a buffered reader — any bytes the browser sends immediately
+        after the handshake may already be in ``rfile``'s buffer.
+        """
         import base64
         import hashlib as _hl
         import struct
@@ -284,32 +291,47 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
+        self.wfile.flush()
 
-        # Prevent BaseHTTPRequestHandler from processing more requests
-        # on this connection — it's now a WebSocket, not HTTP.
         self.close_connection = True
-
         sock = self.request
+        rfile = self.rfile
+
+        def recv_exact(n: int) -> bytes | None:
+            """Read exactly n bytes via rfile (buffered). None on EOF."""
+            try:
+                data = rfile.read(n)
+                return data if data and len(data) == n else None
+            except Exception:
+                return None
+
         with self._ws_lock:
             self.ws_clients.append(sock)
         try:
-            # Keep alive — read (and discard) client frames until close.
             while True:
-                header = sock.recv(2)
-                if len(header) < 2:
+                header = recv_exact(2)
+                if header is None:
                     break
                 opcode = header[0] & 0x0F
                 if opcode == 0x8:  # close frame
                     break
                 length = header[1] & 0x7F
                 if length == 126:
-                    length = struct.unpack(">H", sock.recv(2))[0]
+                    raw = recv_exact(2)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">H", raw)[0]
                 elif length == 127:
-                    length = struct.unpack(">Q", sock.recv(8))[0]
+                    raw = recv_exact(8)
+                    if raw is None:
+                        break
+                    length = struct.unpack(">Q", raw)[0]
                 if header[1] & 0x80:  # masked
-                    sock.recv(4)
+                    if recv_exact(4) is None:
+                        break
                 if length > 0:
-                    sock.recv(length)
+                    if recv_exact(length) is None:
+                        break
         except Exception:
             pass
         finally:
