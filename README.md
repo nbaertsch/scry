@@ -6,9 +6,7 @@ A local-first MCP server that links spec/doc text to AST symbols and detects
 drift between them.
 
 **Status: v0.0.1 — fully functional, all 6 implementation waves shipped
-(W0a–W6e).** Dogfooded on this repo and surfaced through a 5-persona
-swarm user-testing pass.  See [DESIGN.md](DESIGN.md) for the full
-architecture.
+(W0a–W6e).** See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ## What scry does
 
@@ -19,47 +17,96 @@ cosine similarity (sqlite-vec) with BM25 keyword search (FTS5) and a
 typed link graph across those anchors. When a spec and its implementing
 code drift apart, scry surfaces it.
 
-## Install
+---
 
-> All commands below use `uv run scry`. If you'd prefer bare `scry` invocations,
-> install with `pip install -e .` instead (adds the `scry` binary to your PATH).
+## Quick start (zero install — recommended)
+
+Run scry in any git repo using [`uvx`](https://docs.astral.sh/uv/guides/tools/)
+— no clone, no virtualenv, no PATH setup:
+
+```bash
+cd your-project/
+
+# One-time setup
+uvx --from "scry-cli @ git+https://github.com/nbaertsch/scry" scry init
+uvx --from "scry-cli @ git+https://github.com/nbaertsch/scry" scry index
+
+# Search
+uvx --from "scry-cli @ git+https://github.com/nbaertsch/scry" scry search "authentication"
+```
+
+**Tip — create a shell alias** to avoid repeating the `--from` flag:
+
+```bash
+# bash / zsh — add to ~/.bashrc or ~/.zshrc
+alias scry='uvx --from "scry-cli @ git+https://github.com/nbaertsch/scry" scry'
+
+# PowerShell — add to $PROFILE
+function scry { uvx --from "scry-cli @ git+https://github.com/nbaertsch/scry" scry @args }
+```
+
+Then use `scry` as a bare command anywhere:
+
+```bash
+scry init
+scry index
+scry search "your query"
+scry check
+```
+
+## Alternative: install globally with `uv tool`
+
+```bash
+uv tool install "scry-cli @ git+https://github.com/nbaertsch/scry"
+scry --help   # now on PATH permanently
+```
+
+## Alternative: clone + dev install
 
 ```bash
 git clone https://github.com/nbaertsch/scry
 cd scry
-uv sync          # installs scry + tree-sitter + sqlite-vec + fastembed
+uv sync
 uv run scry --help
 ```
 
-## Quick start
-
-```bash
-# In the repo you want to track:
-uv run scry init          # writes .scry/config.yaml + .gitignore + .gitattributes
-uv run scry index         # builds vectors.db (incremental on subsequent runs)
-uv run scry search "your query"
-uv run scry doctor        # health check
-```
+---
 
 ## Core workflow
 
 ```bash
 # 1. Build (or refresh) the local index
-uv run scry index
+scry index
 
 # 2. Link a spec section to its implementing code
-uv run scry link "docs/auth.md::## Authentication" "src/auth.py:login" --type implements
+scry link "docs/auth.md::authentication" "src/auth.py:login" --type implements
 
 # 3. Check for drift between linked spec and code
-uv run scry check
+scry check
 
 # 4. Promote overlay links to the shared baseline
-uv run scry commit-links
+scry commit-links
 ```
 
-Run `uv run scry COMMAND --help` for full options on each command.
+Run `scry COMMAND --help` for full options on each command.
 
-To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
+## MCP server setup
+
+Add scry as an MCP server in your editor (Claude Code, Copilot, Cursor, etc.):
+
+```jsonc
+// .mcp.json (in your project root)
+{
+  "mcpServers": {
+    "scry": {
+      "command": "uvx",
+      "args": ["--from", "scry-cli @ git+https://github.com/nbaertsch/scry", "scry", "mcp"]
+    }
+  }
+}
+```
+
+Or if you installed globally via `uv tool install`:
 
 ```jsonc
 {
@@ -72,12 +119,12 @@ To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
 }
 ```
 
-(`uv run scry init` prints this snippet for you.)
+(`scry init` prints these snippets for you.)
 
 ## Capabilities
 
 * **Anchor extraction** — markdown sections, code symbols (Python, TypeScript,
-  Go, Rust, Zig), and code blocks embedded inside markdown
+  Go, Rust, Zig, Jest/Mocha test constructs), and code blocks inside markdown
 * **Hybrid retrieval** — vector cosine + BM25 fused via RRF, scoped by anchor
   type and link traversal
 * **Typed links** — `mirrors`, `implements`, `tests`, `examples`,
@@ -88,9 +135,10 @@ To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
 * **Transitive code drift** via LSP `callHierarchy/outgoingCalls` —
   optional, requires pyright / typescript-language-server / gopls /
   rust-analyzer / zls on PATH
-* **MCP server** — 12 tools: `search`, `get_anchor`, `get_links`,
-  `find_drift`, `propose_link`, `accept_link`, `commit_links`, `status`,
-  `repo_summary`, `reindex`, `get_callers`, `get_subclasses`
+* **MCP server** — 15 tools: `search`, `get_anchor`, `get_links`,
+  `find_drift`, `propose_link`, `accept_link`, `commit_links`, `unlink`,
+  `status`, `repo_summary`, `reindex`, `get_callers`, `get_subclasses`,
+  `suggest_links_candidates`, `apply_link_suggestions`
 * **Leader / follower coordination** via Unix socket / Windows named
   pipe IPC; multiple agent harnesses can share one indexed view of a
   repo
@@ -98,17 +146,6 @@ To enable the MCP server in your editor (Claude Code, Cursor, OpenCode):
   leader
 * **AI-assisted curation** (opt-in, requires LLM) — `scry suggest-links`
   and `scry reconcile <link_id>` via OpenAI / Anthropic / Ollama / LiteLLM
-
-## Roadmap
-
-* [x] **Wave 0–6** — implementation complete (see commit history)
-* [x] **Dogfooding** — caught & fixed 10 bugs running scry on itself
-* [x] **Swarm user-testing** — caught & fixed 20 bugs across 5 simulated
-  user personas (first-time, drift workflow, MCP integration,
-  multi-process, polyglot)
-* [ ] Polish: surface a few remaining MEDIUM/LOW UX gaps tracked in the
-  bug-tracker
-* [ ] Distribute via PyPI
 
 ## License
 
