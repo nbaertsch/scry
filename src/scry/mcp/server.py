@@ -1063,7 +1063,9 @@ class MCPServer:
 
                     handle = msvcrt.get_osfhandle(_sys.stdin.fileno())
                     if win32file.GetFileType(handle) != win32file.FILE_TYPE_PIPE:
-                        return  # console stdin — not an MCP pipe, skip
+                        # Console stdin — block forever (never trigger shutdown).
+                        await asyncio.Event().wait()
+                        return
                     while True:
                         await asyncio.sleep(2)
                         try:
@@ -1072,7 +1074,9 @@ class MCPServer:
                             logger.info("scry: stdin pipe broken — MCP client disconnected")
                             return
                 except Exception:
-                    return  # pywin32 unavailable or not a pipe
+                    # pywin32 unavailable or stdin not accessible — block
+                    # forever so we never accidentally kill the MCP task.
+                    await asyncio.Event().wait()
 
             async def _serve_with_eof_guard() -> None:
                 mcp_task = asyncio.create_task(self._mcp.run_stdio_async(show_banner=False))
