@@ -221,6 +221,10 @@ class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 class _DashboardHandler(BaseHTTPRequestHandler):
     """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades."""
 
+    # HTTP/1.1 is required for WebSocket upgrades — browsers reject
+    # 101 Switching Protocols responses over HTTP/1.0.
+    protocol_version = "HTTP/1.1"
+
     repo_root: Path  # set via make_handler
     ws_clients: list[Any]  # shared mutable list of WS sockets
     _ws_lock: threading.Lock
@@ -261,6 +265,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -721,22 +726,27 @@ function loadData() {
 function connectWS() {
   if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  _ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const url = `${proto}//${location.host}/ws`;
+  console.log('scry: connecting WebSocket to', url);
+  _ws = new WebSocket(url);
   const statusEl = document.getElementById('ws-status');
 
-  _ws.onopen = () => { statusEl.textContent = '🟢 live'; statusEl.style.color = 'var(--green)'; };
-  _ws.onclose = () => {
+  _ws.onopen = () => { console.log('scry: WS connected'); statusEl.textContent = '🟢 live'; statusEl.style.color = 'var(--green)'; };
+  _ws.onclose = (e) => {
+    console.log('scry: WS closed', e.code, e.reason);
     statusEl.textContent = '🔴 disconnected'; statusEl.style.color = 'var(--red)';
-    // Reconnect after 3s if live toggle is still on
     if (document.getElementById('auto-refresh-toggle').checked)
       setTimeout(connectWS, 3000);
   };
-  _ws.onerror = () => { _ws.close(); };
+  _ws.onerror = (e) => { console.error('scry: WS error', e); _ws.close(); };
   _ws.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data);
-      if (data.anchors && data.summary) applyData(data);
-    } catch(e) { /* ignore bad frames */ }
+      if (data.anchors && data.summary) {
+        console.log('scry: WS push received, anchors:', data.anchors.length);
+        applyData(data);
+      }
+    } catch(e) { console.error('scry: WS message parse error', e); }
   };
 }
 
