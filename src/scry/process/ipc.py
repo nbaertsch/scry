@@ -1641,10 +1641,10 @@ class IPCClient:
         """Verify the leader endpoint is reachable and responding.
 
         Sends a lightweight ``status`` call with a short timeout.
-        Returns ``True`` if the leader responds, ``False`` on any
-        connection or timeout error.  Used during follower startup to
-        detect stale leader metadata (dead process, zombie wrapper)
-        before committing to IPC forwarding.
+        Returns ``True`` if the leader responds OR if the pipe is busy
+        (all instances occupied — proves the leader is alive and serving
+        other clients).  Returns ``False`` only on genuine connection
+        failures (pipe not found, timeout, protocol error).
         """
         try:
             await asyncio.wait_for(
@@ -1652,8 +1652,17 @@ class IPCClient:
                 timeout=timeout_seconds,
             )
             return True
+        except OSError as exc:
+            # ERROR_PIPE_BUSY (231) = all pipe instances are in use.
+            # This proves the leader IS alive and serving clients —
+            # treat as healthy.  The follower will retry on actual
+            # tool calls and may succeed when a slot frees up.
+            if getattr(exc, "errno", None) == 231 or "busy" in str(exc).lower():
+                await self.close()
+                return True
+            await self.close()
+            return False
         except Exception:
-            # Connection refused, timeout, protocol error — leader is unreachable.
             await self.close()
             return False
 
