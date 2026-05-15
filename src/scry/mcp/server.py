@@ -1012,9 +1012,14 @@ class MCPServer:
 
         # Deferred initial index — run in background so the MCP
         # transport is responsive during model load + first index.
+        # The initial sleep(0) ensures the MCP transport gets at least
+        # one event-loop tick to begin accepting messages before
+        # indexing starts; index_async() itself yields every ~50ms
+        # so the transport stays responsive throughout.
         async def _deferred_index() -> None:
             if self._ctx is not None and self._ctx.indexer is not None:
                 try:
+                    await asyncio.sleep(0)
                     await self._ctx.indexer.index_async(force=False)
                     logger.info("scry: deferred initial index complete")
                 except Exception:

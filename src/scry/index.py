@@ -738,6 +738,22 @@ class Indexer:
         embedder = self._ensure_embedder(config)
         git_provider = self._ensure_git_context(config)
 
+        # Time-budgeted yield helper: yields to the event loop when more
+        # than ``_yield_budget`` seconds have elapsed since the last yield.
+        # This prevents long-running CPU-bound phases (extraction, embedding)
+        # from starving the MCP stdio transport of event-loop time, which
+        # would cause the MCP client to timeout on the ``initialize``
+        # handshake (observed as -32001 on Copilot CLI).
+        _yield_budget = 0.05  # 50ms between yields
+        _last_yield = time.monotonic()
+
+        async def _maybe_yield() -> None:
+            nonlocal _last_yield
+            now = time.monotonic()
+            if now - _last_yield >= _yield_budget:
+                await asyncio.sleep(0)
+                _last_yield = time.monotonic()
+
         files_processed = 0
         anchors_extracted = 0
         anchors_embedded = 0
@@ -752,6 +768,11 @@ class Indexer:
         # by reason makes silent "where did my files go" puzzles loud.
         files_skipped = 0
         files_skipped_reasons: dict[str, int] = {}
+
+        # Yield after heavy setup (embedder model load can take >1s)
+        # so the event loop can process MCP messages before we enter
+        # the write-lock-protected indexing phases.
+        await _maybe_yield()
 
         with db.acquire_write_lock():
             try:
@@ -820,6 +841,7 @@ class Indexer:
                     )
                 else:
                     files_processed += 1
+                await _maybe_yield()
 
             # SR3-6: re-validate UNCHANGED markdown files (see sync index()).
             unchanged_md_files = [
@@ -874,6 +896,7 @@ class Indexer:
                 )
                 anchors_embedded += 1
                 chunks_written += n
+                await _maybe_yield()
 
             # ── Write index_metadata ─────────────────────────────────────
             indexed_branch = git_ctx.branch or f"detached-{git_ctx.head_short}"
