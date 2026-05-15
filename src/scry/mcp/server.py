@@ -1045,4 +1045,50 @@ class MCPServer:
             _deferred_index()
         )
 
-        await self._mcp.run_stdio_async(show_banner=False)
+        # On Windows, FastMCP's anyio stdio transport does not reliably
+        # detect stdin EOF (UT4-3). When Copilot kills the session, the
+        # process hangs instead of exiting, holding the leader lock.
+        # Run a parallel stdin-pipe monitor that cancels the MCP task
+        # when the pipe breaks — this is cleaner than an external
+        # watchdog thread and works within the existing event loop.
+        if sys.platform == "win32":
+            import sys as _sys
+
+            async def _stdin_eof_monitor() -> None:
+                """Poll stdin pipe health; return when it breaks."""
+                try:
+                    import msvcrt
+                    import win32file  # type: ignore[import-untyped]
+                    import win32pipe  # type: ignore[import-untyped]
+
+                    handle = msvcrt.get_osfhandle(_sys.stdin.fileno())
+                    if win32file.GetFileType(handle) != win32file.FILE_TYPE_PIPE:
+                        return  # console stdin — not an MCP pipe, skip
+                    while True:
+                        await asyncio.sleep(2)
+                        try:
+                            win32pipe.PeekNamedPipe(handle, 0)
+                        except Exception:
+                            logger.info("scry: stdin pipe broken — MCP client disconnected")
+                            return
+                except Exception:
+                    return  # pywin32 unavailable or not a pipe
+
+            async def _serve_with_eof_guard() -> None:
+                mcp_task = asyncio.create_task(self._mcp.run_stdio_async(show_banner=False))
+                eof_task = asyncio.create_task(_stdin_eof_monitor())
+                # Wait for whichever finishes first.
+                done, pending = await asyncio.wait(
+                    {mcp_task, eof_task}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+                # If eof_task won, the MCP transport is stuck — force stop.
+                if mcp_task in pending:
+                    await self.stop()
+
+            await _serve_with_eof_guard()
+        else:
+            await self._mcp.run_stdio_async(show_banner=False)
