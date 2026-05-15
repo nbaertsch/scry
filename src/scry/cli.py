@@ -3097,6 +3097,49 @@ def validate(ctx: click.Context) -> None:
     click.echo("All checks passed.")
 
 
+# ─── scry dashboard ───────────────────────────────────────────────────────────
+
+
+@main.command("dashboard")
+@click.option(
+    "--port",
+    type=int,
+    default=5555,
+    show_default=True,
+    help="TCP port for the dashboard HTTP server.",
+)
+@click.option(
+    "--no-open",
+    is_flag=True,
+    default=False,
+    help="Don't auto-open the browser.",
+)
+@click.pass_context
+def dashboard_cmd(ctx: click.Context, port: int, no_open: bool) -> None:
+    """Interactive web dashboard for anchors, links, and drift.
+
+    Starts a local HTTP server serving a single-page app with two views:
+
+    \b
+    - **Drift Overview** — score gauge, status breakdown, force-directed
+      graph of anchors + links colored by drift status.
+    - **Anchor Explorer** — searchable table of all anchors with
+      drill-down to linked neighbours and content preview.
+
+    Requires an existing index (run ``scry index`` first).
+    """
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found — run `scry index` first", err=True)
+        raise SystemExit(1)
+
+    # Lazy import to avoid the import tax on every CLI invocation.
+    from scry.dashboard import serve_dashboard
+
+    serve_dashboard(repo, port=port, open_browser=not no_open)
+
+
 # ─── scry mcp ─────────────────────────────────────────────────────────────────
 
 
