@@ -9,7 +9,19 @@
 .scry/stats.json
 .scry/commit-links.*.marker
 
-# Standard Python ignores (anticipating implementation)
+# Local MCP config (user-specific, not committed)
+.mcp.json
+
+# Session artifacts — UAT reports, scratch, experiments
+UAT*.md
+UAT-*.md
+*-report.md
+SCRATCH*
+TEST_SPEC*
+sr2_experiments*
+uat_r5_3*
+
+# Standard Python ignores
 __pycache__/
 *.py[cod]
 *$py.class
@@ -55,4 +67,3 @@ htmlcov/
 .tox/
 .mypy_cache/
 .ruff_cache/
-*sr2_experiments*
