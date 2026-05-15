@@ -245,7 +245,7 @@ class MCPServer:
     # ─── Tool registration ────────────────────────────────────────────────────
 
     def _register_tools(self) -> None:
-        """Register all 12 MCP tools with the FastMCP instance.
+        """Register all 15 MCP tools with the FastMCP instance.
 
         Each tool is a thin async closure that resolves the current
         :class:`~scry.mcp.handlers.MCPContext` and delegates to
