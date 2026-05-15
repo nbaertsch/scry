@@ -24,6 +24,7 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -201,16 +202,22 @@ def _lang_from_path(path: str) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# HTTP server
+# HTTP + WebSocket server
 # ──────────────────────────────────────────────────────────────────────
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
-    """Serves the SPA and the ``/api/data`` JSON endpoint."""
+    """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades."""
 
-    repo_root: Path  # set via partial / class attribute
+    repo_root: Path  # set via make_handler
+    ws_clients: list[Any]  # shared mutable list of WS sockets
+    _ws_lock: threading.Lock
 
-    def do_GET(self) -> None:  # noqa: N802 — HTTP method naming convention
+    def do_GET(self) -> None:  # noqa: N802
+        # WebSocket upgrade
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_ws_upgrade()
+            return
         if self.path == "/api/data":
             self._serve_api()
         elif self.path in ("/", "/index.html"):
@@ -245,8 +252,75 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_ws_upgrade(self) -> None:
+        """Perform the WebSocket handshake and enter the read loop."""
+        import base64
+        import hashlib as _hl
+        import struct
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(
+            _hl.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
+        ).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        sock = self.request
+        with self._ws_lock:
+            self.ws_clients.append(sock)
+        try:
+            # Keep alive — read (and discard) client frames until close.
+            while True:
+                header = sock.recv(2)
+                if len(header) < 2:
+                    break
+                opcode = header[0] & 0x0F
+                if opcode == 0x8:  # close frame
+                    break
+                length = header[1] & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", sock.recv(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", sock.recv(8))[0]
+                if header[1] & 0x80:  # masked
+                    sock.recv(4)
+                if length > 0:
+                    sock.recv(length)
+        except Exception:
+            pass
+        finally:
+            with self._ws_lock:
+                if sock in self.ws_clients:
+                    self.ws_clients.remove(sock)
+
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress noisy per-request stdout logging."""
+
+
+def _ws_send_text(sock: Any, text: str) -> bool:
+    """Send a WebSocket text frame. Returns False on failure."""
+    import struct
+
+    data = text.encode("utf-8")
+    frame = bytearray()
+    frame.append(0x81)  # FIN + text opcode
+    if len(data) < 126:
+        frame.append(len(data))
+    elif len(data) < 65536:
+        frame.append(126)
+        frame.extend(struct.pack(">H", len(data)))
+    else:
+        frame.append(127)
+        frame.extend(struct.pack(">Q", len(data)))
+    frame.extend(data)
+    try:
+        sock.sendall(bytes(frame))
+        return True
+    except Exception:
+        return False
 
 
 def make_handler(repo_root: Path) -> type[_DashboardHandler]:
@@ -256,7 +330,44 @@ def make_handler(repo_root: Path) -> type[_DashboardHandler]:
         pass
 
     BoundHandler.repo_root = repo_root  # type: ignore[attr-defined]
+    BoundHandler.ws_clients = []  # type: ignore[attr-defined]
+    BoundHandler._ws_lock = threading.Lock()  # type: ignore[attr-defined]
     return BoundHandler
+
+
+def _ws_push_loop(
+    repo_root: Path,
+    handler_cls: type[_DashboardHandler],
+    interval: float = 5.0,
+) -> None:
+    """Background thread: gather data and push to all WS clients when data changes."""
+    import hashlib as _hl
+    import time
+
+    last_hash = ""
+    while True:
+        time.sleep(interval)
+        clients = list(handler_cls.ws_clients)  # type: ignore[attr-defined]
+        if not clients:
+            continue
+        try:
+            data = gather_dashboard_data(repo_root)
+            payload = json.dumps(data)
+            data_hash = _hl.sha256(payload.encode()).hexdigest()[:16]
+            if data_hash == last_hash:
+                continue
+            last_hash = data_hash
+        except Exception:
+            continue
+        dead: list[Any] = []
+        for sock in clients:
+            if not _ws_send_text(sock, payload):
+                dead.append(sock)
+        if dead:
+            with handler_cls._ws_lock:  # type: ignore[attr-defined]
+                for s in dead:
+                    if s in handler_cls.ws_clients:  # type: ignore[attr-defined]
+                        handler_cls.ws_clients.remove(s)  # type: ignore[attr-defined]
 
 
 def serve_dashboard(
@@ -278,10 +389,16 @@ def serve_dashboard(
     logger.info("scry dashboard: serving at %s", url)
     print(f"scry dashboard → {url}  (Ctrl-C to stop)")  # noqa: T201
 
+    # Start WS push thread.
+    ws_thread = threading.Thread(
+        target=_ws_push_loop, args=(repo_root, handler_cls, 5.0),
+        daemon=True, name="scry-ws-push",
+    )
+    ws_thread.start()
+
     if open_browser:
         import webbrowser
 
-        # Delay browser open slightly so the server is ready.
         threading.Timer(0.5, partial(webbrowser.open, url)).start()
 
     try:
@@ -443,10 +560,11 @@ tbody tr:hover { background: var(--bg2); }
   <h1>🔮 <span>scry</span> dashboard</h1>
   <span class="branch" id="branch-label"></span>
   <div style="margin-left:auto;display:flex;align-items:center;gap:12px">
+    <span id="ws-status" style="font-size:11px;color:var(--fg2)">⏳ connecting…</span>
     <span id="last-updated" style="font-size:12px;color:var(--fg2)"></span>
-    <button id="refresh-btn" title="Refresh data" style="padding:4px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);cursor:pointer;font-size:13px">↻ Refresh</button>
-    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2);cursor:pointer">
-      <input type="checkbox" id="auto-refresh-toggle"> Auto (30s)
+    <button id="refresh-btn" title="Refresh data now" style="padding:4px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);cursor:pointer;font-size:13px">↻ Refresh</button>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2);cursor:pointer" title="When enabled, dashboard auto-updates via WebSocket when scry data changes">
+      <input type="checkbox" id="auto-refresh-toggle" checked> Live
     </label>
   </div>
 </div>
@@ -532,62 +650,24 @@ function esc(s) {
   return d.innerHTML;
 }
 
-// ── Data loading + refresh ──
-let _autoRefreshTimer = null;
+// ── Data loading + WebSocket live updates ──
+let _ws = null;
+let _currentSim = null;  // track active D3 simulation for cleanup
 
-function loadData() {
-  const loading = document.getElementById('loading');
-  loading.style.display = 'block';
-  loading.innerHTML = '<div class="spinner"></div><p>Loading index…</p>';
-  const btn = document.getElementById('refresh-btn');
-  btn.disabled = true; btn.textContent = '↻ …';
-
-  return fetch('/api/data')
-    .then(r => {
-      if (!r.ok) return r.json().then(d => { throw new Error(d.error || r.statusText); });
-      return r.json();
-    })
-    .then(data => {
-      if (!data.anchors || !data.summary) throw new Error('Unexpected API response shape');
-      DATA = data;
-      init();
-      const now = new Date().toLocaleTimeString();
-      document.getElementById('last-updated').textContent = `updated ${now}`;
-    })
-    .catch(err => {
-      loading.style.display = 'block';
-      loading.innerHTML = `<p style="color:#f85149">Failed to load data: ${esc(err.message)}</p>`;
-    })
-    .finally(() => { btn.disabled = false; btn.textContent = '↻ Refresh'; });
-}
-
-document.getElementById('refresh-btn').addEventListener('click', loadData);
-document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
-  if (e.target.checked) {
-    _autoRefreshTimer = setInterval(loadData, 30000);
-  } else {
-    clearInterval(_autoRefreshTimer); _autoRefreshTimer = null;
-  }
-});
-
-// Initial load
-loadData();
-
-function init() {
+function applyData(data) {
+  DATA = data;
   document.getElementById('loading').style.display = 'none';
   document.getElementById('branch-label').textContent = DATA.branch ? `branch: ${DATA.branch}` : '';
+  document.getElementById('last-updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
 
-  // Reset indices for refresh
+  // Reset indices
   anchorIndex = {}; anchorDrift = {}; anchorLinks = {};
-
-  // Build indices
   DATA.anchors.forEach(a => anchorIndex[a.id] = a);
   DATA.evaluations.forEach(ev => {
     [ev.from_id, ev.to_id].forEach(aid => {
       if (!anchorLinks[aid]) anchorLinks[aid] = [];
       anchorLinks[aid].push(ev);
     });
-    // Track worst drift per anchor
     [ev.from_id, ev.to_id].forEach(aid => {
       const cur = anchorDrift[aid];
       if (!cur || driftSeverity(ev.drift_status) > driftSeverity(cur))
@@ -595,9 +675,70 @@ function init() {
     });
   });
 
+  // Clean up old simulation before rebuilding
+  if (_currentSim) { _currentSim.stop(); _currentSim = null; }
+
   renderOverview();
   renderExplorer();
 }
+
+function loadData() {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true; btn.textContent = '↻ …';
+  return fetch('/api/data')
+    .then(r => {
+      if (!r.ok) return r.json().then(d => { throw new Error(d.error || r.statusText); });
+      return r.json();
+    })
+    .then(data => {
+      if (!data.anchors || !data.summary) throw new Error('Unexpected response');
+      applyData(data);
+    })
+    .catch(err => {
+      document.getElementById('loading').style.display = 'block';
+      document.getElementById('loading').innerHTML =
+        `<p style="color:#f85149">Failed to load: ${esc(err.message)}</p>`;
+    })
+    .finally(() => { btn.disabled = false; btn.textContent = '↻ Refresh'; });
+}
+
+function connectWS() {
+  if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  _ws = new WebSocket(`${proto}//${location.host}/ws`);
+  const statusEl = document.getElementById('ws-status');
+
+  _ws.onopen = () => { statusEl.textContent = '🟢 live'; statusEl.style.color = 'var(--green)'; };
+  _ws.onclose = () => {
+    statusEl.textContent = '🔴 disconnected'; statusEl.style.color = 'var(--red)';
+    // Reconnect after 3s if live toggle is still on
+    if (document.getElementById('auto-refresh-toggle').checked)
+      setTimeout(connectWS, 3000);
+  };
+  _ws.onerror = () => { _ws.close(); };
+  _ws.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      if (data.anchors && data.summary) applyData(data);
+    } catch(e) { /* ignore bad frames */ }
+  };
+}
+
+function disconnectWS() {
+  if (_ws) { _ws.onclose = null; _ws.close(); _ws = null; }
+  document.getElementById('ws-status').textContent = '⏸ paused';
+  document.getElementById('ws-status').style.color = 'var(--fg2)';
+}
+
+document.getElementById('refresh-btn').addEventListener('click', loadData);
+document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
+  if (e.target.checked) connectWS(); else disconnectWS();
+});
+
+// Initial load via HTTP, then connect WS for live updates
+loadData().then(() => {
+  if (document.getElementById('auto-refresh-toggle').checked) connectWS();
+});
 
 function driftSeverity(status) {
   const order = ['fresh','drift-unknown','code-changed','spec-changed',
@@ -692,6 +833,9 @@ const LANG_COLORS = {
 
 function renderGraph() {
   const container = document.getElementById('graph-container');
+  if (!container) return;
+  // Clear previous graph content
+  container.innerHTML = '';
   const width = container.clientWidth || 900;
   const height = 600;
   container.style.height = height + 'px';
@@ -772,6 +916,7 @@ function renderGraph() {
     .force('collide', d3.forceCollide(P.collide))
     .alphaDecay(0.02)
     .velocityDecay(0.4);
+  _currentSim = sim;
 
   function reheat() { sim.alpha(P.alpha).restart(); }
 
