@@ -49,6 +49,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -1052,7 +1053,6 @@ class MCPServer:
         # when the pipe breaks — this is cleaner than an external
         # watchdog thread and works within the existing event loop.
         if sys.platform == "win32":
-            import sys as _sys
 
             async def _stdin_eof_monitor() -> None:
                 """Poll stdin pipe health; return when it breaks."""
@@ -1061,7 +1061,7 @@ class MCPServer:
                     import win32file  # type: ignore[import-untyped]
                     import win32pipe  # type: ignore[import-untyped]
 
-                    handle = msvcrt.get_osfhandle(_sys.stdin.fileno())
+                    handle = msvcrt.get_osfhandle(sys.stdin.fileno())
                     if win32file.GetFileType(handle) != win32file.FILE_TYPE_PIPE:
                         # Console stdin — block forever (never trigger shutdown).
                         await asyncio.Event().wait()
