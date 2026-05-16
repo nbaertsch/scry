@@ -220,41 +220,23 @@ class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
-    """Serves the SPA, ``/api/data`` JSON endpoint, and WebSocket upgrades.
+    """Serves the SPA, ``/api/data`` JSON endpoint, and ``/events`` SSE stream.
 
-    WebSocket connections are handled inline: after the 101 handshake,
-    the handler blocks in a read loop until the client disconnects.
-    ``handle()`` is overridden to skip the ``finish()`` cleanup when
-    the connection has been upgraded — ``BaseHTTPRequestHandler``
-    normally closes ``rfile``/``wfile`` (and the underlying socket)
-    after ``handle()`` returns, which kills the WS connection.
+    Uses Server-Sent Events (SSE) for live updates — a plain HTTP/1.1
+    response with ``Content-Type: text/event-stream`` that stays open
+    while the server writes ``data: {...}\\n\\n`` events.  SSE works
+    with the standard ``BaseHTTPRequestHandler`` lifecycle without
+    needing to detach ``rfile``/``wfile`` or fight the HTTP framework.
     """
 
     protocol_version = "HTTP/1.1"
 
     repo_root: Path
-    _ws_upgraded: bool = False  # set True when connection upgrades to WS
-
-    def handle(self) -> None:
-        """Override to skip finish() socket teardown for WS connections."""
-        self._ws_upgraded = False
-        try:
-            super().handle()
-        finally:
-            # If WS, the socket is already managed by our read loop
-            # and was closed there. Prevent finish() from double-closing.
-            if self._ws_upgraded:
-                # Neuter rfile/wfile so finish() doesn't close the socket
-                import io
-
-                self.rfile = io.BytesIO()
-                self.wfile = io.BytesIO()
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.headers.get("Upgrade", "").lower() == "websocket":
-            self._handle_ws_upgrade()
-            return
-        if self.path == "/api/data":
+        if self.path == "/events":
+            self._serve_sse()
+        elif self.path == "/api/data":
             self._serve_api()
         elif self.path in ("/", "/index.html"):
             self._serve_html()
@@ -289,99 +271,88 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_ws_upgrade(self) -> None:
-        """WebSocket handshake + read loop (blocks until client disconnects)."""
-        import base64
-        import hashlib as _hl
-        import struct
+    def _serve_sse(self) -> None:
+        """Server-Sent Events stream: pushes data on change every ~5s.
 
-        key = self.headers.get("Sec-WebSocket-Key", "")
-        accept = base64.b64encode(
-            _hl.sha1((key + "258EAFA5-E914-47DA-95CA-5AB9CF64AD42").encode()).digest()
-        ).decode()
+        Holds the HTTP response open and writes ``data: <json>\\n\\n``
+        frames whenever the dashboard data changes.  Browsers consume
+        this via ``new EventSource('/events')`` — no WebSocket needed,
+        no protocol upgrade, no socket detach gymnastics.
+        """
+        import time
 
-        # Send 101 directly on the raw socket to avoid any handler buffering.
-        sock = self.request
-        resp = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n"
-            "\r\n"
-        )
-        sock.sendall(resp.encode())
-        self._ws_upgraded = True
-        self.close_connection = True
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
+        self.end_headers()
+        self.wfile.flush()
 
-        # Detach rfile/wfile from the socket BEFORE entering the WS
-        # read loop. The BufferedReader (rfile) may interfere with
-        # raw socket reads if it holds the file descriptor.
-        import io
-        self.rfile = io.BytesIO()
-        self.wfile = io.BytesIO()
+        self.close_connection = True  # don't reuse this connection for more HTTP
 
-        with _ws_lock:
-            _ws_clients.append(sock)
+        # Send an initial event immediately so the client gets data
+        # without waiting for the first poll interval.
+        last_hash = ""
         try:
-            while True:
-                h = _recv_exact(sock, 2)
-                if h is None:
-                    break
-                opcode = h[0] & 0x0F
-                if opcode == 0x8:
-                    break
-                length = h[1] & 0x7F
-                if length == 126:
-                    raw = _recv_exact(sock, 2)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">H", raw)[0]
-                elif length == 127:
-                    raw = _recv_exact(sock, 8)
-                    if raw is None:
-                        break
-                    length = struct.unpack(">Q", raw)[0]
-                if h[1] & 0x80:
-                    if _recv_exact(sock, 4) is None:
-                        break
-                if length > 0:
-                    if _recv_exact(sock, length) is None:
-                        break
+            data = gather_dashboard_data(self.repo_root)
+            payload = json.dumps(data)
+            last_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+            self._send_sse_event(payload)
         except Exception:
-            pass
-        finally:
-            with _ws_lock:
-                if sock in _ws_clients:
-                    _ws_clients.remove(sock)
-            with contextlib.suppress(Exception):
-                sock.close()
+            logger.exception("scry dashboard: SSE initial gather error")
+            return
+
+        # Push loop: re-gather every 5s, send only on change.
+        # A periodic heartbeat (comment line) keeps the connection
+        # alive through proxies that close idle connections.
+        last_heartbeat = time.monotonic()
+        while True:
+            time.sleep(5.0)
+            try:
+                data = gather_dashboard_data(self.repo_root)
+                payload = json.dumps(data)
+                data_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+                if data_hash != last_hash:
+                    if not self._send_sse_event(payload):
+                        return  # client disconnected
+                    last_hash = data_hash
+                    last_heartbeat = time.monotonic()
+                elif time.monotonic() - last_heartbeat > 30.0:
+                    # heartbeat to keep proxies + browser happy
+                    if not self._send_sse_comment("heartbeat"):
+                        return
+                    last_heartbeat = time.monotonic()
+            except Exception:
+                logger.exception("scry dashboard: SSE push loop error")
+                return
+
+    def _send_sse_event(self, payload: str) -> bool:
+        """Write one SSE event frame. Returns False if the client is gone."""
+        try:
+            # SSE: each line prefixed with 'data: ', terminated by blank line.
+            # Multi-line payloads need each line prefixed; JSON is single-line
+            # by default but be defensive.
+            lines = payload.split("\n")
+            frame = "".join(f"data: {line}\n" for line in lines) + "\n"
+            self.wfile.write(frame.encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _send_sse_comment(self, comment: str) -> bool:
+        """Write an SSE comment line (heartbeat). Returns False if disconnected."""
+        try:
+            self.wfile.write(f": {comment}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
 
     def log_message(self, format: str, *args: Any) -> None:
         """Log requests via the module logger instead of stdout."""
         logger.debug("HTTP: %s", format % args)
-
-
-def _ws_send_text(sock: Any, text: str) -> bool:
-    """Send a WebSocket text frame. Returns False on failure."""
-    import struct
-
-    data = text.encode("utf-8")
-    frame = bytearray()
-    frame.append(0x81)  # FIN + text opcode
-    if len(data) < 126:
-        frame.append(len(data))
-    elif len(data) < 65536:
-        frame.append(126)
-        frame.extend(struct.pack(">H", len(data)))
-    else:
-        frame.append(127)
-        frame.extend(struct.pack(">Q", len(data)))
-    frame.extend(data)
-    try:
-        sock.sendall(bytes(frame))
-        return True
-    except Exception:
-        return False
 
 
 def make_handler(repo_root: Path) -> type[_DashboardHandler]:
@@ -394,65 +365,6 @@ def make_handler(repo_root: Path) -> type[_DashboardHandler]:
     return BoundHandler
 
 
-_ws_clients: list[Any] = []
-_ws_lock = threading.Lock()
-
-
-def _recv_exact(sock: Any, n: int) -> bytes | None:
-    """Read exactly n bytes. Returns None on EOF/error."""
-    buf = b""
-    while len(buf) < n:
-        try:
-            chunk = sock.recv(n - len(buf))
-        except Exception:
-            return None
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
-def _ws_push_loop(
-    repo_root: Path,
-    interval: float = 5.0,
-) -> None:
-    """Background thread: gather data and push to all WS clients when data changes."""
-    import time
-
-    last_hash = ""
-    last_client_count = 0
-    while True:
-        time.sleep(interval)
-        with _ws_lock:
-            clients = list(_ws_clients)
-        if not clients:
-            last_client_count = 0
-            continue
-        try:
-            data = gather_dashboard_data(repo_root)
-            payload = json.dumps(data)
-            data_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
-            # Always push when new clients join (they need initial data),
-            # or when data has changed.
-            new_clients = len(clients) > last_client_count
-            last_client_count = len(clients)
-            if data_hash == last_hash and not new_clients:
-                continue
-            last_hash = data_hash
-        except Exception:
-            logger.exception("scry dashboard: push loop gather error")
-            continue
-        dead: list[Any] = []
-        for sock in clients:
-            if not _ws_send_text(sock, payload):
-                dead.append(sock)
-        if dead:
-            with _ws_lock:
-                for s in dead:
-                    if s in _ws_clients:
-                        _ws_clients.remove(s)
-
-
 def serve_dashboard(
     repo_root: Path,
     *,
@@ -463,7 +375,7 @@ def serve_dashboard(
 
     Args:
         repo_root:    Absolute path to the repository root.
-        port:         TCP port to listen on (WS upgrades on same port).
+        port:         TCP port to listen on.
         open_browser: Open the dashboard URL in the default browser.
     """
     handler_cls = make_handler(repo_root)
@@ -471,13 +383,6 @@ def serve_dashboard(
     url = f"http://127.0.0.1:{port}"
     logger.info("scry dashboard: serving at %s", url)
     print(f"scry dashboard → {url}  (Ctrl-C to stop)")  # noqa: T201
-
-    # Start WS push thread.
-    push_thread = threading.Thread(
-        target=_ws_push_loop, args=(repo_root, 5.0),
-        daemon=True, name="scry-ws-push",
-    )
-    push_thread.start()
 
     if open_browser:
         import webbrowser
@@ -788,63 +693,63 @@ function loadData() {
     .finally(() => { btn.disabled = false; btn.textContent = '↻ Refresh'; });
 }
 
-function connectWS() {
-  if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
-  const url = `ws://${location.host}/ws`;
-  console.log('scry: connecting WebSocket to', url);
-  const ws = new WebSocket(url);
-  _ws = ws;
+function connectLive() {
+  if (_ws) return;  // already connected
+  const url = '/events';
+  console.log('scry: connecting EventSource to', url);
+  const es = new EventSource(url);
+  _ws = es;
   const statusEl = document.getElementById('ws-status');
 
-  ws.onopen = () => {
-    console.log('scry: WS connected');
+  es.onopen = () => {
+    console.log('scry: SSE connected');
     statusEl.textContent = '🟢 live';
     statusEl.style.color = 'var(--green)';
   };
-  ws.onclose = (e) => {
-    console.log('scry: WS closed', e.code, e.reason);
-    // Only update UI if this is still the active socket
-    if (_ws === ws) {
-      _ws = null;
+  es.onerror = (e) => {
+    // EventSource auto-reconnects on errors; just update status.
+    console.warn('scry: SSE error/disconnect', e);
+    if (es.readyState === EventSource.CLOSED) {
       statusEl.textContent = '🔴 disconnected';
       statusEl.style.color = 'var(--red)';
+      _ws = null;
+      // Reconnect after 3s if live toggle is still on
       if (document.getElementById('auto-refresh-toggle').checked)
-        setTimeout(connectWS, 3000);
+        setTimeout(connectLive, 3000);
+    } else {
+      statusEl.textContent = '🟡 reconnecting…';
+      statusEl.style.color = 'var(--yellow)';
     }
   };
-  ws.onerror = (e) => {
-    console.error('scry: WS error', e);
-    // onclose will fire after onerror — let it handle cleanup
-  };
-  ws.onmessage = (evt) => {
+  es.onmessage = (evt) => {
     try {
       const data = JSON.parse(evt.data);
       if (data.anchors && data.summary) {
-        console.log('scry: WS push received, anchors:', data.anchors.length);
+        console.log('scry: SSE event received, anchors:', data.anchors.length);
         applyData(data);
       }
-    } catch(e) { console.error('scry: WS message parse error', e); }
+    } catch(e) { console.error('scry: SSE message parse error', e); }
   };
 }
 
-function disconnectWS() {
-  const ws = _ws;
-  _ws = null;  // clear first so onclose doesn't reconnect
-  if (ws) { ws.onclose = null; ws.close(); }
+function disconnectLive() {
+  const es = _ws;
+  _ws = null;
+  if (es) { es.close(); }
   document.getElementById('ws-status').textContent = '⏸ paused';
   document.getElementById('ws-status').style.color = 'var(--fg2)';
 }
 
 document.getElementById('refresh-btn').addEventListener('click', loadData);
 document.getElementById('auto-refresh-toggle').addEventListener('change', e => {
-  if (e.target.checked) connectWS(); else disconnectWS();
+  if (e.target.checked) connectLive(); else disconnectLive();
 });
 
-// Initial load via HTTP, then connect WS for live updates.
-console.log('scry: calling loadData + connectWS');
+// Initial load via HTTP, then connect SSE for live updates.
+console.log('scry: calling loadData + connectLive');
 loadData();
 if (document.getElementById('auto-refresh-toggle').checked) {
-  connectWS();
+  connectLive();
 }
 
 function driftSeverity(status) {
