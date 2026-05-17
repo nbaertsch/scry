@@ -234,9 +234,9 @@ class TestDashboardHTML:
         assert "esc(a.path)" in DASHBOARD_HTML
         assert "esc(other)" in DASHBOARD_HTML
 
-    def test_html_has_graph_size_guard(self) -> None:
-        """Large graphs should be guarded to prevent browser freeze."""
-        assert "MAX_GRAPH_NODES" in DASHBOARD_HTML
+    def test_html_has_no_graph_size_cap(self) -> None:
+        """Graph rendering is uncapped — no MAX_GRAPH_NODES guard."""
+        assert "MAX_GRAPH_NODES" not in DASHBOARD_HTML
 
 
 # ──────────────────────────────────────────────────────────────────────

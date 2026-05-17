@@ -877,15 +877,6 @@ function renderGraph() {
     return;
   }
 
-  const MAX_GRAPH_NODES = 300;
-  if (nodes.length > MAX_GRAPH_NODES) {
-    container.innerHTML = `<div style="padding:40px;text-align:center;color:var(--fg2)">
-      Graph disabled: ${nodes.length} linked anchors exceeds the ${MAX_GRAPH_NODES}-node rendering limit.<br>
-      Use the <strong>Anchor Explorer</strong> tab to browse anchors and links.
-    </div>`;
-    return;
-  }
-
   const svg = d3.select(container).append('svg')
     .attr('width', width).attr('height', height)
     .attr('viewBox', [0, 0, width, height]);
