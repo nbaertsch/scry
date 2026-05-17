@@ -135,7 +135,11 @@ _DETECT_SKIP_DIRS: set[str] = {
 }
 
 
-def _detect_repo_languages(repo: Path, max_files: int = 5000) -> list[str]:
+def _detect_repo_languages(
+    repo: Path,
+    max_files: int = 5000,
+    skip_dirs: frozenset[str] = frozenset(),
+) -> list[str]:
     """Return ordered include-glob list based on what's present in *repo*.
 
     UAT-4: scry init previously hard-coded include = [md, py, ts] and
@@ -143,14 +147,26 @@ def _detect_repo_languages(repo: Path, max_files: int = 5000) -> list[str]:
     inspects up to ``max_files`` files (cap to keep large repos fast)
     and emits every glob whose extension was seen at least once.
 
+    ``skip_dirs`` is a set of absolute directory paths (as POSIX strings
+    relative to *repo*) to prune in addition to the built-in skip set.
+    Pass vendored-toolchain directories so the file-count cap isn't
+    exhausted on stdlib files in e.g. ``.tooling/zig-*/lib/`` before
+    the walk ever reaches the real project sources.
+
     Always includes ``**/*.md`` so doc anchors keep working in any
     repo, even one without explicit Markdown files yet.
     """
     seen_globs: set[str] = {"**/*.md"}
     files_checked = 0
-    for _dirpath, dirnames, filenames in os.walk(repo):
-        # In-place prune skip dirs.
-        dirnames[:] = [d for d in dirnames if d not in _DETECT_SKIP_DIRS]
+    repo_resolved = repo.resolve()
+    skip_abs = {(repo_resolved / s).resolve() for s in skip_dirs}
+    for dirpath, dirnames, filenames in os.walk(repo):
+        # In-place prune skip dirs (by name and by vendored-toolchain abs path).
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _DETECT_SKIP_DIRS
+            and (Path(dirpath) / d).resolve() not in skip_abs
+        ]
         for name in filenames:
             files_checked += 1
             if files_checked > max_files:
@@ -643,7 +659,16 @@ def init(ctx: click.Context, force: bool, register_global: bool, max_files: int)
     # actually present.  Without this, polyglot repos (Go/Rust/JS)
     # silently get a Python+TS+MD-only config and an indexer that
     # silently drops half their codebase.
-    detected_globs = _detect_repo_languages(repo)
+    #
+    # Detect vendored toolchains FIRST so the language-detection walk
+    # skips e.g. ``.tooling/zig-*/lib/`` (thousands of stdlib files)
+    # before exhausting its file-count cap and missing real project
+    # sources like Python files outside the toolchain.
+    early_toolchain_excludes = _detect_vendored_toolchain_excludes(repo)
+    early_toolchain_skip_dirs = frozenset(
+        excl.removesuffix("/**") for excl, _ in early_toolchain_excludes
+    )
+    detected_globs = _detect_repo_languages(repo, skip_dirs=early_toolchain_skip_dirs)
     config_text = _render_config_yaml(detected_globs)
     config_path.write_text(config_text, encoding="utf-8")
     click.echo(f"Wrote {config_path}")
