@@ -435,9 +435,7 @@ class AnchorLinkProjection(BaseModel):
     def serialize(self) -> dict[str, Any]:
         """Serialize with `transitive_hash_status` omitted for non-CODE targets."""
         d = self.model_dump()
-        if self.to_type != AnchorType.CODE.value and "transitive_hash_status" in d:
-            d.pop("transitive_hash_status")
-        if d.get("transitive_hash_status") is None and self.to_type != AnchorType.CODE.value:
+        if self.to_type != AnchorType.CODE.value:
             d.pop("transitive_hash_status", None)
         return d
 

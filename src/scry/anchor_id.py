@@ -92,9 +92,8 @@ def short_content_hash(text: str, *, length: int = 8) -> str:
     Default length is 8, matching the anonymous block-ID format (§15.3):
     ``block-<short-content-hash>``.
     """
-    canonical = canonicalize_content(text)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return digest[:length]
+    # Strip the "sha256:" prefix and truncate.
+    return content_hash(text).removeprefix("sha256:")[:length]
 
 
 def fingerprint_simhash(text: str) -> int:
