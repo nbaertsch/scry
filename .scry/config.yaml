@@ -43,5 +43,6 @@ drift:
   semantic_drift_threshold: 0.25
 
 llm:
-  provider: ollama
-  model: llama3.2
+  provider: litellm
+  model: azure/gpt-5.5
+  base_url: https://noah-research-openai-sweden-cent.services.ai.azure.com/

@@ -16,10 +16,12 @@ Key invariants (§10.2 v3.1):
     2.  Only after the OS lock is held does the caller bind its IPC endpoint
         and then call :meth:`LeaderLock.write_metadata`.
 
-    3.  Stale-lock detection relies entirely on the OS: ``fcntl.flock`` /
-        ``msvcrt.locking`` are released automatically by the kernel when the
-        holding process dies.  **No PID-liveness checks; no force-stealing.**
-        (See DESIGN.md §13 Q11 for the idempotency-cache open question.)
+    3.  Stale-lock detection: ``fcntl.flock`` / ``msvcrt.locking`` are
+        released automatically by the kernel when the holding process dies.
+        As a defense-in-depth for Windows (where ``uv.exe`` parent kills
+        can orphan child fds), :meth:`LeaderLock.try_acquire` checks the
+        recorded PID liveness when the OS lock is contended.  If the PID
+        is confirmed dead, the lock file is removed and acquisition retried.
 
     4.  The boot-epoch token (UUIDv4) guards against PID recycling: after a
         crash and restart, a new scry process with the same PID generates a
@@ -210,6 +212,31 @@ def _read_path_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if *pid* refers to a running process (best-effort).
+
+    On Windows, avoids ``os.kill(pid, 0)`` which can leak an inheritable
+    process handle (CPython opens with PROCESS_ALL_ACCESS).  Instead we use
+    ctypes to call OpenProcess with bInheritHandle=FALSE and immediately
+    close the handle.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    # POSIX: signal 0 is the standard liveness check.
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, SystemError):
+        return False
+
+
 # ── Public types ───────────────────────────────────────────────────────────────
 
 
@@ -308,6 +335,11 @@ class LeaderLock:
         Returns a held :class:`LeaderLock` instance on success, or ``None``
         if another process already holds the lock.
 
+        If the lock is held but the recorded PID is confirmed dead (process
+        was force-killed or orphaned), the stale lock file is removed and
+        acquisition is retried once.  This handles the Windows case where
+        ``uv.exe`` parent termination orphans the child holding the fd.
+
         Raises :exc:`OSError` if the lock file cannot be opened (e.g. the
         ``.scry/`` directory does not exist — run ``scry init`` first).
         """
@@ -315,6 +347,24 @@ class LeaderLock:
         fd = _open_lock_file(instance._lock_path)
         if not _try_lock(fd):
             os.close(fd)
+            # Check if the holder is dead — if so, force-recover.
+            metadata = _read_path_json(instance._lock_path)
+            if metadata is not None:
+                pid = metadata.get("pid")
+                if pid is not None and not _pid_alive(pid):
+                    logger.warning(
+                        "scry: leader lock held by dead PID %s — forcing recovery",
+                        pid,
+                    )
+                    with contextlib.suppress(OSError):
+                        os.unlink(instance._lock_path)
+                    # Retry once.
+                    fd2 = _open_lock_file(instance._lock_path)
+                    if _try_lock(fd2):
+                        instance._fd = fd2
+                        instance._locked = True
+                        return instance
+                    os.close(fd2)
             return None
         instance._fd = fd
         instance._locked = True

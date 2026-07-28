@@ -498,15 +498,21 @@ class LiteLLMProvider:
             ) from exc
         self._litellm: Any = litellm
         self._model = config.model
+        self._base_url = config.base_url
         self._timeout = config.timeout
 
     async def complete(self, req: LLMRequest) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _build_messages(req),
-            "temperature": req.temperature,
             "timeout": self._timeout,
         }
+        if self._base_url:
+            kwargs["api_base"] = self._base_url
+        # Some models (e.g. Azure gpt-5.x) reject temperature=0; only
+        # send it when explicitly non-zero.
+        if req.temperature != 0.0:
+            kwargs["temperature"] = req.temperature
         if req.max_tokens is not None:
             kwargs["max_tokens"] = req.max_tokens
         if req.json_mode:

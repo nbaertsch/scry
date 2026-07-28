@@ -1091,16 +1091,25 @@ To prevent the "stale sub-chunk attached to fresh parent hash" race:
 
 | Tool | Purpose |
 |---|---|
-| `search(query, types?, top_k?)` | Hybrid retrieval; returns ranked anchor packets |
-| `get_anchor(id)` | Full content of an anchor by ID |
+| `search(query, types?, top_k?, exclude_tests?)` | Hybrid BM25 + vector retrieval; returns ranked anchor packets |
+| `get_anchor(anchor_id)` | Full content of an anchor by ID (no truncation) |
 | `get_links(anchor_id, link_types?, direction?)` | Bidirectional link enumeration; inverse names rendered for `direction=incoming` |
-| `find_drift(scope?, status_filter?)` | List anchors/links with drift status > `fresh` |
+| `find_drift(scope?, status_filter?, since?)` | Evaluate section-level drift for active links; `since` accepts a git ref for diff-scoped results |
 | `propose_link(from_id, to_id, link_type, evidence?)` | Stages a link in the overlay (§3.5.4) |
 | `accept_link(proposed_id)` | Marks an overlay-staged proposal as accepted (still overlay; promote with `commit_links`) |
 | `commit_links(scope?)` | Promote accepted overlay records to the baseline `links.jsonl` |
+| `unlink(link_id, reason?)` | Tombstone a link; the `link_id` is permanently reserved |
 | `status()` | Return pending overlay records, merge conflicts, index state |
-| `repo_summary()` | One-shot orientation: file tree, classified docs, top symbols, drift + coverage scores |
-| `reindex(scope?)` | Force re-extraction (default is incremental on file change) |
+| `repo_summary()` | One-shot orientation: anchor counts, drift + coverage scores |
+| `reindex(scope?, force?)` | Force re-extraction (default is incremental on file change) |
+| `get_callers(anchor_id, max_depth?)` | LSP-backed: symbols that call a given code anchor |
+| `get_subclasses(anchor_id)` | LSP-backed: classes that extend a given class anchor |
+| `suggest_links_candidates(scope?, source?, limit?)` | Surface (code, doc) pair candidates + classifier prompt for agent-side LLM classification |
+| `apply_link_suggestions(suggestions, pair_payloads, min_confidence?, apply?)` | Apply or preview agent-classified link suggestions |
+
+All write tools accept an `idempotency_token` parameter for safe retries.
+All tools carry explicit `readOnlyHint` / `destructiveHint` / `idempotentHint`
+annotations so MCP clients can distinguish safe queries from mutations.
 
 CLI surface mirrors the MCP tools 1:1.
 
@@ -1286,6 +1295,13 @@ When the only process running is the leader, behavior is:
 1. Load `.scry/config.yaml`
 2. **Acquire leader lock first** (§10.2 step 1). This is the
    serialization barrier — no DB writes happen before this.
+   - **2b. Stale-PID recovery (Windows):** if `try_acquire` fails,
+     read the lock metadata and check if the recorded PID is alive
+     via `os.kill(pid, 0)`. If the PID is dead (process was
+     force-killed or orphaned by a parent `uv.exe` termination),
+     remove the stale lock file and re-acquire. This prevents
+     dangling locks from blocking subsequent startups after unclean
+     shutdowns (e.g. Copilot CLI session kill).
 3. Bind IPC endpoint (Unix socket or Windows named pipe) per §10.3.
 4. Open vector store read-write
 5. Verify `.scry/vectors.db` exists; auto-reconcile (§7.2) or

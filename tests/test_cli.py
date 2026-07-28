@@ -891,11 +891,24 @@ class TestMCP:
         # Exit 0: clean EOF. Non-zero is acceptable only if an error is printed.
         assert result.returncode == 0, result.stderr.decode(errors="replace")
 
-    def test_mcp_missing_config_exits_1(self, runner: CliRunner, tmp_path: Path) -> None:
-        """scry mcp exits 1 when .scry/config.yaml is missing."""
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "FastMCP's anyio-backed stdio transport hangs on stdin EOF "
+            "under Windows ProactorEventLoop (same as test above)."
+        ),
+    )
+    def test_mcp_malformed_config_exits_1(self, runner: CliRunner, tmp_path: Path) -> None:
+        """scry mcp exits 1 when .scry/config.yaml is malformed.
+
+        Note: missing config no longer causes exit 1 because the MCP server
+        auto-creates a default config on first launch.
+        """
         with runner.isolated_filesystem(temp_dir=tmp_path):
             repo = Path.cwd()
-            (repo / ".scry").mkdir()
+            scry_dir = repo / ".scry"
+            scry_dir.mkdir()
+            (scry_dir / "config.yaml").write_text("{{{{invalid yaml", encoding="utf-8")
             old_cwd = Path.cwd()
             try:
                 os.chdir(repo)

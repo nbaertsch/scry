@@ -19,11 +19,16 @@ cosine_similarity       — ad-hoc cosine scoring between serialized blobs
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
+import os
 import struct
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 import sqlite_vec
 
@@ -236,12 +241,40 @@ class StubEmbedder:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _default_model_cache_dir() -> Path:
+    """Return a stable platform-appropriate cache directory for model weights.
+
+    Uses ``%LOCALAPPDATA%/scry/models`` on Windows, ``~/.cache/scry/models``
+    elsewhere.  Falls back to fastembed's default (system temp) only if the
+    preferred location cannot be created.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            p = Path(base) / "scry" / "models"
+        else:
+            p = Path.home() / ".cache" / "scry" / "models"
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        if xdg:
+            p = Path(xdg) / "scry" / "models"
+        else:
+            p = Path.home() / ".cache" / "scry" / "models"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except OSError:
+        # Fall back to letting fastembed decide (system temp).
+        return None  # type: ignore[return-value]
+
+
 class LocalFastEmbedder:
     """fastembed-backed embedder.  Lazy-loads the model on first :meth:`encode`.
 
     Default model: ``BAAI/bge-small-en-v1.5`` (384 dimensions, ~30 MB ONNX
     weights, no API key required).  The model is downloaded to *cache_dir*
-    (or the fastembed default ``~/.cache/fastembed``) on first use.
+    (or ``%LOCALAPPDATA%/scry/models`` on Windows, ``~/.cache/scry/models``
+    elsewhere) on first use.
 
     Thread-safety: the lazy-init guard is not thread-safe.  For concurrent
     use, instantiate from a single thread or guard externally.
@@ -265,11 +298,12 @@ class LocalFastEmbedder:
                 breaking the §7.2.1 model-mismatch detector and the
                 ``--reembed`` migration path.
             cache_dir:  Directory for model weight caching.  ``None`` uses
-                the fastembed default (``~/.cache/fastembed``).
+                ``%LOCALAPPDATA%/scry/models`` (Windows) or
+                ``~/.cache/scry/models`` (elsewhere).
         """
         self._model_name = model_name
         self._dimensions = dimensions
-        self._cache_dir = cache_dir
+        self._cache_dir = cache_dir or _default_model_cache_dir()
         self._model: Any = None  # fastembed.TextEmbedding; typed Any (no stubs)
         self._dimensions_validated = False
 
@@ -294,7 +328,12 @@ class LocalFastEmbedder:
         return None
 
     def _ensure_model(self) -> None:
-        """Lazily initialise the fastembed TextEmbedding model."""
+        """Lazily initialise the fastembed TextEmbedding model.
+
+        If the cached model files are corrupt or missing (e.g. system temp
+        cleanup deleted the ONNX weights), clears the offending cache entry
+        and retries the download once.
+        """
         if self._model is not None:
             return
         try:
@@ -308,7 +347,39 @@ class LocalFastEmbedder:
         kwargs: dict[str, Any] = {"model_name": self._model_name}
         if self._cache_dir is not None:
             kwargs["cache_dir"] = str(self._cache_dir)
-        self._model = fastembed.TextEmbedding(**kwargs)
+
+        try:
+            self._model = fastembed.TextEmbedding(**kwargs)
+        except Exception as exc:
+            # Detect corrupt/missing model files in cache and retry once.
+            exc_str = str(exc)
+            if "NO_SUCHFILE" in exc_str or "Load model" in exc_str:
+                logger.warning(
+                    "scry: cached model files appear corrupt — clearing cache "
+                    "entry and re-downloading model '%s'",
+                    self._model_name,
+                )
+                self._clear_corrupt_cache()
+                # Retry — this will trigger a fresh download.
+                self._model = fastembed.TextEmbedding(**kwargs)
+            else:
+                raise
+
+    def _clear_corrupt_cache(self) -> None:
+        """Remove the corrupt model cache directory so fastembed re-downloads."""
+        import shutil
+
+        if self._cache_dir is None:
+            return
+        cache_path = Path(self._cache_dir)
+        if not cache_path.exists():
+            return
+        # fastembed stores models as models--<org>--<model>-onnx-q
+        model_slug = self._model_name.replace("/", "--")
+        for entry in cache_path.iterdir():
+            if model_slug in entry.name and entry.is_dir():
+                logger.info("scry: removing corrupt cache entry: %s", entry)
+                shutil.rmtree(entry, ignore_errors=True)
 
     def encode(self, texts: list[str]) -> list[bytes]:
         """Batch-encode *texts* using fastembed.
