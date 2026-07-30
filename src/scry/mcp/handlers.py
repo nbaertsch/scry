@@ -1871,6 +1871,107 @@ async def apply_link_suggestions(
     return out
 
 
+# ─── Semantic audit (agent-driven) ────────────────────────────────────────────
+
+
+async def audit_candidates(
+    ctx: MCPContext,
+    *,
+    scope: str | None = None,
+    limit: int | None = 20,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """Return doc↔code pairs for an LLM agent to audit for semantic drift.
+
+    No LLM call is made by scry — the calling agent (Claude/Copilot)
+    evaluates the pairs itself, then feeds findings back to
+    :func:`apply_audit_findings`.
+
+    Args:
+        ctx:   Injected :class:`MCPContext`.
+        scope: Optional path-prefix filter for doc anchors.
+        limit: Maximum doc anchors to include. Defaults to 20.
+        top_k: Code neighbors per doc anchor.
+
+    Returns:
+        Dict with ``system_prompt``, ``schema``, and ``pairs`` list.
+    """
+    from scry.audit import AuditConfig, build_audit_payload, select_audit_pairs
+
+    replay = ctx.overlay_mgr.replay_active()
+    cfg = AuditConfig(scope=scope, limit=limit, top_k=top_k)
+    pairs = select_audit_pairs(
+        db=ctx.db,
+        active_links=replay.active_links,
+        embedder=ctx.embedder,
+        config=cfg,
+    )
+    return build_audit_payload(pairs, cfg)
+
+
+async def apply_audit_findings(
+    ctx: MCPContext,
+    *,
+    findings: list[dict[str, Any]] | dict[str, Any],
+    pair_payloads: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Parse and return validated audit findings from an agent's response.
+
+    Companion to :func:`audit_candidates`: takes the agent's structured
+    JSON response and returns validated, severity-sorted findings.
+
+    Args:
+        ctx:           Injected :class:`MCPContext`.
+        findings:      The agent's JSON response (dict with ``findings`` key,
+                       or a list of finding objects directly).
+        pair_payloads: The ``pairs`` array from the original
+                       ``audit_candidates`` response (needed to map pair_ids
+                       back to anchors).
+
+    Returns:
+        Dict with ``findings`` list and ``summary`` counts.
+    """
+    from scry.audit import AuditConfig, AuditFinding, parse_agent_audit, select_audit_pairs
+
+    # Re-select pairs to get the Anchor objects for mapping
+    replay = ctx.overlay_mgr.replay_active()
+    cfg = AuditConfig(limit=None)  # No limit — we need all pairs to resolve pair_ids
+    pairs = select_audit_pairs(
+        db=ctx.db,
+        active_links=replay.active_links,
+        embedder=ctx.embedder,
+        config=cfg,
+    )
+
+    # Normalize input
+    if isinstance(findings, list):
+        findings_data: dict[str, Any] = {"findings": findings}
+    else:
+        findings_data = findings
+
+    parsed = parse_agent_audit(findings_data, pairs=pairs)
+
+    high = sum(1 for f in parsed if f.severity == "HIGH")
+    medium = sum(1 for f in parsed if f.severity == "MEDIUM")
+    low = sum(1 for f in parsed if f.severity == "LOW")
+
+    return {
+        "findings": [
+            {
+                "doc_path": f.doc_path,
+                "section": f.doc_section,
+                "severity": f.severity,
+                "doc_claim": f.doc_claim,
+                "code_reality": f.code_reality,
+                "code_path": f.code_path,
+                "suggestion": f.suggestion,
+            }
+            for f in parsed
+        ],
+        "summary": {"total": len(parsed), "high": high, "medium": medium, "low": low},
+    }
+
+
 # ─── Dispatch table ───────────────────────────────────────────────────────────
 
 #: Maps MCP tool names to their handler functions.
@@ -1892,4 +1993,7 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     # UAT-R5-2: agent-driven suggest-links (no scry-side LLM required).
     "suggest_links_candidates": suggest_links_candidates,
     "apply_link_suggestions": apply_link_suggestions,
+    # Semantic audit (agent-driven).
+    "audit_candidates": audit_candidates,
+    "apply_audit_findings": apply_audit_findings,
 }

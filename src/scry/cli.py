@@ -2730,6 +2730,225 @@ def suggest_links(
     click.echo(f"Wrote {written} link(s) to overlay.")
 
 
+# ─── scry audit ───────────────────────────────────────────────────────────────
+
+
+@main.command("audit")
+@click.option("--scope", default=None, help="Restrict audit to doc anchors under this path prefix.")
+@click.option("--limit", default=None, type=int, help="Maximum doc anchors to audit.")
+@click.option(
+    "--batch-size",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Doc anchors per LLM request.",
+)
+@click.option(
+    "--top-k",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Code neighbors to retrieve per doc anchor.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output findings as JSON.")
+@click.option(
+    "--candidates-only",
+    is_flag=True,
+    help=(
+        "Print audit pairs + classifier prompt as JSON for an external agent "
+        "(Claude/Copilot) instead of running scry's own LLM."
+    ),
+)
+@click.option(
+    "--from-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Feed agent-classified audit results back from a JSON file.",
+)
+@click.pass_context
+def audit(
+    ctx: click.Context,
+    scope: str | None,
+    limit: int | None,
+    batch_size: int,
+    top_k: int,
+    as_json: bool,
+    candidates_only: bool,
+    from_file: Path | None,
+) -> None:
+    """Semantic documentation audit — find docs that no longer match code.
+
+    Unlike hash-based drift (scry check), this uses an LLM to compare doc
+    content against related code and identify factual inaccuracies, stale
+    references, and missing behavior.
+
+    Use --candidates-only to produce JSON for an external LLM agent.
+    Use --from-file to apply an agent's classified response.
+
+    Exit codes: 0 = no drift found, 1 = drift findings exist, 2 = error.
+    """
+    import asyncio as _asyncio
+
+    from scry.audit import (
+        AuditConfig,
+        AuditFinding,
+        build_audit_payload,
+        parse_agent_audit,
+        run_audit,
+        select_audit_pairs,
+    )
+    from scry.store.links import LinkStore as _LinkStore
+
+    repo = _resolve_repo_root(ctx)
+    db_path = repo / ".scry" / "vectors.db"
+    if not db_path.exists():
+        click.echo("error: vectors.db not found. Run `scry index` first.", err=True)
+        raise SystemExit(1) from None
+
+    try:
+        config = load_config(repo)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    audit_cfg = AuditConfig(
+        scope=scope,
+        limit=limit,
+        batch_size=batch_size,
+        top_k=top_k,
+    )
+
+    if candidates_only and from_file is not None:
+        click.echo(
+            "error: --candidates-only and --from-file are mutually exclusive.",
+            err=True,
+        )
+        raise SystemExit(2) from None
+
+    try:
+        with ScryDB(repo, read_only=True) as db:
+            git_ctx = GitContextProvider(repo)
+            base_link_store = _LinkStore(repo)
+            overlay_mgr = OverlayManager(repo, git_context=git_ctx, link_store=base_link_store)
+            overlay = overlay_mgr.current_overlay_path()
+
+            class _BranchLinkStore(_LinkStore):
+                def replay(self, *, overlay_path: Path | None = None) -> Any:
+                    return super().replay(overlay_path=overlay_path or overlay)
+
+            link_store = _BranchLinkStore(repo)
+            active_links = link_store.replay().active_links
+            embedder = _get_embedder(config)
+
+            if candidates_only:
+                pairs = select_audit_pairs(
+                    db=db, active_links=active_links, embedder=embedder, config=audit_cfg
+                )
+                if not pairs:
+                    click.echo('{"pairs": [], "_count": 0}')
+                    return
+                payload = build_audit_payload(pairs, audit_cfg)
+                click.echo(json.dumps(payload, indent=2))
+                return
+
+            if from_file is not None:
+                pairs = select_audit_pairs(
+                    db=db, active_links=active_links, embedder=embedder, config=audit_cfg
+                )
+                if not pairs:
+                    click.echo("No doc↔code pairs to audit.")
+                    return
+                try:
+                    agent_payload = json.loads(from_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    click.echo(f"error: --from-file: {exc}", err=True)
+                    raise SystemExit(2) from None
+                findings = parse_agent_audit(agent_payload, pairs=pairs)
+                _emit_audit_findings(findings, as_json=as_json)
+                if findings:
+                    raise SystemExit(1) from None
+                return
+
+            # Full LLM-powered audit
+            from scry.llm import LLMError, make_provider
+
+            try:
+                provider = make_provider(config.llm)
+            except (LLMError, Exception) as exc:
+                click.echo(
+                    f"error: LLM provider not available: {exc}\n"
+                    "  Hint: use --candidates-only to produce JSON for an external agent,\n"
+                    "  or configure an LLM provider in .scry/config.yaml.",
+                    err=True,
+                )
+                raise SystemExit(2) from None
+
+            result = _asyncio.run(
+                run_audit(
+                    db=db,
+                    active_links=active_links,
+                    embedder=embedder,
+                    provider=provider,
+                    config=audit_cfg,
+                )
+            )
+
+            click.echo(
+                f"Audited {result.docs_audited} doc sections "
+                f"({result.errors} errors, {result.total_tokens} tokens)."
+            )
+            _emit_audit_findings(result.findings, as_json=as_json)
+            if result.findings:
+                raise SystemExit(1) from None
+
+    except (LockTimeout, OSError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(2) from None
+
+
+def _emit_audit_findings(findings: list[Any], *, as_json: bool) -> None:
+    """Print audit findings in human or JSON format."""
+    if not findings:
+        click.echo("✓ No semantic drift found.")
+        return
+
+    if as_json:
+        click.echo(json.dumps(
+            [
+                {
+                    "doc_path": f.doc_path,
+                    "section": f.doc_section,
+                    "severity": f.severity,
+                    "doc_claim": f.doc_claim,
+                    "code_reality": f.code_reality,
+                    "code_path": f.code_path,
+                    "suggestion": f.suggestion,
+                }
+                for f in findings
+            ],
+            indent=2,
+        ))
+        return
+
+    high = [f for f in findings if f.severity == "HIGH"]
+    medium = [f for f in findings if f.severity == "MEDIUM"]
+    low = [f for f in findings if f.severity == "LOW"]
+
+    click.echo(f"\n⚠  {len(findings)} drift finding(s): "
+               f"{len(high)} HIGH, {len(medium)} MEDIUM, {len(low)} LOW\n")
+
+    for f in findings:
+        icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(f.severity, "⚪")
+        click.echo(f"{icon} [{f.severity}] {f.doc_path}")
+        if f.doc_section and f.doc_section != f.doc_path:
+            click.echo(f"   Section: {f.doc_section}")
+        click.echo(f"   Doc says: {f.doc_claim}")
+        click.echo(f"   Code does: {f.code_reality}")
+        click.echo(f"   Fix: {f.suggestion}")
+        click.echo(f"   Related code: {f.code_path}")
+        click.echo()
+
+
 # ─── scry reconcile ───────────────────────────────────────────────────────────
 
 
