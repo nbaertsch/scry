@@ -589,7 +589,7 @@ async def test_reindex_follower_raises(git_repo: Path) -> None:
 
 
 def test_handlers_dict_covers_all_tools() -> None:
-    """HANDLERS covers all 17 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven + 2 audit)."""
+    """HANDLERS covers all 18 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven + 2 audit + 1 working_context)."""
     expected = {
         "search",
         "get_anchor",
@@ -611,6 +611,8 @@ def test_handlers_dict_covers_all_tools() -> None:
         # Semantic audit (agent-driven)
         "audit_candidates",
         "apply_audit_findings",
+        # Agent context helper
+        "working_context",
     }
     assert set(HANDLERS.keys()) == expected
 

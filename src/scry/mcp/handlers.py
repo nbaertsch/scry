@@ -1972,7 +1972,110 @@ async def apply_audit_findings(
     }
 
 
-# ─── Dispatch table ───────────────────────────────────────────────────────────
+# ─── Working Context (agent helper) ──────────────────────────────────────────
+
+
+async def working_context(
+    ctx: MCPContext,
+    *,
+    paths: list[str],
+    include_content: bool = False,
+) -> dict[str, Any]:
+    """Return contextual information for an agent working on specific files.
+
+    Given a list of file paths the agent is about to read or edit, returns:
+    - Related documentation sections (via links)
+    - Drift status of those links (are the docs stale?)
+    - Key architectural facts about the area
+    - Suggested verification steps
+
+    This helps agents avoid relying on stale documentation and directs them
+    to the actual source of truth.
+
+    Args:
+        ctx:             Injected :class:`MCPContext`.
+        paths:           List of relative file paths the agent is working on.
+        include_content: If True, include anchor content_text in results.
+
+    Returns:
+        Dict with per-file context: linked docs, drift status, warnings.
+    """
+    replay = _replay_active(ctx.overlay_mgr)
+    conflicts = set(replay.merge_conflicts)
+
+    results: dict[str, Any] = {}
+
+    for file_path in paths[:10]:  # Cap at 10 files per call
+        # Normalize path separators
+        normalized = file_path.replace("\\", "/").lstrip("./")
+
+        # Find all anchors in this file
+        file_anchors = [
+            a for a in ctx.db.list_anchors()
+            if a.file_path and a.file_path.replace("\\", "/") == normalized
+        ]
+
+        if not file_anchors:
+            results[normalized] = {"found": False, "message": f"No anchors indexed for {normalized}"}
+            continue
+
+        # Find all links involving these anchors
+        anchor_ids = {a.id for a in file_anchors}
+        related_links = []
+        for link in replay.active_links.values():
+            if link.from_id in anchor_ids or link.to_id in anchor_ids:
+                related_links.append(link)
+
+        # Evaluate drift for these links
+        drifted_docs: list[dict[str, Any]] = []
+        fresh_docs: list[dict[str, Any]] = []
+        for link in related_links:
+            ev = evaluate_link_drift(link, db=ctx.db, merge_conflicts=conflicts, config=ctx.config.drift)
+            doc_id = link.to_id if link.from_id in anchor_ids else link.from_id
+            doc_anchor = ctx.db.get_anchor(doc_id)
+            entry: dict[str, Any] = {
+                "doc_anchor": doc_id,
+                "link_type": str(link.type),
+                "drift_status": str(ev.drift_status),
+            }
+            if include_content and doc_anchor:
+                entry["content_preview"] = (doc_anchor.content_text or "")[:500]
+            if ev.drift_status not in ("fresh",):
+                entry["warning"] = f"This doc section may be STALE (status: {ev.drift_status})"
+                drifted_docs.append(entry)
+            else:
+                fresh_docs.append(entry)
+
+        # Build file context
+        file_result: dict[str, Any] = {
+            "found": True,
+            "anchors": len(file_anchors),
+            "symbols": [a.id.split(":")[-1] if ":" in a.id else a.id for a in file_anchors[:20]],
+            "linked_docs": {
+                "fresh": fresh_docs[:10],
+                "drifted": drifted_docs,
+            },
+            "total_links": len(related_links),
+        }
+
+        # Add warnings if drift detected
+        if drifted_docs:
+            file_result["warning"] = (
+                f"{len(drifted_docs)} linked doc section(s) may be stale. "
+                "Verify claims against this code before relying on those docs. "
+                "After making changes, update the linked docs to match."
+            )
+
+        results[normalized] = file_result
+
+    return {
+        "context": results,
+        "advice": (
+            "Code is the source of truth. If any linked docs show drift, "
+            "read the actual code to understand current behavior. "
+            "After changing code, update linked documentation to stay in sync."
+        ),
+    }
 
 #: Maps MCP tool names to their handler functions.
 #: Used by the leader IPC handler and by ``_dispatch`` in ``server.py``.
@@ -1996,4 +2099,6 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     # Semantic audit (agent-driven).
     "audit_candidates": audit_candidates,
     "apply_audit_findings": apply_audit_findings,
+    # Agent context helper.
+    "working_context": working_context,
 }
