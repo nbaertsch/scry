@@ -44,6 +44,7 @@ from scry.mcp.handlers import (
     repo_summary,
     search,
     status,
+    version_info,
 )
 from scry.mcp.server import MCPServer
 from scry.models import (
@@ -589,7 +590,7 @@ async def test_reindex_follower_raises(git_repo: Path) -> None:
 
 
 def test_handlers_dict_covers_all_tools() -> None:
-    """HANDLERS covers all 18 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven + 2 audit + 1 working_context)."""
+    """HANDLERS covers all 19 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven + 2 audit + 1 working_context + 1 version_info)."""
     expected = {
         "search",
         "get_anchor",
@@ -613,6 +614,8 @@ def test_handlers_dict_covers_all_tools() -> None:
         "apply_audit_findings",
         # Agent context helper
         "working_context",
+        # Version introspection
+        "version_info",
     }
     assert set(HANDLERS.keys()) == expected
 
@@ -761,6 +764,38 @@ async def test_lifecycle_recover_pending_called(tmp_path: Path) -> None:
     # recover_pending is callable (already ran, so we just check the obj).
     assert hasattr(server._ctx.overlay_mgr, "recover_pending")
     await server.stop()
+
+
+# ─── Tests: version_info ─────────────────────────────────────────────────────
+
+
+async def test_version_info_returns_expected_keys(git_repo: Path) -> None:
+    """version_info() returns version, platform, and min_compatible_version."""
+    ctx = _make_ctx(git_repo)
+    result = await version_info(ctx)
+    assert "version" in result
+    assert "install_commit" in result
+    assert "min_compatible_version" in result
+    assert "python_version" in result
+    assert "platform" in result
+
+
+async def test_version_info_version_matches_package(git_repo: Path) -> None:
+    """version_info().version matches scry.__version__."""
+    import scry
+
+    ctx = _make_ctx(git_repo)
+    result = await version_info(ctx)
+    assert result["version"] == scry.__version__
+
+
+async def test_version_info_min_compatible_is_semver(git_repo: Path) -> None:
+    """min_compatible_version is a valid semver string."""
+    ctx = _make_ctx(git_repo)
+    result = await version_info(ctx)
+    parts = result["min_compatible_version"].split(".")
+    assert len(parts) == 3
+    assert all(p.isdigit() for p in parts)
 
 
 # uat-r5-5 pr-d noise

@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import scry
 from scry.drift import DriftEvaluation, compute_drift_summary, evaluate_link_drift
 from scry.embed import Embedder
 from scry.git_context import GitContextProvider, get_current_user
@@ -77,6 +78,7 @@ __all__ = [
     "status",
     "suggest_links_candidates",
     "unlink",
+    "version_info",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1157,6 +1159,47 @@ async def status(ctx: MCPContext) -> dict[str, Any]:
     }
 
 
+async def version_info(ctx: MCPContext) -> dict[str, Any]:
+    """Return scry version metadata for staleness detection.
+
+    Agents and SDKs can call this tool to check whether the installed
+    scry version is current.  The response includes the semantic version,
+    the git commit SHA the package was built from (if available via
+    ``importlib.metadata``), and the minimum version that ``.mcp.json``
+    consumers should require.
+
+    Returns:
+        Dict with keys: ``version``, ``install_commit``,
+        ``min_compatible_version``, ``python_version``, ``platform``.
+    """
+    import importlib.metadata
+    import platform
+    import sys
+
+    # Try to extract the git commit SHA from the installed package metadata.
+    # When installed via `git+https://...@<sha>`, the direct_url.json contains it.
+    install_commit: str | None = None
+    try:
+        dist = importlib.metadata.distribution("scry-cli")
+        direct_url_text = dist.read_text("direct_url.json")
+        if direct_url_text:
+            import json
+
+            direct_url = json.loads(direct_url_text)
+            vcs_info = direct_url.get("vcs_info", {})
+            install_commit = vcs_info.get("commit_id")
+    except (importlib.metadata.PackageNotFoundError, Exception):
+        pass
+
+    return {
+        "version": scry.__version__,
+        "install_commit": install_commit,
+        "min_compatible_version": "0.2.0",
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "platform": platform.system(),
+    }
+
+
 async def repo_summary(ctx: MCPContext) -> dict[str, Any]:
     """Return a high-level repository summary with drift score.
 
@@ -2101,4 +2144,6 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     "apply_audit_findings": apply_audit_findings,
     # Agent context helper.
     "working_context": working_context,
+    # Version introspection.
+    "version_info": version_info,
 }

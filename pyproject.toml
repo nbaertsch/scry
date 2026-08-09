@@ -1,6 +1,6 @@
 [project]
 name = "scry-cli"
-version = "0.0.1"
+version = "0.2.0"
 description = "Local-first MCP server for code↔spec drift detection via hybrid retrieval"
 readme = "README.md"
 requires-python = ">=3.11"

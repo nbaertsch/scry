@@ -85,8 +85,7 @@ from scry.store.overlay import OverlayManager
 
 logger = logging.getLogger(__name__)
 
-# scry semantic version exposed in leader lock metadata.
-_SCRY_VERSION = "0.2.0"
+# scry semantic version — single source of truth is scry.__version__.
 
 
 # ─── SR4-4: strip noisy tracebacks for expected validation errors ────────
@@ -593,6 +592,20 @@ class MCPServer:
                 ),
             )
 
+        @mcp.tool(annotations=_read)
+        async def version_info() -> dict[str, Any]:
+            """Return scry version metadata for staleness detection.
+
+            Agents and SDKs call this to check whether the installed scry
+            version is current.  Returns the semantic version, the git
+            commit SHA the package was built from, and the minimum
+            compatible version.
+            """
+            return cast(
+                dict[str, Any],
+                await self._dispatch("version_info", {}),
+            )
+
     # ─── Dispatch ────────────────────────────────────────────────────────────
 
     async def _dispatch(self, op: str, args: dict[str, Any]) -> Any:
@@ -898,7 +911,7 @@ class MCPServer:
             if endpoint_uri is not None:
                 leader_lock.write_metadata(
                     endpoint_uri=endpoint_uri,
-                    scry_version=_SCRY_VERSION,
+                    scry_version=scry.__version__,
                 )
 
             self._ctx = ctx
