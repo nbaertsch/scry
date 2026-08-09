@@ -69,3 +69,8 @@ htmlcov/
 .ruff_cache/
 
 .env
+
+# Scry runtime artifacts
+.scry/check_output.json
+.scry/full_check.json
+.scry/status.json

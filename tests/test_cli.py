@@ -969,7 +969,7 @@ class TestGlobalFlags:
             result = runner.invoke(main, ["--version"], env=_STUB_ENV, catch_exceptions=False)
         assert result.exit_code == 0
         assert "scry" in result.output
-        assert "0.0.1" in result.output
+        assert "0.2.0" in result.output
 
 
 # uat-r5-5 pr-d noise

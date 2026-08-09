@@ -770,14 +770,17 @@ async def test_lifecycle_recover_pending_called(tmp_path: Path) -> None:
 
 
 async def test_version_info_returns_expected_keys(git_repo: Path) -> None:
-    """version_info() returns version, platform, and min_compatible_version."""
+    """version_info() returns version, platform, update info, and min_compatible_version."""
     ctx = _make_ctx(git_repo)
     result = await version_info(ctx)
     assert "version" in result
     assert "install_commit" in result
     assert "min_compatible_version" in result
+    assert "update_available" in result
+    assert "update_command" in result
     assert "python_version" in result
     assert "platform" in result
+    assert result["update_command"] == "scry self-update"
 
 
 async def test_version_info_version_matches_package(git_repo: Path) -> None:

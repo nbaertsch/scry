@@ -1162,22 +1162,21 @@ async def status(ctx: MCPContext) -> dict[str, Any]:
 async def version_info(ctx: MCPContext) -> dict[str, Any]:
     """Return scry version metadata for staleness detection.
 
-    Agents and SDKs can call this tool to check whether the installed
-    scry version is current.  The response includes the semantic version,
-    the git commit SHA the package was built from (if available via
-    ``importlib.metadata``), and the minimum version that ``.mcp.json``
-    consumers should require.
+    Agents and SDKs should call this tool at session start to check
+    whether the installed scry version is current.  If ``update_available``
+    is true, offer to run ``scry self-update`` (or the shell command in
+    ``update_command``) to bring scry up to date.
 
     Returns:
         Dict with keys: ``version``, ``install_commit``,
-        ``min_compatible_version``, ``python_version``, ``platform``.
+        ``min_compatible_version``, ``update_command``,
+        ``update_available``, ``python_version``, ``platform``.
     """
     import importlib.metadata
     import platform
+    import subprocess
     import sys
 
-    # Try to extract the git commit SHA from the installed package metadata.
-    # When installed via `git+https://...@<sha>`, the direct_url.json contains it.
     install_commit: str | None = None
     try:
         dist = importlib.metadata.distribution("scry-cli")
@@ -1191,10 +1190,31 @@ async def version_info(ctx: MCPContext) -> dict[str, Any]:
     except (importlib.metadata.PackageNotFoundError, Exception):
         pass
 
+    # Check if an update is available by comparing installed commit to remote HEAD.
+    update_available: bool | None = None
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "https://github.com/nbaertsch/scry.git", "refs/heads/main"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            remote_sha = result.stdout.strip().split()[0]
+            if install_commit:
+                update_available = not (
+                    remote_sha.startswith(install_commit)
+                    or install_commit.startswith(remote_sha)
+                )
+    except Exception:
+        pass  # Network unavailable — don't block on this.
+
     return {
         "version": scry.__version__,
         "install_commit": install_commit,
         "min_compatible_version": "0.2.0",
+        "update_available": update_available,
+        "update_command": "scry self-update",
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "platform": platform.system(),
     }

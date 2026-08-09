@@ -594,12 +594,13 @@ class MCPServer:
 
         @mcp.tool(annotations=_read)
         async def version_info() -> dict[str, Any]:
-            """Return scry version metadata for staleness detection.
+            """Return scry version metadata and update availability.
 
-            Agents and SDKs call this to check whether the installed scry
-            version is current.  Returns the semantic version, the git
-            commit SHA the package was built from, and the minimum
-            compatible version.
+            **Agent instructions**: Call this tool at session start.  If
+            the response has ``"update_available": true``, inform the user
+            that a scry update is available and offer to run the command
+            in ``update_command`` (typically ``scry self-update``).  After
+            updating, restart the MCP session for changes to take effect.
             """
             return cast(
                 dict[str, Any],

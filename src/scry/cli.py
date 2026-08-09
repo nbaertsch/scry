@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import platform
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -3621,6 +3622,81 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
         # mask the original error from the user.
         with contextlib.suppress(Exception):
             asyncio.run(server.stop())
+
+
+# ─── scry self-update ─────────────────────────────────────────────────────────
+
+
+_SCRY_INSTALL_SPEC = "scry-cli @ git+https://github.com/nbaertsch/scry@main"
+
+
+@main.command("self-update")
+@click.option("--check", is_flag=True, help="Only check if an update is available; don't install.")
+def self_update(check: bool) -> None:
+    """Update scry to the latest version from the main branch.
+
+    Uses ``uv tool install --force`` to pull the latest commit.
+    With ``--check``, fetches remote HEAD and compares to the installed
+    commit without installing.
+    """
+    import importlib.metadata
+
+    import scry
+
+    current_version = scry.__version__
+    install_commit: str | None = None
+    try:
+        dist = importlib.metadata.distribution("scry-cli")
+        direct_url_text = dist.read_text("direct_url.json")
+        if direct_url_text:
+            vcs_info = json.loads(direct_url_text).get("vcs_info", {})
+            install_commit = vcs_info.get("commit_id")
+    except Exception:
+        pass
+
+    if check:
+        # Fetch remote HEAD SHA without cloning.
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "https://github.com/nbaertsch/scry.git", "refs/heads/main"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            remote_sha = result.stdout.strip().split()[0] if result.stdout.strip() else None
+        except Exception:
+            remote_sha = None
+
+        click.echo(f"Installed version: {current_version}")
+        click.echo(f"Installed commit:  {install_commit or 'unknown'}")
+        click.echo(f"Remote HEAD:       {remote_sha or 'could not fetch'}")
+        if remote_sha and install_commit:
+            if remote_sha.startswith(install_commit) or install_commit.startswith(remote_sha):
+                click.echo("✓ Up to date.")
+            else:
+                click.echo("⚠ Update available. Run: scry self-update")
+                raise SystemExit(1)
+        else:
+            click.echo("? Could not determine update status.")
+        return
+
+    click.echo(f"Updating scry from {current_version} (commit {install_commit or 'unknown'})...")
+    # Prefer uv (fast), fall back to pip.
+    uv = shutil.which("uv")
+    if uv:
+        cmd = [uv, "tool", "install", "--force", _SCRY_INSTALL_SPEC]
+    else:
+        pip = shutil.which("pip") or sys.executable + " -m pip"
+        cmd = [pip, "install", "--force-reinstall", _SCRY_INSTALL_SPEC]
+
+    click.echo(f"Running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode == 0:
+        click.echo("✓ scry updated successfully. Restart any running MCP sessions.")
+    else:
+        click.echo(f"✗ Update failed (exit {proc.returncode}):", err=True)
+        click.echo(proc.stderr or proc.stdout, err=True)
+        raise SystemExit(proc.returncode)
 
 
 if __name__ == "__main__":  # pragma: no cover
