@@ -210,6 +210,9 @@ def extract_claims(doc_path: str, text: str) -> list[Claim]:
     sections = _parse_sections(text)
     seen_ids: set[str] = set()
 
+    # Track fenced code blocks for context
+    in_fenced_block = False
+
     for section in sections:
         section_title = " > ".join(section.heading_path) if section.heading_path else ""
         section_text = "\n".join(section.lines)
@@ -217,8 +220,16 @@ def extract_claims(doc_path: str, text: str) -> list[Claim]:
         for line_offset, line in enumerate(section.lines):
             line_no = section.start_line + line_offset
 
+            # Track fenced code blocks — skip content inside them
+            stripped = line.strip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fenced_block = not in_fenced_block
+                continue
+            if in_fenced_block:
+                continue
+
             # Skip pure headings, empty lines, and HTML comments
-            if not line.strip() or line.strip().startswith("#") or line.strip().startswith("<!--"):
+            if not stripped or stripped.startswith("#") or stripped.startswith("<!--"):
                 continue
 
             # --- Symbol existence claims ---
@@ -227,6 +238,10 @@ def extract_claims(doc_path: str, text: str) -> list[Claim]:
                 if len(sym) < 3 or sym.isdigit() or sym.isupper():
                     continue
                 if _is_noise_symbol(sym, line):
+                    continue
+                # Context: if preceded by = or : it's likely a value, not a symbol
+                pre_ctx = line[:m.start()]
+                if pre_ctx.rstrip().endswith(("=", ":", "=>", "set to", "value")):
                     continue
                 claim = Claim(
                     doc_path=doc_path,
