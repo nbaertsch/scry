@@ -30,6 +30,13 @@ import scry.claims.verifiers.paths  # noqa: F401
 import scry.claims.verifiers.envvar  # noqa: F401
 
 
+def _evidence_changed(cached: VerificationResult, changed_files: set[str]) -> bool:
+    """Check if any evidence files are in the changed file set."""
+    if not changed_files:
+        return False
+    return any(e.file_path in changed_files for e in cached.evidence if e.file_path)
+
+
 def _find_doc_files(repo_root: Path, paths: list[str] | None = None) -> list[str]:
     """Find markdown doc files to verify.
 
@@ -92,6 +99,7 @@ def verify_docs(
     changed_only: bool = False,
     store: ClaimStore | None = None,
     skip_llm: bool = True,
+    use_cache: bool = True,
 ) -> VerificationReport:
     """Extract claims from docs and verify them against code.
 
@@ -101,6 +109,7 @@ def verify_docs(
         changed_only: Only verify claims impacted by changed files.
         store: Optional ClaimStore for persistence.
         skip_llm: Skip claims that need LLM verification.
+        use_cache: Use cached verdicts when code hasn't changed.
 
     Returns:
         VerificationReport with all results.
@@ -150,6 +159,7 @@ def verify_docs(
         store.upsert_claims(all_claims)
 
     # Verify each claim
+    changed_file_set = changed_files or set()
     for claim in all_claims:
         if skip_llm and claim.needs_llm:
             result = VerificationResult(
@@ -159,13 +169,37 @@ def verify_docs(
                 verifier="skip_llm",
             )
         else:
-            result = verify_claim(claim, repo_root, index)
+            # Check cache: skip if verdict exists and evidence files unchanged
+            cached = store.get_latest_verdict(claim.id) if (store and use_cache) else None
+            if cached and cached.code_fingerprint and not _evidence_changed(cached, changed_file_set):
+                result = cached
+            else:
+                result = verify_claim(claim, repo_root, index)
+                # Set code fingerprint from evidence files
+                if result.evidence:
+                    fp_parts = sorted({e.file_path for e in result.evidence if e.file_path})
+                    fingerprint = hashlib.sha256("|".join(fp_parts).encode()).hexdigest()[:16]
+                    object.__setattr__(result, "code_fingerprint", fingerprint)
 
         report.add(result)
 
-        # Persist verdict
+        # Persist verdict and auto-generate dependencies
         if store:
             store.save_verdict(result)
+            # Generate dependencies from evidence
+            if result.evidence:
+                deps = [
+                    ClaimDependency(
+                        claim_id=claim.id,
+                        file_path=e.file_path,
+                        symbol=e.symbol,
+                        kind=DependencyKind.SYMBOL if e.symbol else DependencyKind.FILE,
+                    )
+                    for e in result.evidence
+                    if e.file_path
+                ]
+                if deps:
+                    store.upsert_dependencies(deps)
 
     return report
 
