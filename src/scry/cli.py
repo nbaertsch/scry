@@ -3716,6 +3716,79 @@ def verify_cmd(
         store.close()
 
 
+# ─── scry hooks ───────────────────────────────────────────────────────────────
+
+
+@main.group("hooks")
+def hooks_group() -> None:
+    """Manage git hooks for automatic claim verification."""
+    pass
+
+
+@hooks_group.command("install")
+@click.option("--pre-commit", "hook_type", flag_value="pre-commit", default=True, help="Install as pre-commit hook.")
+@click.option("--pre-push", "hook_type", flag_value="pre-push", help="Install as pre-push hook.")
+@click.pass_context
+def hooks_install(ctx: click.Context, hook_type: str) -> None:
+    """Install a git hook that runs scry verify --changed on commits/pushes."""
+    import stat
+
+    repo_root = _resolve_repo_root(ctx)
+    hooks_dir = repo_root / ".git" / "hooks"
+    if not hooks_dir.exists():
+        click.echo("Error: .git/hooks directory not found. Are you in a git repo?", err=True)
+        raise SystemExit(1)
+
+    hook_path = hooks_dir / hook_type
+    hook_script = f"""#!/bin/sh
+# Scry claim verification hook (installed by `scry hooks install`)
+scry verify --changed --fail-on error 2>/dev/null
+"""
+
+    if hook_path.exists():
+        existing = hook_path.read_text(encoding="utf-8")
+        if "scry verify" in existing:
+            click.echo(f"Hook {hook_type} already has scry verify. Skipping.")
+            return
+        # Append to existing hook
+        with open(hook_path, "a", encoding="utf-8") as f:
+            f.write("\n" + hook_script.lstrip("#!/bin/sh\n"))
+        click.echo(f"Appended scry verify to existing {hook_type} hook.")
+    else:
+        hook_path.write_text(hook_script, encoding="utf-8")
+        hook_path.chmod(hook_path.stat().st_mode | stat.S_IEXEC)
+        click.echo(f"Installed {hook_type} hook at {hook_path}")
+
+
+@hooks_group.command("uninstall")
+@click.option("--pre-commit", "hook_type", flag_value="pre-commit", default=True)
+@click.option("--pre-push", "hook_type", flag_value="pre-push")
+@click.pass_context
+def hooks_uninstall(ctx: click.Context, hook_type: str) -> None:
+    """Remove scry verify from a git hook."""
+    repo_root = _resolve_repo_root(ctx)
+    hook_path = repo_root / ".git" / "hooks" / hook_type
+
+    if not hook_path.exists():
+        click.echo(f"No {hook_type} hook found.")
+        return
+
+    content = hook_path.read_text(encoding="utf-8")
+    if "scry verify" not in content:
+        click.echo(f"No scry verify found in {hook_type} hook.")
+        return
+
+    # Remove scry lines
+    lines = [l for l in content.splitlines() if "scry verify" not in l and "Scry claim verification" not in l]
+    remaining = "\n".join(lines).strip()
+    if remaining == "#!/bin/sh" or not remaining:
+        hook_path.unlink()
+        click.echo(f"Removed {hook_type} hook (was scry-only).")
+    else:
+        hook_path.write_text(remaining + "\n", encoding="utf-8")
+        click.echo(f"Removed scry verify from {hook_type} hook.")
+
+
 # ─── scry self-update ─────────────────────────────────────────────────────────
 
 

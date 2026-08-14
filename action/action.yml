@@ -1,0 +1,102 @@
+name: "Scry Verify"
+description: "Verify documentation claims against source code using scry"
+branding:
+  icon: "check-circle"
+  color: "purple"
+
+inputs:
+  paths:
+    description: "Space-separated paths to verify (default: all docs)"
+    required: false
+    default: ""
+  changed-only:
+    description: "Only verify claims impacted by changed files"
+    required: false
+    default: "false"
+  fail-on:
+    description: "Exit non-zero threshold: 'error', 'warn', or 'none'"
+    required: false
+    default: "error"
+  format:
+    description: "Output format: 'text', 'json', or 'sarif'"
+    required: false
+    default: "sarif"
+  upload-sarif:
+    description: "Upload SARIF to GitHub Code Scanning"
+    required: false
+    default: "true"
+  scry-version:
+    description: "Scry version/ref to install (default: main)"
+    required: false
+    default: "main"
+
+outputs:
+  total-claims:
+    description: "Total claims extracted"
+    value: ${{ steps.verify.outputs.total-claims }}
+  contradicted:
+    description: "Number of contradicted claims"
+    value: ${{ steps.verify.outputs.contradicted }}
+  sarif-file:
+    description: "Path to generated SARIF file"
+    value: ${{ steps.verify.outputs.sarif-file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: Install scry
+      shell: bash
+      run: uv tool install "scry-cli @ git+https://github.com/nbaertsch/scry@${{ inputs.scry-version }}"
+
+    - name: Run scry verify
+      id: verify
+      shell: bash
+      run: |
+        ARGS=""
+        if [ -n "${{ inputs.paths }}" ]; then
+          ARGS="${{ inputs.paths }}"
+        fi
+        if [ "${{ inputs.changed-only }}" = "true" ]; then
+          ARGS="$ARGS --changed"
+        fi
+
+        SARIF_FILE=""
+        if [ "${{ inputs.format }}" = "sarif" ]; then
+          SARIF_FILE="scry-verify.sarif"
+          ARGS="$ARGS --format sarif --output $SARIF_FILE"
+        else
+          ARGS="$ARGS --format ${{ inputs.format }}"
+        fi
+
+        ARGS="$ARGS --fail-on ${{ inputs.fail-on }}"
+
+        echo "Running: scry verify $ARGS"
+        scry verify $ARGS || EXIT_CODE=$?
+
+        # Parse stats from text output or SARIF
+        if [ -n "$SARIF_FILE" ] && [ -f "$SARIF_FILE" ]; then
+          TOTAL=$(python3 -c "import json; d=json.load(open('$SARIF_FILE')); print(len(d['runs'][0]['results']))" 2>/dev/null || echo "0")
+          echo "total-claims=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+        fi
+
+        CONTRADICTED=$(python3 -c "
+        import json, sys
+        try:
+            d=json.load(open('$SARIF_FILE'))
+            print(sum(1 for r in d['runs'][0]['results'] if r.get('level')=='error'))
+        except: print('0')
+        " 2>/dev/null || echo "0")
+        echo "contradicted=$CONTRADICTED" >> "$GITHUB_OUTPUT"
+
+        exit ${EXIT_CODE:-0}
+
+    - name: Upload SARIF
+      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: scry-verify.sarif
+        category: scry-claim-verification
