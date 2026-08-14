@@ -3639,10 +3639,11 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
 @click.option(
     "--format",
     "fmt",
-    type=click.Choice(["text", "json"]),
+    type=click.Choice(["text", "json", "sarif"]),
     default="text",
     help="Output format.",
 )
+@click.option("--output", "-o", "output_file", type=click.Path(), default=None, help="Write output to file (useful for SARIF).")
 @click.option("--show-confirmed", is_flag=True, help="Also show confirmed claims in output.")
 @click.pass_context
 def verify_cmd(
@@ -3651,6 +3652,7 @@ def verify_cmd(
     changed: bool,
     fail_on: str,
     fmt: str,
+    output_file: str | None,
     show_confirmed: bool,
 ) -> None:
     """Verify documentation claims against source code.
@@ -3685,15 +3687,25 @@ def verify_cmd(
         )
 
         # Collect claims for enriched output
-        all_claims = store.get_all_claims() if fmt == "text" else None
+        all_claims = store.get_all_claims() if fmt in ("text", "sarif") else None
 
-        output = format_report(
-            report,
-            claims=all_claims,
-            format=fmt,
-            show_confirmed=show_confirmed,
-        )
-        click.echo(output)
+        if fmt == "sarif":
+            from scry.claims.sarif import generate_sarif
+            output = generate_sarif(report, report.results, all_claims or [])
+        else:
+            output = format_report(
+                report,
+                claims=all_claims,
+                format=fmt,
+                show_confirmed=show_confirmed,
+            )
+
+        if output_file:
+            from pathlib import Path as P
+            P(output_file).write_text(output, encoding="utf-8")
+            click.echo(f"Report written to {output_file}")
+        else:
+            click.echo(output)
 
         # Exit code based on --fail-on
         if fail_on == "error" and report.contradicted > 0:
