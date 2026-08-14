@@ -87,14 +87,58 @@ _ENVVAR_NOISE = frozenset({
     "WAL", "FTS", "UUID", "SHA", "LLM", "MCP", "CLI", "AST",
     "NOTE", "TODO", "FIXME", "HACK", "XXX", "WIP",
     "TABLE", "INDEX", "WHERE", "FROM", "INTO", "SELECT",
+    # Common prose/status words that happen to be ALL_CAPS in markdown
+    "PULLING", "PUSHING", "RUNNING", "BUILDING", "DEPLOYING",
+    "CANCELLED", "FAILED", "COMPLETED", "PENDING", "BLOCKED",
+    "ENABLED", "DISABLED", "REQUIRED", "OPTIONAL", "DEFAULT",
+    "EXAMPLE", "WARNING", "ERROR", "INFO", "DEBUG", "CRITICAL",
+    "IMPORTANT", "RECOMMENDED", "DEPRECATED", "BREAKING",
+    "MUST", "SHALL", "SHOULD", "WILL", "WOULD", "COULD", "MAY",
 })
 
-# Common noise symbols to skip
+# Common noise symbols to skip — builtins, generic words, prose terms
 _SYMBOL_NOISE = frozenset({
+    # Python builtins/types
     "True", "False", "None", "self", "cls", "str", "int", "float",
     "bool", "list", "dict", "set", "tuple", "bytes", "type",
-    "Optional", "Any", "Union", "Literal",
+    "Optional", "Any", "Union", "Literal", "object", "super",
+    "print", "len", "range", "enumerate", "isinstance", "hasattr",
+    # Generic prose/log words often backticked
+    "crash", "error", "warning", "info", "debug", "success", "failure",
+    "running", "pending", "done", "cancelled", "failed", "completed",
+    "pulling", "pushing", "building", "deploying", "testing",
+    "enabled", "disabled", "active", "inactive", "ready", "blocked",
+    "default", "custom", "manual", "automatic", "required", "optional",
+    "example", "output", "input", "result", "response", "request",
+    "config", "settings", "options", "params", "args", "kwargs",
+    # File extensions / formats when standalone
+    "json", "yaml", "toml", "csv", "html", "xml", "txt", "log", "md",
+    # Common short tokens that are never real symbols
+    "id", "ok", "on", "off", "up", "no", "yes",
 })
+
+# Bare filenames that are config/docs, not code symbols
+_FILENAME_NOISE_RE = re.compile(
+    r"^[a-z][\w.-]*\.(ya?ml|json|toml|md|txt|cfg|ini|env|lock|log|sh|bat|ps1)$",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_symbol(sym: str, line: str) -> bool:
+    """Enhanced noise detection for symbol claims."""
+    # Already in static noise set
+    if sym in _SYMBOL_NOISE or sym.lower() in {s.lower() for s in _SYMBOL_NOISE}:
+        return True
+    # All-lowercase single word under 6 chars with no underscores — likely prose
+    if len(sym) < 6 and sym.islower() and "_" not in sym and "." not in sym:
+        return True
+    # Looks like a bare filename (config.yaml, setup.py, etc.)
+    if _FILENAME_NOISE_RE.match(sym):
+        return True
+    # Pure gerund/past-tense verbs (ends in ing/ed) — likely prose
+    if sym.islower() and (sym.endswith("ing") or sym.endswith("ed")) and "_" not in sym:
+        return True
+    return False
 
 
 # ───── Section parser ────────────────────────────────────────────────
@@ -180,10 +224,9 @@ def extract_claims(doc_path: str, text: str) -> list[Claim]:
             # --- Symbol existence claims ---
             for m in _BACKTICK_RE.finditer(line):
                 sym = m.group(1)
-                if sym in _SYMBOL_NOISE or len(sym) < 3:
+                if len(sym) < 3 or sym.isdigit() or sym.isupper():
                     continue
-                # Skip if it looks like a value, not a symbol
-                if sym.isdigit() or sym.isupper():
+                if _is_noise_symbol(sym, line):
                     continue
                 claim = Claim(
                     doc_path=doc_path,
