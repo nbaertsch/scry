@@ -181,8 +181,14 @@ def _extract_python(source: str, rel_path: str, index: RepoIndex) -> None:
     except SyntaxError:
         return
 
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.parent = parent  # type: ignore[attr-defined]
+
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            if isinstance(getattr(node, "parent", None), ast.ClassDef):
+                continue
             _add_symbol(index, node.name, "function", rel_path, node.lineno, source)
         elif isinstance(node, ast.ClassDef):
             _add_symbol(index, node.name, "class", rel_path, node.lineno, source)

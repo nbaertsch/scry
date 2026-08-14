@@ -49,9 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_claims_type ON claims(claim_type);
 CREATE TABLE IF NOT EXISTS claim_deps (
     claim_id    TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
     file_path   TEXT NOT NULL,
-    symbol      TEXT,
+    symbol      TEXT NOT NULL DEFAULT '',
     kind        TEXT NOT NULL DEFAULT 'file',
-    PRIMARY KEY (claim_id, file_path, COALESCE(symbol, ''))
+    PRIMARY KEY (claim_id, file_path, symbol)
 );
 
 CREATE INDEX IF NOT EXISTS idx_claim_deps_file ON claim_deps(file_path);
@@ -175,7 +175,7 @@ class ClaimStore:
         """Insert or replace claim dependencies."""
         conn = self._connect()
         rows = [
-            (d.claim_id, d.file_path, d.symbol, d.kind.value)
+            (d.claim_id, d.file_path, d.symbol or "", d.kind.value)
             for d in deps
         ]
         conn.executemany(
