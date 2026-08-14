@@ -3624,6 +3624,86 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
             asyncio.run(server.stop())
 
 
+# ─── scry verify ──────────────────────────────────────────────────────────────
+
+
+@main.command("verify")
+@click.argument("paths", nargs=-1, type=click.Path())
+@click.option("--changed", is_flag=True, help="Only verify claims impacted by changed files.")
+@click.option(
+    "--fail-on",
+    type=click.Choice(["error", "warn", "none"]),
+    default="none",
+    help="Exit non-zero on failures: 'error' for contradicted, 'warn' for incomplete too.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.option("--show-confirmed", is_flag=True, help="Also show confirmed claims in output.")
+@click.pass_context
+def verify_cmd(
+    ctx: click.Context,
+    paths: tuple[str, ...],
+    changed: bool,
+    fail_on: str,
+    fmt: str,
+    show_confirmed: bool,
+) -> None:
+    """Verify documentation claims against source code.
+
+    Extracts atomic, verifiable claims from markdown docs (symbol names,
+    numeric defaults, API routes, env vars, enum counts) and checks each
+    one against the actual codebase.  No LLM required.
+
+    \b
+    Examples:
+        scry verify                        # verify all docs
+        scry verify docs/reference/        # verify one directory
+        scry verify --changed              # only claims touched by diff
+        scry verify --fail-on error        # CI mode: exit 1 on failures
+        scry verify --format json          # machine-readable output
+    """
+    from scry.claims.orchestrator import format_report, verify_docs
+    from scry.claims.store import ClaimStore
+
+    repo_root = _resolve_repo_root(ctx)
+    scry_dir = repo_root / ".scry"
+    scry_dir.mkdir(exist_ok=True)
+
+    store = ClaimStore(scry_dir / "claims.db")
+    try:
+        path_list = list(paths) if paths else None
+        report = verify_docs(
+            repo_root,
+            paths=path_list,
+            changed_only=changed,
+            store=store,
+        )
+
+        # Collect claims for enriched output
+        all_claims = store.get_all_claims() if fmt == "text" else None
+
+        output = format_report(
+            report,
+            claims=all_claims,
+            format=fmt,
+            show_confirmed=show_confirmed,
+        )
+        click.echo(output)
+
+        # Exit code based on --fail-on
+        if fail_on == "error" and report.contradicted > 0:
+            raise SystemExit(1)
+        elif fail_on == "warn" and (report.contradicted > 0 or report.incomplete > 0):
+            raise SystemExit(1)
+    finally:
+        store.close()
+
+
 # ─── scry self-update ─────────────────────────────────────────────────────────
 
 

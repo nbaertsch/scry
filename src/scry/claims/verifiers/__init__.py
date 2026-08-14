@@ -16,6 +16,7 @@ from scry.claims.model import (
     ClaimType,
     VerificationResult,
 )
+from scry.claims.repo_index import RepoIndex
 
 
 @runtime_checkable
@@ -32,7 +33,7 @@ class Verifier(Protocol):
         """Claim types this verifier can handle."""
         ...
 
-    def verify(self, claim: Claim, repo_root: Path) -> VerificationResult:
+    def verify(self, claim: Claim, repo_root: Path, index: RepoIndex) -> VerificationResult:
         """Verify a single claim against the codebase at repo_root."""
         ...
 
@@ -49,41 +50,7 @@ class BaseVerifier(ABC):
     def supported_types(self) -> frozenset[ClaimType]: ...
 
     @abstractmethod
-    def verify(self, claim: Claim, repo_root: Path) -> VerificationResult: ...
-
-    def _search_files(
-        self,
-        repo_root: Path,
-        pattern: str,
-        *,
-        glob_pattern: str = "**/*.py",
-    ) -> list[tuple[Path, int, str]]:
-        """Search files for a text pattern, return (path, line_no, line_text) tuples."""
-        import re
-
-        results: list[tuple[Path, int, str]] = []
-        compiled = re.compile(pattern)
-        for fp in repo_root.glob(glob_pattern):
-            if ".git" in fp.parts or "__pycache__" in fp.parts:
-                continue
-            try:
-                text = fp.read_text(encoding="utf-8", errors="ignore")
-            except (OSError, UnicodeDecodeError):
-                continue
-            for i, line in enumerate(text.splitlines(), 1):
-                if compiled.search(line):
-                    results.append((fp, i, line.strip()))
-        return results
-
-    def _read_file(self, repo_root: Path, rel_path: str) -> str | None:
-        """Read a file relative to repo root, return None if missing."""
-        fp = repo_root / rel_path
-        if not fp.is_file():
-            return None
-        try:
-            return fp.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            return None
+    def verify(self, claim: Claim, repo_root: Path, index: RepoIndex) -> VerificationResult: ...
 
 
 # ───── Registry ──────────────────────────────────────────────────────
@@ -103,7 +70,7 @@ def get_verifier(claim_type: ClaimType) -> Verifier | None:
     return REGISTRY.get(claim_type)
 
 
-def verify_claim(claim: Claim, repo_root: Path) -> VerificationResult:
+def verify_claim(claim: Claim, repo_root: Path, index: RepoIndex) -> VerificationResult:
     """Verify a single claim using the appropriate registered verifier."""
     from scry.claims.model import Verdict
 
@@ -115,4 +82,4 @@ def verify_claim(claim: Claim, repo_root: Path) -> VerificationResult:
             reason=f"No verifier registered for claim type '{claim.claim_type}'",
             verifier="dispatch",
         )
-    return verifier.verify(claim, repo_root)
+    return verifier.verify(claim, repo_root, index)
