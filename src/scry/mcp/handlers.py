@@ -34,6 +34,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import scry
+from scry.claims.extractor import extract_claims_from_file
+from scry.claims.model import ClaimType
+from scry.claims.orchestrator import verify_docs
+from scry.claims.store import ClaimStore
 from scry.drift import DriftEvaluation, compute_drift_summary, evaluate_link_drift
 from scry.embed import Embedder
 from scry.git_context import GitContextProvider, get_current_user
@@ -64,8 +68,10 @@ __all__ = [
     "MCPContext",
     "MCPServerError",
     "accept_link",
+    "affected_claims",
     "apply_link_suggestions",
     "commit_links",
+    "extract_claims",
     "find_drift",
     "get_anchor",
     "get_callers",
@@ -78,6 +84,7 @@ __all__ = [
     "status",
     "suggest_links_candidates",
     "unlink",
+    "verify_claims",
     "version_info",
 ]
 
@@ -2140,6 +2147,164 @@ async def working_context(
         ),
     }
 
+
+def _normalize_repo_relative_path(repo_root: Path, value: str, *, arg_name: str) -> str:
+    """Normalize a path-like MCP argument to a repo-relative forward-slash path."""
+    if not isinstance(value, str) or not value.strip():
+        raise MCPServerError(f"'{arg_name}' must be a non-empty string")
+    raw = value.strip()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.relative_to(repo_root)
+        except ValueError as exc:
+            raise MCPServerError(
+                f"'{arg_name}' must be inside the repository: {value!r}"
+            ) from exc
+    return str(candidate).replace("\\", "/").lstrip("./")
+
+
+def _normalize_stored_relpath(value: str | None) -> str | None:
+    """Normalize a stored repo-relative path for MCP responses."""
+    if value is None:
+        return None
+    return value.replace("\\", "/")
+
+
+async def extract_claims(
+    ctx: MCPContext,
+    doc_path: str,
+    *,
+    claim_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Extract verifiable claims from a documentation file."""
+    normalized_doc_path = _normalize_repo_relative_path(ctx.repo_root, doc_path, arg_name="doc_path")
+
+    claim_type_filter: ClaimType | None = None
+    if claim_type is not None:
+        if not isinstance(claim_type, str) or not claim_type.strip():
+            raise MCPServerError("'claim_type' must be a non-empty string when provided")
+        try:
+            claim_type_filter = ClaimType(claim_type.strip())
+        except ValueError as exc:
+            allowed = ", ".join(member.value for member in ClaimType)
+            raise MCPServerError(
+                f"Invalid claim_type {claim_type!r}. Expected one of: {allowed}"
+            ) from exc
+
+    claims = extract_claims_from_file(normalized_doc_path, ctx.repo_root)
+    if claim_type_filter is not None:
+        claims = [claim for claim in claims if claim.claim_type == claim_type_filter]
+
+    return [
+        {
+            "id": claim.id,
+            "type": claim.claim_type.value,
+            "text": claim.claim_text,
+            "span": claim.span.model_dump(),
+            "subject": claim.subject,
+        }
+        for claim in claims
+    ]
+
+
+async def verify_claims(
+    ctx: MCPContext,
+    *,
+    paths: list[str] | None = None,
+    changed_only: bool = False,
+) -> dict[str, Any]:
+    """Verify documentation claims for one or more doc paths."""
+    if not isinstance(changed_only, bool):
+        raise MCPServerError(f"'changed_only' must be a boolean, got {type(changed_only).__name__}")
+
+    normalized_paths: list[str] | None = None
+    if paths is not None:
+        if not isinstance(paths, list):
+            raise MCPServerError("'paths' must be a list of strings when provided")
+        normalized_paths = [
+            _normalize_repo_relative_path(ctx.repo_root, path, arg_name="paths[]")
+            for path in paths
+        ]
+
+    claims_db_path = ctx.repo_root / ".scry" / "claims.db"
+    store = ClaimStore(claims_db_path)
+    try:
+        report = verify_docs(
+            ctx.repo_root,
+            paths=normalized_paths,
+            changed_only=changed_only,
+            store=store,
+        )
+        claim_map = {claim.id: claim for claim in store.get_all_claims()}
+    finally:
+        store.close()
+
+    failures: list[dict[str, Any]] = []
+    for result in report.failed_results:
+        claim = claim_map.get(result.claim_id)
+        failures.append(
+            {
+                "claim_id": result.claim_id,
+                "doc_path": _normalize_stored_relpath(claim.doc_path) if claim is not None else None,
+                "claim_text": claim.claim_text if claim is not None else None,
+                "verdict": result.verdict.value,
+                "reason": result.reason,
+                "evidence": [e.model_dump() for e in result.evidence],
+            }
+        )
+
+    return {
+        "summary": {
+            "total_claims": report.total_claims,
+            "verified": report.verified,
+            "confirmed": report.confirmed,
+            "contradicted": report.contradicted,
+            "incomplete": report.incomplete,
+            "unverifiable": report.unverifiable,
+            "stale_target": report.stale_target,
+            "errors": report.errors,
+            "pass_rate": report.pass_rate,
+        },
+        "failures": failures,
+    }
+
+
+async def affected_claims(
+    ctx: MCPContext,
+    *,
+    changed_files: list[str],
+) -> list[dict[str, Any]]:
+    """Return stored claims whose dependencies include any changed file."""
+    if not isinstance(changed_files, list) or not changed_files:
+        raise MCPServerError("'changed_files' must be a non-empty list of strings")
+
+    normalized_files = [
+        _normalize_repo_relative_path(ctx.repo_root, changed_file, arg_name="changed_files[]")
+        for changed_file in changed_files
+    ]
+
+    claims_db_path = ctx.repo_root / ".scry" / "claims.db"
+    if not claims_db_path.exists():
+        return []
+
+    store = ClaimStore(claims_db_path)
+    try:
+        claim_map = {claim.id: claim for claim in store.get_all_claims()}
+        affected: dict[str, str] = {}
+        for changed_file in normalized_files:
+            for claim_id in store.get_claims_for_file(changed_file):
+                claim = claim_map.get(claim_id)
+                if claim is not None:
+                    affected[claim_id] = _normalize_stored_relpath(claim.doc_path) or ""
+    finally:
+        store.close()
+
+    return [
+        {"claim_id": claim_id, "doc_path": doc_path}
+        for claim_id, doc_path in sorted(affected.items(), key=lambda item: (item[1], item[0]))
+    ]
+
 #: Maps MCP tool names to their handler functions.
 #: Used by the leader IPC handler and by ``_dispatch`` in ``server.py``.
 HANDLERS: dict[str, Callable[..., Any]] = {
@@ -2164,6 +2329,10 @@ HANDLERS: dict[str, Callable[..., Any]] = {
     "apply_audit_findings": apply_audit_findings,
     # Agent context helper.
     "working_context": working_context,
+    # Claim extraction and verification.
+    "extract_claims": extract_claims,
+    "verify_claims": verify_claims,
+    "affected_claims": affected_claims,
     # Version introspection.
     "version_info": version_info,
 }

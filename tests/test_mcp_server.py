@@ -35,7 +35,9 @@ from scry.mcp.handlers import (
     MCPContext,
     MCPServerError,
     accept_link,
+    affected_claims,
     commit_links,
+    extract_claims,
     find_drift,
     get_anchor,
     get_links,
@@ -44,6 +46,7 @@ from scry.mcp.handlers import (
     repo_summary,
     search,
     status,
+    verify_claims,
     version_info,
 )
 from scry.mcp.server import MCPServer
@@ -586,11 +589,53 @@ async def test_reindex_follower_raises(git_repo: Path) -> None:
         await reindex(ctx)
 
 
+# ─── Tests: claim verification tools ─────────────────────────────────────────
+
+
+async def test_extract_claims_returns_filtered_claims(git_repo: Path) -> None:
+    """extract_claims() returns extracted claims and honors claim_type filter."""
+    ctx = _make_ctx(git_repo)
+    docs_dir = git_repo / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "claims.md").write_text("The implementation lives in `src/auth.py`.\n", encoding="utf-8")
+
+    result = await extract_claims(ctx, "docs/claims.md", claim_type="file_path")
+
+    assert len(result) == 1
+    assert result[0]["type"] == "file_path"
+    assert result[0]["text"] == "File `src/auth.py` exists"
+    assert result[0]["subject"] == "src/auth.py"
+
+
+async def test_verify_claims_and_affected_claims_round_trip(git_repo: Path) -> None:
+    """verify_claims() populates claims.db so affected_claims() can resolve dependencies."""
+    ctx = _make_ctx(git_repo)
+    (git_repo / "docs").mkdir()
+    (git_repo / "src").mkdir()
+    (git_repo / "src" / "auth.py").write_text("def verify_token() -> bool:\n    return True\n", encoding="utf-8")
+    (git_repo / "docs" / "claims.md").write_text(
+        "The implementation lives in `src/auth.py`.\n",
+        encoding="utf-8",
+    )
+
+    report = await verify_claims(ctx, paths=["docs/claims.md"])
+
+    assert report["summary"]["total_claims"] == 1
+    assert report["summary"]["confirmed"] == 1
+    assert report["failures"] == []
+
+    affected = await affected_claims(ctx, changed_files=["src/auth.py"])
+
+    assert len(affected) == 1
+    assert affected[0]["doc_path"] == "docs/claims.md"
+    assert affected[0]["claim_id"].startswith("claim_")
+
+
 # ─── Tests: HANDLERS dict ─────────────────────────────────────────────────────
 
 
 def test_handlers_dict_covers_all_tools() -> None:
-    """HANDLERS covers all 19 MCP tool names (12 base + 1 unlink + 2 UAT-R5-2 agent-driven + 2 audit + 1 working_context + 1 version_info)."""
+    """HANDLERS covers all registered MCP tool names."""
     expected = {
         "search",
         "get_anchor",
@@ -614,6 +659,10 @@ def test_handlers_dict_covers_all_tools() -> None:
         "apply_audit_findings",
         # Agent context helper
         "working_context",
+        # Claim extraction and verification
+        "extract_claims",
+        "verify_claims",
+        "affected_claims",
         # Version introspection
         "version_info",
     }
@@ -664,7 +713,17 @@ async def test_follower_read_dispatch_bypasses_ipc(git_repo: Path) -> None:
     server = MCPServer.__new__(MCPServer)
     server._ctx = ctx
 
-    read_ops = {"search", "get_anchor", "get_links", "find_drift", "status", "repo_summary"}
+    read_ops = {
+        "search",
+        "get_anchor",
+        "get_links",
+        "find_drift",
+        "status",
+        "repo_summary",
+        "extract_claims",
+        "verify_claims",
+        "affected_claims",
+    }
     for op in read_ops:
         mock_ipc.call.reset_mock()
         args: dict[str, Any] = {}
@@ -676,6 +735,24 @@ async def test_follower_read_dispatch_bypasses_ipc(git_repo: Path) -> None:
             args = {"anchor_id": _SPEC_ID, "link_types": None, "direction": "outgoing"}
         elif op == "find_drift":
             args = {"scope": None, "status_filter": None}
+        elif op == "extract_claims":
+            (git_repo / "docs").mkdir(exist_ok=True)
+            (git_repo / "docs" / "claims.md").write_text(
+                "The implementation lives in `src/auth.py`.\n",
+                encoding="utf-8",
+            )
+            args = {"doc_path": "docs/claims.md", "claim_type": None}
+        elif op == "verify_claims":
+            (git_repo / "docs").mkdir(exist_ok=True)
+            (git_repo / "src").mkdir(exist_ok=True)
+            (git_repo / "src" / "auth.py").write_text("pass\n", encoding="utf-8")
+            (git_repo / "docs" / "claims.md").write_text(
+                "The implementation lives in `src/auth.py`.\n",
+                encoding="utf-8",
+            )
+            args = {"paths": ["docs/claims.md"], "changed_only": False}
+        elif op == "affected_claims":
+            args = {"changed_files": ["src/auth.py"]}
 
         await server._dispatch(op, args)
         mock_ipc.call.assert_not_awaited()

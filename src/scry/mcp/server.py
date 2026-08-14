@@ -593,6 +593,51 @@ class MCPServer:
             )
 
         @mcp.tool(annotations=_read)
+        async def extract_claims(
+            doc_path: str,
+            claim_type: str | None = None,
+        ) -> list[dict[str, Any]]:
+            """Extract verifiable claims from a markdown document."""
+            return cast(
+                list[dict[str, Any]],
+                await self._dispatch(
+                    "extract_claims",
+                    {"doc_path": doc_path, "claim_type": claim_type},
+                ),
+            )
+
+        @mcp.tool(annotations=_read)
+        async def verify_claims(
+            paths: list[str] | None = None,
+            changed_only: Annotated[bool, Field(strict=True)] = False,
+        ) -> dict[str, Any]:
+            """Verify extracted doc claims against the repository source of truth.
+
+            Returns summary counters plus a ``failures`` list containing
+            claim text, verdict, reason, and supporting evidence.
+            ``paths`` defaults to all docs; ``changed_only=True`` narrows
+            verification to docs touched by the current git diff.
+            """
+            return cast(
+                dict[str, Any],
+                await self._dispatch(
+                    "verify_claims",
+                    {"paths": paths, "changed_only": changed_only},
+                ),
+            )
+
+        @mcp.tool(annotations=_read)
+        async def affected_claims(changed_files: list[str]) -> list[dict[str, Any]]:
+            """Find stored doc claims whose evidence depends on changed files."""
+            return cast(
+                list[dict[str, Any]],
+                await self._dispatch(
+                    "affected_claims",
+                    {"changed_files": changed_files},
+                ),
+            )
+
+        @mcp.tool(annotations=_read)
         async def version_info() -> dict[str, Any]:
             """Return scry version metadata and update availability.
 
