@@ -42,6 +42,11 @@ class SymbolExistsVerifier(BaseVerifier):
         bare = symbol.rstrip("()")
         hits = index.lookup_symbol(bare)
 
+        # For dotted paths like foo.bar.baz, also try the last component
+        if not hits and "." in bare:
+            last_part = bare.split(".")[-1]
+            hits = index.lookup_symbol(last_part)
+
         if hits:
             evidence = [
                 Evidence(file_path=h.file_path, line=h.line, snippet=h.snippet, symbol=h.name)

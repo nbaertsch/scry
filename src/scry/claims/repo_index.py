@@ -283,10 +283,17 @@ def _extract_python(source: str, rel_path: str, index: RepoIndex) -> None:
                         members=members,
                     )
 
-            # Extract methods
+            # Extract methods and class attributes (Pydantic fields, etc.)
             for item in node.body:
                 if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
                     _add_symbol(index, item.name, "method", rel_path, item.lineno, source)
+                elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    # Annotated class attribute: field_name: Type = ...
+                    _add_symbol(index, item.target.id, "attribute", rel_path, item.lineno, source)
+                elif isinstance(item, ast.Assign):
+                    for t in item.targets:
+                        if isinstance(t, ast.Name) and not t.id.startswith("__"):
+                            _add_symbol(index, t.id, "attribute", rel_path, item.lineno, source)
 
         elif isinstance(node, ast.Assign):
             for t in node.targets:
@@ -322,8 +329,8 @@ def _extract_strings_and_routes(source: str, rel_path: str, index: RepoIndex) ->
                 snippet=line.strip()[:200],
             ))
 
-        # String literals that look like env vars or important constants
-        for m in re.finditer(r'["\']([A-Z][A-Z0-9_]{3,})["\']', line):
+        # String literals — env vars (ALL_CAPS) and identifiers (snake_case, camelCase)
+        for m in re.finditer(r'["\']([A-Za-z][A-Za-z0-9_]{2,})["\']', line):
             val = m.group(1)
             lit = StringLiteral(value=val, file_path=rel_path, line=i, context=line.strip()[:200])
             index.strings.setdefault(val, []).append(lit)

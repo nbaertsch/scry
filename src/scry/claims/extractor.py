@@ -113,6 +113,9 @@ _SYMBOL_NOISE = frozenset({
     "config", "settings", "options", "params", "args", "kwargs",
     # File extensions / formats when standalone
     "json", "yaml", "toml", "csv", "html", "xml", "txt", "log", "md",
+    # Infrastructure / Kubernetes / Docker terms
+    "localhost", "emptyDir", "Dockerfile", "llmproxy",
+    "hostPath", "configMap", "secretRef", "nodePort",
     # Common short tokens that are never real symbols
     "id", "ok", "on", "off", "up", "no", "yes",
 })
