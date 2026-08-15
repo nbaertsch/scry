@@ -200,7 +200,7 @@ def test_verify_claim_symbol_exists_returns_stale_target_for_missing_symbol(tmp_
 
     result = verify_claim(claim, tmp_path, index)
 
-    assert result.verdict == Verdict.STALE_TARGET
+    assert result.verdict == Verdict.CONTRADICTED
 
 
 def test_verify_claim_file_path_checks_existing_and_missing_paths(tmp_path: Path) -> None:

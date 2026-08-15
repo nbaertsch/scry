@@ -55,15 +55,17 @@ class SymbolExistsVerifier(BaseVerifier):
 
         similar = index.find_similar_symbols(bare)
         if similar:
+            # High-confidence rename detected
+            top = similar[0]
             return VerificationResult(
-                claim_id=claim.id, verdict=Verdict.STALE_TARGET, confidence=0.8,
-                severity=Severity.HIGH,
-                reason=f"Symbol `{symbol}` not found; similar: {', '.join(similar[:3])}",
+                claim_id=claim.id, verdict=Verdict.STALE_TARGET, confidence=0.85,
+                severity=Severity.MEDIUM,
+                reason=f"Symbol `{symbol}` not found; possible rename to `{top}`",
                 expected=symbol, observed=similar[:3], verifier=self.name,
             )
 
         return VerificationResult(
-            claim_id=claim.id, verdict=Verdict.STALE_TARGET, confidence=0.7,
+            claim_id=claim.id, verdict=Verdict.CONTRADICTED, confidence=0.7,
             severity=Severity.MEDIUM,
             reason=f"Symbol `{symbol}` not found in codebase",
             expected=symbol, verifier=self.name,

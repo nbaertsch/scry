@@ -54,6 +54,62 @@ class EnumDef:
     members: list[str] = field(default_factory=list)
 
 
+# ───── Fuzzy matching helpers ────────────────────────────────────────
+
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _normalize_symbol(name: str) -> str:
+    """Normalize a symbol to lowercase with underscore separators."""
+    # Split camelCase
+    parts = _CAMEL_RE.sub("_", name).lower().replace("-", "_").split("_")
+    return "_".join(p for p in parts if p)
+
+
+def _trigrams(s: str) -> set[str]:
+    """Generate trigrams from a string."""
+    s = s.lower()
+    return {s[i : i + 3] for i in range(max(0, len(s) - 2))}
+
+
+def _symbol_similarity(query: str, query_normalized: str, candidate: str) -> float:
+    """Score similarity between query symbol and a candidate.
+
+    Returns 0.0–1.0. Uses multiple strategies:
+    - Exact case-insensitive match → 1.0
+    - Normalized form match → 0.95
+    - Trigram similarity
+    """
+    cand_lower = candidate.lower()
+    query_lower = query.lower()
+
+    # Exact case-insensitive
+    if query_lower == cand_lower:
+        return 1.0
+
+    # Normalized match (camelCase vs snake_case)
+    cand_normalized = _normalize_symbol(candidate)
+    if query_normalized == cand_normalized:
+        return 0.95
+
+    # One contains the other
+    if query_lower in cand_lower or cand_lower in query_lower:
+        ratio = min(len(query_lower), len(cand_lower)) / max(len(query_lower), len(cand_lower))
+        return 0.6 + ratio * 0.3
+
+    # Trigram similarity
+    q_tri = _trigrams(query)
+    c_tri = _trigrams(candidate)
+    if not q_tri or not c_tri:
+        return 0.0
+    intersection = len(q_tri & c_tri)
+    union = len(q_tri | c_tri)
+    return intersection / union if union else 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+
+
 @dataclass
 class RepoIndex:
     """Pre-scanned repository index for fast verification lookups."""
@@ -77,18 +133,28 @@ class RepoIndex:
         return self.strings.get(value, [])
 
     def find_similar_symbols(self, name: str, max_results: int = 5) -> list[str]:
-        """Find symbols with similar names."""
+        """Find symbols with similar names using fuzzy matching.
+
+        Uses multiple strategies: prefix match, case-normalized match,
+        snake/camel transforms, and trigram similarity.
+        """
         bare = name.rstrip("()").split(".")[-1]
         if len(bare) < 3:
             return []
-        prefix = bare[:4].lower()
-        similar: list[str] = []
+
+        # Normalize for comparison
+        normalized = _normalize_symbol(bare)
+        candidates: list[tuple[float, str]] = []
+
         for sym_name in self.symbols:
-            if sym_name.lower().startswith(prefix) and sym_name != bare:
-                similar.append(sym_name)
-                if len(similar) >= max_results:
-                    break
-        return similar
+            if sym_name == bare:
+                continue
+            score = _symbol_similarity(bare, normalized, sym_name)
+            if score > 0.5:
+                candidates.append((score, sym_name))
+
+        candidates.sort(key=lambda x: -x[0])
+        return [c[1] for c in candidates[:max_results]]
 
     def find_similar_strings(self, value: str, prefix_len: int = 8) -> list[str]:
         """Find string literals with similar prefix."""
