@@ -53,6 +53,36 @@ class SymbolExistsVerifier(BaseVerifier):
                 evidence=evidence, verifier=self.name,
             )
 
+        # Try case-insensitive lookup before fuzzy
+        bare_lower = bare.lower()
+        ci_hits = [s for s in index.symbols if s.lower() == bare_lower]
+        if ci_hits:
+            # Case-insensitive match — confirmed with slightly lower confidence
+            match_name = ci_hits[0]
+            defs = index.symbols[match_name]
+            evidence = [
+                Evidence(file_path=d.file_path, line=d.line, snippet=d.snippet, symbol=d.name)
+                for d in defs[:3]
+            ]
+            return VerificationResult(
+                claim_id=claim.id, verdict=Verdict.CONFIRMED, confidence=0.85,
+                reason=f"Symbol `{symbol}` found as `{match_name}` (case-insensitive)",
+                evidence=evidence, verifier=self.name,
+            )
+
+        # Also check string literals (field names, config keys)
+        str_hits = index.lookup_string(bare)
+        if str_hits:
+            evidence = [
+                Evidence(file_path=h.file_path, line=h.line, snippet=h.value)
+                for h in str_hits[:3]
+            ]
+            return VerificationResult(
+                claim_id=claim.id, verdict=Verdict.CONFIRMED, confidence=0.75,
+                reason=f"Symbol `{symbol}` found as string literal in code",
+                evidence=evidence, verifier=self.name,
+            )
+
         similar = index.find_similar_symbols(bare)
         if similar:
             # High-confidence rename detected
