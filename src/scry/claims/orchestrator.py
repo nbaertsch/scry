@@ -37,6 +37,67 @@ def _evidence_changed(cached: VerificationResult, changed_files: set[str]) -> bo
     return any(e.file_path in changed_files for e in cached.evidence if e.file_path)
 
 
+def _load_or_build_index(repo_root: Path, scry_dir: Path) -> RepoIndex:
+    """Load cached RepoIndex or build fresh one.
+
+    Uses a file manifest to detect changes — only rebuilds when
+    Python files have been modified since last index.
+    """
+    import json
+    import pickle
+
+    cache_path = scry_dir / "repo_index.pkl"
+    manifest_path = scry_dir / "index_manifest.json"
+
+    # Check if cache is fresh
+    if cache_path.exists() and manifest_path.exists():
+        try:
+            old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            # Quick staleness check: compare mtimes of Python files
+            stale = False
+            exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".scry"}
+            current_py_files: dict[str, float] = {}
+            for fp in repo_root.rglob("*.py"):
+                if any(d in fp.parts for d in exclude_dirs):
+                    continue
+                rel = str(fp.relative_to(repo_root)).replace("\\", "/")
+                current_py_files[rel] = fp.stat().st_mtime
+
+            # Check if file set or mtimes changed
+            if set(current_py_files.keys()) != set(old_manifest.keys()):
+                stale = True
+            elif any(
+                current_py_files.get(k, 0) != v
+                for k, v in old_manifest.items()
+            ):
+                stale = True
+
+            if not stale:
+                index = pickle.loads(cache_path.read_bytes())
+                return index
+        except Exception:
+            pass  # Cache corrupted, rebuild
+
+    # Build fresh index
+    index = build_index(repo_root)
+
+    # Save cache + manifest
+    try:
+        cache_path.write_bytes(pickle.dumps(index))
+        exclude_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".scry"}
+        manifest: dict[str, float] = {}
+        for fp in repo_root.rglob("*.py"):
+            if any(d in fp.parts for d in exclude_dirs):
+                continue
+            rel = str(fp.relative_to(repo_root)).replace("\\", "/")
+            manifest[rel] = fp.stat().st_mtime
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    except Exception:
+        pass  # Non-fatal if cache write fails
+
+    return index
+
+
 def _find_doc_files(repo_root: Path, paths: list[str] | None = None) -> list[str]:
     """Find markdown doc files to verify.
 
@@ -145,8 +206,10 @@ def verify_docs(
                 # No changed docs found
                 return report
 
-    # Build repo index once
-    index = build_index(repo_root)
+    # Build repo index once (with disk caching)
+    scry_dir = repo_root / ".scry"
+    scry_dir.mkdir(exist_ok=True)
+    index = _load_or_build_index(repo_root, scry_dir)
 
     # Extract and verify
     all_claims: list[Claim] = []
