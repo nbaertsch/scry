@@ -3644,6 +3644,8 @@ def mcp(ctx: click.Context, daemon: bool) -> None:
     help="Output format.",
 )
 @click.option("--output", "-o", "output_file", type=click.Path(), default=None, help="Write output to file (useful for SARIF).")
+@click.option("--annotate", is_flag=True, help="Emit GitHub Actions annotations (::error/::warning).")
+@click.option("--summary", is_flag=True, help="Write markdown summary to $GITHUB_STEP_SUMMARY.")
 @click.option("--show-confirmed", is_flag=True, help="Also show confirmed claims in output.")
 @click.pass_context
 def verify_cmd(
@@ -3653,6 +3655,8 @@ def verify_cmd(
     fail_on: str,
     fmt: str,
     output_file: str | None,
+    annotate: bool,
+    summary: bool,
     show_confirmed: bool,
 ) -> None:
     """Verify documentation claims against source code.
@@ -3706,6 +3710,28 @@ def verify_cmd(
             click.echo(f"Report written to {output_file}")
         else:
             click.echo(output)
+
+        # GitHub Actions annotations
+        if annotate:
+            from scry.claims.annotations import generate_annotations
+            all_claims_for_ann = store.get_all_claims()
+            ann_output = generate_annotations(report, all_claims_for_ann)
+            if ann_output:
+                click.echo(ann_output)
+
+        # GitHub Step Summary
+        if summary:
+            import os
+            from scry.claims.annotations import generate_summary
+            all_claims_for_sum = store.get_all_claims()
+            summary_md = generate_summary(report, all_claims_for_sum)
+            summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary_file:
+                with open(summary_file, "a", encoding="utf-8") as f:
+                    f.write(summary_md + "\n")
+                click.echo("Summary written to $GITHUB_STEP_SUMMARY")
+            else:
+                click.echo(summary_md)
 
         # Exit code based on --fail-on
         if fail_on == "error" and report.contradicted > 0:
